@@ -12,7 +12,8 @@ This is the independent C repository requested by the owner. Keep C changes here
    job on main. Download the matching Actions ZIP or commit/run/attempt CI prerelease
    asset. Verify workflow head SHA, run ID/attempt, artifact digest, Git source
    tree and every payload hash before executing a downloaded program.
-4. Run `scripts/validate.py` on the downloaded macOS ARM64 bundle. It executes native
+4. Run `scripts/validate.py` on the downloaded macOS ARM64 bundle. The Mac job uses
+   the Xcode 27 image to match the owner's macOS 27 sanitizer runtime requirements. It executes native
    and ASan/UBSan unit, domain, server, plan and nft CLI tests without compilation.
    Run downloaded ARM64 library tests and isolated application checks on the owner's
    target when relevant. Kernel NFT writes, routing, performance and sustained-rate

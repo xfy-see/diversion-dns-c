@@ -10,7 +10,7 @@
 
 | 产物 | 内容 |
 |---|---|
-| macOS ARM64 native | 本机可运行的程序、native 和 ASan/UBSan 测试程序及 sanitizer runtime |
+| macOS 27 ARM64 native | Xcode 27 runner 构建，native 和 ASan/UBSan 测试程序及匹配的 sanitizer runtime |
 | Linux x86_64 native | Linux native/ASan/UBSan 程序和测试程序 |
 | Linux ARM64 static | 固定 Zig 0.14.1、PCRE2 10.48，静态 musl 程序和全部测试程序 |
 | Linux x86_64 static | 同样固定依赖的静态 musl 程序和全部测试程序 |

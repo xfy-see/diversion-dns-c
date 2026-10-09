@@ -15,7 +15,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          - os: xcode-27
             target: macos-arm64
           - os: ubuntu-24.04
             target: linux-amd64
@@ -41,6 +41,11 @@ jobs:
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           python3 -m unittest discover -s tests -p 'test_*.py' -v
           mkdir -p .build/compile-logs
+          uname -a > .build/compile-logs/host.txt
+          if [[ $(uname) == Darwin ]]; then
+            sw_vers > .build/compile-logs/os.txt
+            xcodebuild -version > .build/compile-logs/xcode.txt
+          fi
           "$CC" --version > .build/compile-logs/compiler.txt
           pcre2-config --version > .build/compile-logs/pcre2.txt
           if [[ $(uname) == Darwin ]]; then
