@@ -51,8 +51,9 @@ class SizeAttributionTests(unittest.TestCase):
     def test_zig_verbose_link_command(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "link.log"
-            path.write_text("ld.lld -static -o '/tmp/diagnostic elf' /tmp/main.o /tmp/libc.a\n")
-            self.assertEqual(BUILD.verbose_lld_command(path),
+            path.write_text("ld.lld -r -o /tmp/crt1.o /tmp/crt1.part.o\n"
+                            "ld.lld -static -o '/tmp/diagnostic elf' /tmp/main.o /tmp/libc.a\n")
+            self.assertEqual(BUILD.verbose_lld_command(path, Path("/tmp/diagnostic elf")),
                              ["-static", "-o", "/tmp/diagnostic elf", "/tmp/main.o", "/tmp/libc.a"])
 
 

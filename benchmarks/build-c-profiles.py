@@ -114,7 +114,7 @@ def command(command, cwd, env, log):
     return value
 
 
-def verbose_lld_command(log):
+def verbose_lld_command(log, output):
     """Recover Zig's exact LLD inputs; zig cc does not accept -Wl,-Map."""
     matches = []
     for line in log.read_text().splitlines():
@@ -126,8 +126,12 @@ def verbose_lld_command(log):
             if part == "ld.lld" or part.endswith("/ld.lld"):
                 matches.append(parts[index + 1:])
                 break
-    if len(matches) != 1 or "-o" not in matches[0]:
-        raise BuildError("expected one verbose ld.lld command in " + str(log))
+    expected = str(output)
+    matches = [args for args in matches if "-o" in args
+               and args.index("-o") + 1 < len(args)
+               and args[args.index("-o") + 1] == expected]
+    if len(matches) != 1:
+        raise BuildError("expected one verbose ld.lld command for " + expected + " in " + str(log))
     return matches[0]
 
 
@@ -262,7 +266,7 @@ def main():
         mapped = size_dir / "mosdns-c.mapped"
         link_map = size_dir / "mosdns-c.map"
         size_json = size_dir / "attribution.json"
-        lld_args = verbose_lld_command(normal_link_log)
+        lld_args = verbose_lld_command(normal_link_log, app)
         lld_args[lld_args.index("-o") + 1] = str(mapped)
         manifest["commands"].append(command([str(args.zig), "ld.lld"] + lld_args
                                             + ["-Map=" + str(link_map)], work, env,
