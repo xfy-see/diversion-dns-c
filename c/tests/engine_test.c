@@ -65,6 +65,37 @@ static void config_validation(void) {
     must_fail("\"plugins\\0extra\": []\n", "embedded NUL");
     e=md_engine_load("/tmp/config.toml",true,err);assert(!e);assert(strstr(err,"YAML/YML/JSON"));
 }
+static void regex_profile_validation(void) {
+    const char *unsupported[]={"(*UTF)^example\\.test$", "(*UCP)^example\\.test$",
+                               "^\\p{L}+\\.test$", "^\\P{L}+\\.test$", "^\\X\\.test$"};
+    for(size_t i=0;i<sizeof(unsupported)/sizeof(unsupported[0]);i++) {
+        char text[2048],path[512],rules[512],err[MD_ERROR_SIZE]={0};
+        /* Both inline entry points compile in check mode as well as at startup. */
+        snprintf(text,sizeof(text),"plugins: [{type: domain_set, args: {exps: ['regexp:%s']}}]\n",unsupported[i]);
+        must_fail(text,"invalid PCRE2 regexp at ");
+        md_engine *e=load_text(text,false,err);assert(!e);assert(strstr(err,"invalid PCRE2 regexp at "));
+        snprintf(text,sizeof(text),"plugins: [{type: sequence, args: [{matches: 'qname regexp:%s', exec: reject}]}]\n",unsupported[i]);
+        must_fail(text,"invalid PCRE2 regexp at ");
+        e=load_text(text,false,err);assert(!e);assert(strstr(err,"invalid PCRE2 regexp at "));
+
+        snprintf(rules,sizeof(rules),"# external regex profile\nfull:before.test\nregexp:%s\nfull:after.test\n",unsupported[i]);
+        write_config("unicode-rules.txt",rules,path);
+        for(unsigned direct=0;direct<2;direct++) {
+            if(direct) snprintf(text,sizeof(text),"plugins:\n"
+                " - {tag: main, type: sequence, args: [{matches: 'qname &%s', exec: reject}]}\n"
+                " - {type: udp_server, args: {entry: main, listen: '127.0.0.1:0'}}\n",path);
+            else snprintf(text,sizeof(text),"plugins:\n"
+                " - {tag: domains, type: domain_set, args: {files: '%s'}}\n"
+                " - {tag: main, type: sequence, args: [{matches: 'qname $domains', exec: reject}]}\n"
+                " - {type: udp_server, args: {entry: main, listen: '127.0.0.1:0'}}\n",path);
+            /* check deliberately skips external files; it is not a rules preflight. */
+            e=load_text(text,true,err);assert(e);assert(md_engine_listener_count(e)==1);md_engine_free(e);
+            e=load_text(text,false,err);assert(!e);
+            assert(strstr(err,path) && strstr(err,"line 3:") && strstr(err,"invalid PCRE2 regexp at "));
+        }
+        assert(!unlink(path));
+    }
+}
 static void matching_and_flow(void) {
     char err[MD_ERROR_SIZE]={0};
     const char *config="plugins:\n"
@@ -146,6 +177,6 @@ static void cached_accept_guards(void) {
 }
 int main(void) {
     strcpy(directory,"/tmp/mosdns-c-engine-test-XXXXXX");assert(mkdtemp(directory));
-    config_validation();matching_and_flow();included_json();cached_accept_guards();char config[512];snprintf(config,sizeof(config),"%s/config.yaml",directory);unlink(config);assert(!rmdir(directory));
+    config_validation();regex_profile_validation();matching_and_flow();included_json();cached_accept_guards();char config[512];snprintf(config,sizeof(config),"%s/config.yaml",directory);unlink(config);assert(!rmdir(directory));
     puts("engine: configuration and sequence tests passed");return 0;
 }

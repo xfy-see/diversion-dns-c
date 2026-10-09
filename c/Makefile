@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 CC ?= cc
 AR ?= ar
-BUILD ?= ../.build/c-native
-PCRE2_PREFIX ?= $(shell if test -d /opt/homebrew/opt/pcre2; then echo /opt/homebrew/opt/pcre2; else echo /usr; fi)
+BUILD ?= ../.build/c-native-no-unicode-no-jit
+# Build this pinned dependency with scripts/build-native-pcre2.py first.
+# Never silently select a system PCRE2 with different Unicode/JIT features.
+PCRE2_PREFIX ?= ../.build/pcre2-8-no-unicode-no-jit
 PCRE2_CFLAGS ?= -I$(PCRE2_PREFIX)/include
-PCRE2_LIB ?= $(shell if test -f $(PCRE2_PREFIX)/lib/libpcre2-8.a; then echo $(PCRE2_PREFIX)/lib/libpcre2-8.a; else echo -lpcre2-8; fi)
+PCRE2_LIB ?= $(PCRE2_PREFIX)/lib/libpcre2-8.a
 CPPFLAGS += -Iinclude -Ivendor/libyaml/include $(PCRE2_CFLAGS) -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE
 CFLAGS ?= -O2 -g
 CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -Werror -pthread
@@ -21,7 +23,7 @@ TESTS = dns_test cache_domain_test engine_test plan_regression_test nft_netlink_
 
 .PHONY: all test unit integration clean
 all: $(BUILD)/mosdns-c
-$(BUILD)/mosdns-c: $(APPOBJ) $(BUILD)/libmosdns-c.a
+$(BUILD)/mosdns-c: $(APPOBJ) $(BUILD)/libmosdns-c.a $(wildcard $(PCRE2_LIB))
 	$(CC) $(LDFLAGS) -o $@ $(APPOBJ) $(BUILD)/libmosdns-c.a $(LDLIBS)
 $(BUILD)/libmosdns-c.a: $(LIBOBJ)
 	$(AR) rcs $@ $^
@@ -31,7 +33,7 @@ $(BUILD)/vendor/libyaml/src/%.o: vendor/libyaml/src/%.c
 $(BUILD)/%.o: %.c include/mosdns.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
-$(BUILD)/tests/%: tests/%.c $(BUILD)/libmosdns-c.a
+$(BUILD)/tests/%: tests/%.c $(BUILD)/libmosdns-c.a $(wildcard $(PCRE2_LIB))
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) $< $(BUILD)/libmosdns-c.a $(LDLIBS) -o $@
 unit: $(addprefix $(BUILD)/tests/,$(TESTS)) $(BUILD)/tests/domain_driver

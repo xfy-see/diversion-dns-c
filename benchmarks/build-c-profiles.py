@@ -20,6 +20,16 @@ import tarfile
 from datetime import datetime, timezone
 
 
+# One explicit dependency contract for native CI and static release profiles.
+PCRE2_SHA256 = "ebcc25aadf2a51fa1fefa9b8bc9e7a79b3dae86870a0f1152a22e42befd46888"
+PCRE2_CONFIGURE_OPTIONS = [
+    "--disable-shared", "--enable-static", "--disable-pcre2-16",
+    "--disable-pcre2-32", "--disable-jit", "--disable-unicode",
+    "--disable-dependency-tracking", "--disable-pcre2grep-libz",
+    "--disable-pcre2grep-libbz2",
+]
+
+
 class BuildError(RuntimeError):
     pass
 
@@ -205,17 +215,15 @@ def main():
         flags = ["-O2", "-ffunction-sections", "-fdata-sections"]
         manifest["build"] = {"compiler": {"path": str(args.zig), **record(args.zig)},
                               "flags": flags + ["-UNDEBUG", "-std=c11", "-pthread", "-static", "-Wl,--gc-sections", "-Wl,-s", "-Wl,-z,stack-size=1048576"],
-                              "pcre2_options": ["8-bit", "Unicode enabled", "JIT disabled", "static"],
+                              "pcre2_options": ["8-bit", "Unicode disabled", "JIT disabled", "static"],
                               "application_workers": "runtime --cpu; planned tests use --cpu 2",
                               "stack_size_reason": "1 MiB ELF default thread stack: regression mock threads hold two 65 KiB DNS packets; musl default stack may be too small."}
         version = subprocess.run([str(args.zig), "version"], capture_output=True, text=True, check=True)
         manifest["build"]["compiler"]["version"] = version.stdout.strip()
         write_json(out / "manifest.json", manifest)
-        pcre_build = work / "pcre2"
+        pcre_build = work / "pcre2-8-no-unicode-no-jit"
         pcre_build.mkdir()
-        configure = [str(pcre_source / "configure"), "--host=" + args.target,
-                     "--disable-shared", "--enable-static", "--disable-pcre2-16", "--disable-pcre2-32", "--disable-jit",
-                     "--disable-dependency-tracking", "--disable-pcre2grep-libz", "--disable-pcre2grep-libbz2",
+        configure = [str(pcre_source / "configure"), "--host=" + args.target] + PCRE2_CONFIGURE_OPTIONS + [
                      "CC=" + str(wrappers / "cc"), "AR=" + str(wrappers / "ar"), "RANLIB=" + str(wrappers / "ranlib"),
                      "CFLAGS=" + " ".join(flags)]
         manifest["commands"].append(command(configure, pcre_build, env, logs / "pcre2-configure.log"))

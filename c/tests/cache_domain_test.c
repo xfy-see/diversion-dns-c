@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+#define PCRE2_CODE_UNIT_WIDTH 8
 #include "mosdns.h"
+#include <pcre2.h>
 #include <assert.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -132,6 +134,97 @@ static void concurrency_tests(void) {
     md_cache_free(c);
 }
 
+static void regex_profile_tests(void) {
+    uint32_t enabled = 1;
+    assert(!pcre2_config(PCRE2_CONFIG_UNICODE, &enabled));
+    if (enabled) { fputs("test profile requires PCRE2 without Unicode support\n", stderr); abort(); }
+    assert(!pcre2_config(PCRE2_CONFIG_JIT, &enabled));
+    if (enabled) { fputs("test profile requires PCRE2 without JIT support\n", stderr); abort(); }
+
+    const char *unsupported[] = {
+        "regexp:(*UTF)^example\\.test$", "regexp:(*UCP)^example\\.test$",
+        "regexp:^\\p{L}+\\.test$", "regexp:^\\P{L}+\\.test$", "regexp:^\\X\\.test$"
+    };
+    char err[MD_ERROR_SIZE], path[] = "/tmp/mosdns-c-regex-XXXXXX";
+    int fd = mkstemp(path); assert(fd >= 0); assert(!close(fd));
+    for (size_t i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); ++i) {
+        md_domain *d = md_domain_new(); assert(d);
+        assert(md_domain_add(d, unsupported[i], err));
+        assert(strstr(err, "invalid PCRE2 regexp at "));
+        assert(!md_domain_match(d, "example.test"));
+        FILE *f = fopen(path, "w"); assert(f);
+        assert(fprintf(f, "# profile rejection\nfull:before.test\n\n%s\nfull:after.test\n", unsupported[i]) > 0);
+        assert(!fclose(f));
+        assert(md_domain_load(d, path, err));
+        assert(strstr(err, path) && strstr(err, "line 4:") && strstr(err, "invalid PCRE2 regexp at "));
+        assert(md_domain_match(d, "before.test"));
+        assert(!md_domain_match(d, "after.test")); /* Fail at the bad rule; never skip it. */
+        md_domain_free(d);
+    }
+    assert(!unlink(path));
+
+    md_domain *d = md_domain_new(); assert(d);
+    assert(!md_domain_add(d, "regexp:^asset-\\d+\\.\\w+$", err));
+    assert(md_domain_match(d, "ASSET-123.A_B."));
+    assert(!md_domain_match(d, "asset-a.test"));
+    assert(!md_domain_match(d, "asset-\xd9\xa1.test")); /* Arabic-Indic digit is not ASCII \\d. */
+    assert(!md_domain_match(d, "asset-1.\xc3\xa9")); /* UTF-8 bytes are not ASCII \\w. */
+    md_domain_free(d);
+    d = md_domain_new(); assert(d);
+    assert(!md_domain_add(d, "regexp:^..\\.bytes$", err));
+    assert(md_domain_match(d, "ab.bytes"));
+    assert(md_domain_match(d, "\xc3\xa9.bytes")); /* Library matcher counts bytes, not code points. */
+    assert(!md_domain_match(d, "a.bytes"));
+    assert(!md_domain_match(d, "\xe4\xb8\xad.bytes"));
+    md_domain_free(d);
+}
+
+static void direct_list_regex_tests(void) {
+    /* All eight regexp lines, unchanged, from Loyalsoldier/v2ray-rules-dat:
+     * https://github.com/Loyalsoldier/v2ray-rules-dat/blob/99f994716ed6323595c9ba5ff6dc36b6a1fe27c7/direct-list.txt#L111725-L111732
+     * Verified source blob: 7f1511773bce814fa841dcab4ff2a6314bd8575b.
+     * Test each rule alone so another rule cannot mask an incorrect result. */
+    const struct { const char *rule; const char *yes[4], *no[4]; } cases[] = {
+        {"regexp:.+\\.awsdns-cn-[0-9][0-9]\\.(biz|com|net|top)$",
+         {"a.awsdns-cn-00.biz", "a.b.awsdns-cn-12.com", "A.AWSDNS-CN-99.NET.", "a.awsdns-cn-42.top"},
+         {"awsdns-cn-00.biz", "a.awsdns-cn-1.com", "a.awsdns-cn-1a.net", "a.awsdns-cn-12.top.evil"}},
+        {"regexp:.+\\.awsdns-cn-[0-9][a-e0-9]\\.cn$",
+         {"a.awsdns-cn-0a.cn", "a.b.awsdns-cn-9e.cn", "A.AWSDNS-CN-00.CN.", "a.awsdns-cn-99.cn"},
+         {"awsdns-cn-0a.cn", "a.awsdns-cn-1f.cn", "a.awsdns-cn-aa.cn", "a.awsdns-cn-1a.cn.evil"}},
+        {"regexp:^(.+\\.)*zh\\.okaapps\\.com$",
+         {"zh.okaapps.com", "a.zh.okaapps.com", "a.b.zh.okaapps.com", "ZH.OKAAPPS.COM."},
+         {"okaapps.com", "prefixzh.okaapps.com", "zh.okaapps.com.evil", "zhxokaapps.com"}},
+        {"regexp:^.+-mihayo\\.akamaized\\.net$",
+         {"a-mihayo.akamaized.net", "a-b-mihayo.akamaized.net", "a.b-mihayo.akamaized.net", "A-MIHAYO.AKAMAIZED.NET."},
+         {"-mihayo.akamaized.net", "a-mihoyo.akamaized.net", "a-mihayo.akamaized.net.evil", "a-mihayoxakamaized.net"}},
+        {"regexp:^cdn\\d-epicgames-\\d+\\.file\\.myqcloud\\.com$",
+         {"cdn0-epicgames-0.file.myqcloud.com", "cdn9-epicgames-123.file.myqcloud.com", "cdn1-epicgames-00.file.myqcloud.com", "CDN2-EPICGAMES-9.FILE.MYQCLOUD.COM."},
+         {"cdn12-epicgames-1.file.myqcloud.com", "cdna-epicgames-1.file.myqcloud.com", "cdn1-epicgames-.file.myqcloud.com", "cdn1-epicgames-1.file.myqcloud.com.evil"}},
+        {"regexp:^epicgames-download\\d-\\d+\\.file\\.myqcloud\\.com$",
+         {"epicgames-download0-0.file.myqcloud.com", "epicgames-download9-123.file.myqcloud.com", "epicgames-download1-00.file.myqcloud.com", "EPICGAMES-DOWNLOAD2-9.FILE.MYQCLOUD.COM."},
+         {"epicgames-download12-1.file.myqcloud.com", "epicgames-downloada-1.file.myqcloud.com", "epicgames-download1-.file.myqcloud.com", "epicgames-download1-1.file.myqcloud.com.evil"}},
+        {"regexp:^r+[0-9]+(---|\\.)sn-(2x3|ni5|j5o)\\w{5}\\.googlevideo\\.com$",
+         {"r1---sn-2x3abc_9.googlevideo.com", "rr123.sn-ni5a0b1c.googlevideo.com", "r9---sn-j5o12345.googlevideo.com", "R1.SN-2X3ABCDE.GOOGLEVIDEO.COM."},
+         {"r1--sn-2x3abcde.googlevideo.com", "r1---sn-xxxabcde.googlevideo.com", "r1---sn-2x3abcd.googlevideo.com", "r1---sn-2x3abc-e.googlevideo.com"}},
+        {"regexp:^r+[0-9]+(---|\\.)sn-(2x3|ni5|j5o)\\w{5}\\.xn--ngstr-lra8j\\.com$",
+         {"r1---sn-2x3abc_9.xn--ngstr-lra8j.com", "rr123.sn-ni5a0b1c.xn--ngstr-lra8j.com", "r9---sn-j5o12345.xn--ngstr-lra8j.com", "R1.SN-2X3ABCDE.XN--NGSTR-LRA8J.COM."},
+         {"r1--sn-2x3abcde.xn--ngstr-lra8j.com", "r1---sn-xxxabcde.xn--ngstr-lra8j.com", "r1---sn-2x3abcdef.xn--ngstr-lra8j.com", "r1---sn-2x3abc-e.xn--ngstr-lra8j.com"}}
+    };
+    assert(sizeof(cases) / sizeof(cases[0]) == 8);
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        char err[MD_ERROR_SIZE]; md_domain *d = md_domain_new(); assert(d);
+        assert(!md_domain_add(d, cases[i].rule, err));
+        for (size_t j = 0; j < 4; ++j) {
+            assert(md_domain_match(d, cases[i].yes[j]));
+            assert(!md_domain_match(d, cases[i].no[j]));
+        }
+        char suffix[256];
+        assert(snprintf(suffix, sizeof(suffix), "%s.evil", cases[i].yes[0]) > 0);
+        assert(!md_domain_match(d, suffix));
+        md_domain_free(d);
+    }
+}
+
 static void domain_tests(void) {
     char err[MD_ERROR_SIZE]; md_domain *d = md_domain_new(); assert(d);
     const char *rules[] = {"domain:EXAMPLE.com.", "full:only.test", "keyword:needle", "regexp:^asset-[0-9]+\\.test$", ":default.test"};
@@ -176,6 +269,6 @@ static void nft_tests(void) {
     for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); ++i) assert(!md_nft_new(bad[i], err));
 }
 int main(void) {
-    domain_tests(); cache_tests(); concurrency_tests(); nft_tests();
+    regex_profile_tests(); direct_list_regex_tests(); domain_tests(); cache_tests(); concurrency_tests(); nft_tests();
     puts("domain/cache/nftset parser tests passed"); return 0;
 }

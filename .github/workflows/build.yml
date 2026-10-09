@@ -27,14 +27,12 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-      - name: Dependencies
+      - name: Pinned no-Unicode PCRE2 dependency
         run: |
-          if [[ $(uname) == Darwin ]]; then
-            brew install pcre2
-          else
-            sudo apt-get update
-            sudo apt-get install -y libpcre2-dev
-          fi
+          set -euo pipefail
+          mkdir -p .build/deps
+          curl --fail --location --retry 3 https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.48/pcre2-10.48.tar.gz -o .build/deps/pcre2-10.48.tar.gz
+          python3 scripts/build-native-pcre2.py --archive .build/deps/pcre2-10.48.tar.gz --output .build/pcre2-8-no-unicode-no-jit --jobs 4
       - name: Build native and ASan/UBSan programs
         run: |
           set -eo pipefail
@@ -47,15 +45,10 @@ jobs:
             xcodebuild -version > .build/compile-logs/xcode.txt
           fi
           "$CC" --version > .build/compile-logs/compiler.txt
-          pcre2-config --version > .build/compile-logs/pcre2.txt
-          if [[ $(uname) == Darwin ]]; then
-            prefix=$(brew --prefix pcre2)
-            lib=$prefix/lib/libpcre2-8.a
-            cpp=-I$prefix/include
-          else
-            lib=/usr/lib/$(cc -dumpmachine)/libpcre2-8.a
-            cpp=-I/usr/include
-          fi
+          cp .build/pcre2-8-no-unicode-no-jit/manifest.json .build/compile-logs/pcre2.json
+          cp .build/pcre2-8-no-unicode-no-jit/logs/*.log .build/compile-logs/
+          lib="$PWD/.build/pcre2-8-no-unicode-no-jit/lib/libpcre2-8.a"
+          cpp="-I$PWD/.build/pcre2-8-no-unicode-no-jit/include"
           test -f "$lib"
           for profile in native asan; do
             folder=../.build/$profile
@@ -98,6 +91,7 @@ jobs:
           name: failure-native-${{ matrix.target }}-${{ github.sha }}-attempt-${{ github.run_attempt }}
           path: |
             .build/compile-logs/
+            .build/pcre2-8-no-unicode-no-jit/logs/
             .build/ci-validation/
           include-hidden-files: true
           if-no-files-found: warn
