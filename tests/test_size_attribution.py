@@ -56,6 +56,19 @@ class SizeAttributionTests(unittest.TestCase):
             self.assertEqual(BUILD.verbose_lld_command(path, Path("/tmp/diagnostic elf")),
                              ["-static", "-o", "/tmp/diagnostic elf", "/tmp/main.o", "/tmp/libc.a"])
 
+    def test_diagnostic_reuses_exact_release_link_inputs(self):
+        original = ["-static", "-s", "-o", "/tmp/release", "/cache/release/crt1.o",
+                    "/work/main.o", "/cache/release/libc.a", "/cache/release/libcompiler_rt.a",
+                    "--gc-sections", "-z", "stack-size=1048576"]
+        diagnostic = BUILD.unstripped_lld_args(original, Path("/tmp/diagnostic"))
+        self.assertEqual(diagnostic, ["-static", "-o", "/tmp/diagnostic", "/cache/release/crt1.o",
+                                     "/work/main.o", "/cache/release/libc.a", "/cache/release/libcompiler_rt.a",
+                                     "--gc-sections", "-z", "stack-size=1048576"])
+        self.assertIn("-s", original)
+        self.assertEqual(original[3], "/tmp/release")
+        with self.assertRaises(BUILD.BuildError):
+            BUILD.unstripped_lld_args(["-o", "/tmp/unstripped"], Path("/tmp/diagnostic"))
+
 
 if __name__ == "__main__":
     unittest.main()

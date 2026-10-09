@@ -145,6 +145,15 @@ def verbose_lld_command(log, output):
     return matches[0]
 
 
+def unstripped_lld_args(release_args, output):
+    """Keep release CRT/libc/compiler-rt inputs; only retain symbol sections."""
+    if "-s" not in release_args or "-o" not in release_args:
+        raise BuildError("expected stripped release LLD command")
+    args = [arg for arg in release_args if arg != "-s"]
+    args[args.index("-o") + 1] = str(output)
+    return args
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
@@ -281,15 +290,13 @@ def main():
                                             logs / "link-app-map.log"))
         if record(mapped) != {k: manifest["binary"][k] for k in ("bytes", "sha256")}:
             raise BuildError("map-linked stripped ELF differs from published program")
-        # An unstripped link preserves symbols for inspection. Its allocated
-        # section sizes/addresses are checked separately, not assumed identical
-        # in content to the stripped release.
-        diagnostic_flags = [flag for flag in ldflags if flag != "-Wl,-s"]
-        verbose_log = logs / "link-app-diagnostic.log"
-        manifest["commands"].append(command([str(args.zig), "cc", "-target", args.target] + diagnostic_flags
-                                            + ["-o", str(diagnostic), str(objects["main.c"]),
-                                               str(objects["pkg/server.c"]), str(lib), str(pcre_lib), "-pthread"],
-                                            work, env, verbose_log))
+        # Reuse the release's exact CRT/libc/compiler-rt inputs. A second zig cc
+        # invocation without -s can select different cached runtime objects and
+        # change allocated section shapes (observed on x86_64 without Unicode).
+        # Only remove LLD's strip flag; retain all strict layout/hash checks.
+        diagnostic_args = unstripped_lld_args(lld_args, diagnostic)
+        manifest["commands"].append(command([str(args.zig), "ld.lld"] + diagnostic_args,
+                                            work, env, logs / "link-app-diagnostic.log"))
         manifest["commands"].append(command(["python3", str(frozen / "benchmarks/size-attribution.py"),
                                              "--release", str(app), "--diagnostic", str(diagnostic),
                                              "--mapped", str(mapped), "--map", str(link_map),
