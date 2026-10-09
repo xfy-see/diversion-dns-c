@@ -56,7 +56,8 @@ def tree(root):
 
 def inputs(root):
     result = {"c/" + name: value for name, value in tree(root / "c").items()}
-    for name in ("tests/fixtures/matcher_domain.json", "benchmarks/build-c-profiles.py"):
+    for name in ("tests/fixtures/matcher_domain.json", "benchmarks/build-c-profiles.py",
+                 "benchmarks/size-attribution.py"):
         result[name] = record(root / name)
     return dict(sorted(result.items()))
 
@@ -232,6 +233,34 @@ def main():
         app = out / "mosdns-c"
         manifest["commands"].append(command([str(args.zig), "cc", "-target", args.target] + ldflags + ["-o", str(app), str(objects["main.c"]), str(objects["pkg/server.c"]), str(lib), str(pcre_lib), "-pthread"], work, env, logs / "link-app.log"))
         manifest["binary"] = {"path": str(app), **record(app), "stripped": True, "static": True}
+        # Keep the published link above unchanged. Relink the same objects without
+        # -s so the map can attribute retained input sections, then verify that
+        # every allocated section still matches the published ELF byte-for-byte.
+        size_dir = out / "size"
+        size_dir.mkdir()
+        diagnostic = size_dir / "mosdns-c.unstripped"
+        link_map = size_dir / "mosdns-c.map"
+        size_json = size_dir / "attribution.json"
+        diagnostic_flags = [flag for flag in ldflags if flag != "-Wl,-s"] + ["-Wl,-Map," + str(link_map)]
+        manifest["commands"].append(command([str(args.zig), "cc", "-target", args.target] + diagnostic_flags
+                                            + ["-o", str(diagnostic), str(objects["main.c"]),
+                                               str(objects["pkg/server.c"]), str(lib), str(pcre_lib), "-pthread"],
+                                            work, env, logs / "link-app-diagnostic.log"))
+        manifest["commands"].append(command(["python3", str(frozen / "benchmarks/size-attribution.py"),
+                                             "--release", str(app), "--diagnostic", str(diagnostic),
+                                             "--map", str(link_map), "--output", str(size_json)],
+                                            work, env, logs / "size-attribution.log"))
+        size_result = json.loads(size_json.read_text())
+        size_result["versions"] = {"zig": manifest["build"]["compiler"]["version"],
+                                   "libyaml": "0.2.5", "pcre2": "10.48",
+                                   "musl": "bundled with the pinned Zig distribution; upstream version not recorded"}
+        size_result["explicit_link_inputs"] = {
+            "main.c.o": record(objects["main.c"]), "pkg/server.c.o": record(objects["pkg/server.c"]),
+            "libmosdns-c.a": record(lib), "libpcre2-8.a": record(pcre_lib)}
+        write_json(size_json, size_result)
+        manifest["size_attribution"] = {"release_alloc_sections_equal": True,
+                                        "diagnostic": record(diagnostic), "map": record(link_map),
+                                        "report": record(size_json)}
         testdir = out / "tests"
         testdir.mkdir()
         manifest["test_binaries"] = {}

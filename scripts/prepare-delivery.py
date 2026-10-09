@@ -21,6 +21,8 @@ def main():
         a.source_matches(a.ROOT,m)
         key=(m['kind'],m['target'])
         a.require(key in expected and key not in seen and m['run_attempt']==attempt,'delivery identity differs')
+        if m['kind'] == 'static':
+            a.require('size' in m['profiles']['static'], 'static size attribution missing')
         seen.add(key)
         result=json.loads(contents['ci-logs/ci-validation/result.json'])
         a.require(result['completed'] and result['commit']==commit and result['run_id']==run

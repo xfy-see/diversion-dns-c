@@ -102,6 +102,22 @@ def pack(args):
                 require(digest((folder / 'tests' / t).read_bytes()) == m['test_binaries'][t]['sha256'], 'linked test differs')
             for name, item in m['inputs'].items():
                 require(digest((ROOT / name).read_bytes()) == item['sha256'], 'frozen source differs')
+            if label == 'static':
+                size_files = {'diagnostic': 'mosdns-c.unstripped', 'map': 'mosdns-c.map',
+                              'report': 'attribution.json'}
+                profiles[label]['size'] = {key: f'builds/{label}/size/{name}'
+                                           for key, name in size_files.items()}
+                for key, name in size_files.items():
+                    path = folder / 'size' / name
+                    require(path.is_file() and not path.is_symlink()
+                            and digest(path.read_bytes()) == m['size_attribution'][key]['sha256'],
+                            'size attribution changed: ' + key)
+                    add(profiles[label]['size'][key], path, 0o644)
+                size_report = json.loads((folder / 'size' / 'attribution.json').read_text())
+                require(size_report['release']['sha256'] == m['binary']['sha256']
+                        and sum(size_report['disk_bytes'].values()) == m['binary']['bytes']
+                        and size_report['diagnostic']['alloc_sections_equal'],
+                        'size attribution does not match published ELF')
             add(f'builds/{label}/manifest.ci.json', original, 0o644)
             for p in sorted((folder / 'logs').glob('*')):
                 add(f'builds/{label}/logs/{p.name}', p, 0o644)
@@ -165,6 +181,17 @@ def read_archive(path, commit, run_id, archive_sha=None):
         require(label in ('native','asan','static') and set(profile['tests']) == set(TESTS), 'incomplete profile')
         for name in [profile['application'],*profile['tests'].values()]:
             require(name.startswith('builds/'+label+'/') and name in contents and m['files'][name]['mode']==0o755, 'missing executable')
+        if label == 'static' and 'size' in profile:
+            expected = {key: f'builds/static/size/{name}' for key, name in
+                        (('diagnostic', 'mosdns-c.unstripped'), ('map', 'mosdns-c.map'),
+                         ('report', 'attribution.json'))}
+            require(profile.get('size') == expected and all(name in contents for name in expected.values()),
+                    'static size attribution missing')
+            size_report = json.loads(contents[expected['report']])
+            require(size_report['release']['sha256'] == digest(contents[profile['application']])
+                    and sum(size_report['disk_bytes'].values()) == len(contents[profile['application']])
+                    and size_report['diagnostic']['alloc_sections_equal'],
+                    'static size attribution mismatches application')
     require(bool(m['profiles']), 'no executable profile')
     return m, contents
 
