@@ -66,7 +66,7 @@ def main():
     out.mkdir(parents=True, exist_ok=False)
     if args.driver and args.old_source:
         parser.error('--driver and --old-source cannot be combined')
-    compiler = None if args.driver else Path(shutil.which('cc')).resolve()
+    compiler = None if args.driver else Path(shutil.which(os.environ.get('CC', 'cc'))).resolve()
     child = out / 'grammar-nft'
     child.write_text(CHILD); child.chmod(0o700)
     flags = ['-std=c11','-Wall','-Wextra','-Wpedantic','-Werror','-pthread','-D_POSIX_C_SOURCE=200809L','-D_DEFAULT_SOURCE','-I'+str(ROOT/'c/include')]

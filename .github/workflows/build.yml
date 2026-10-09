@@ -21,6 +21,8 @@ jobs:
             target: linux-amd64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
+    env:
+      CC: clang
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -35,10 +37,10 @@ jobs:
           fi
       - name: Build native and ASan/UBSan programs
         run: |
-          set -euo pipefail
+          set -eo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           mkdir -p .build/compile-logs
-          cc --version > .build/compile-logs/compiler.txt
+          "$CC" --version > .build/compile-logs/compiler.txt
           pcre2-config --version > .build/compile-logs/pcre2.txt
           if [[ $(uname) == Darwin ]]; then
             prefix=$(brew --prefix pcre2)
@@ -57,7 +59,7 @@ jobs:
             for t in dns_test cache_domain_test engine_test plan_regression_test nft_netlink_test domain_driver; do
               targets+=("$folder/tests/$t")
             done
-            make -C c -j4 BUILD="$folder" PCRE2_LIB="$lib" PCRE2_CFLAGS="$cpp" "${options[@]}" "${targets[@]}" 2>&1 | tee .build/compile-logs/$profile.log
+            make -C c -j4 CC="$CC" BUILD="$folder" PCRE2_LIB="$lib" PCRE2_CFLAGS="$cpp" "${options[@]}" "${targets[@]}" 2>&1 | tee .build/compile-logs/$profile.log
             args=()
             if [[ $profile == asan ]]; then args+=(--sanitize); fi
             python3 c/tests/nft_cli_test.py --output .build/nft-$profile --compile-only "${args[@]}"
@@ -67,7 +69,7 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: |
-          set -euo pipefail
+          set -eo pipefail
           runtime=()
           if [[ $(uname) == Darwin ]]; then
             runtime+=(--runtime-file "$(cc -print-resource-dir)/lib/darwin/libclang_rt.asan_osx_dynamic.dylib")
