@@ -78,7 +78,7 @@ def category(source):
         return "unattributed"
     if source.endswith(("/main.c.o", "/server.c.o")) and "/objects/" in source:
         return "project"
-    if re.search(r"(?:^|/)(?:libc(?:_nonshared)?\.a|libcompiler_rt\.a|libunwind\.a|libclang_rt[^/]*\.a)\(", source):
+    if re.search(r"(?:^|/)(?:libc(?:_nonshared)?\.a|libcompiler_rt\.a|libubsan_rt\.a|libunwind\.a|libclang_rt[^/]*\.a)\(", source):
         return "musl_startup_compiler"
     if re.search(r"(?:^|/)(?:crt1|Scrt1|rcrt1|crti|crtn)\.o(?::|$)", source):
         return "musl_startup_compiler"
@@ -120,7 +120,11 @@ def analyze(release_path, debug_path, map_path):
     debug_alloc = {n: {k: v[k] for k in ("type", "flags", "addr", "size", "sha256")}
                    for n, v in debug["sections"].items() if v["flags"] & 2}
     if release_alloc != debug_alloc:
-        raise ValueError("diagnostic and release ELF allocated sections differ")
+        differences = {name: dict(release=release_alloc.get(name), diagnostic=debug_alloc.get(name))
+                       for name in sorted(set(release_alloc) | set(debug_alloc))
+                       if release_alloc.get(name) != debug_alloc.get(name)}
+        raise ValueError("diagnostic and release ELF allocated sections differ: "
+                         + json.dumps(differences, sort_keys=True))
     rows = parse_map(map_path, debug["sections"])
     disk = dict.fromkeys(CATEGORIES, 0)
     bss = dict.fromkeys(CATEGORIES, 0)

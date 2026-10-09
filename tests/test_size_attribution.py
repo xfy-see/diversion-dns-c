@@ -24,6 +24,7 @@ class SizeAttributionTests(unittest.TestCase):
             "/work/libmosdns-c.a(scanner.c.o)": "libyaml",
             "/work/libpcre2-8.a(pcre2_compile.c.o)": "pcre2",
             "/zig/lib/libc.a(memcpy.o)": "musl_startup_compiler",
+            "/zig/lib/libubsan_rt.a(ubsan.o)": "musl_startup_compiler",
             "<internal>": "linker_generated",
             "/unexpected/libother.a(example.o)": "unattributed",
         }

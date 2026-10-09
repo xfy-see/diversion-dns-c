@@ -165,6 +165,8 @@ jobs:
           path: |
             .build/static/manifest.json
             .build/static/logs/
+            .build/static/mosdns-c
+            .build/static/size/
             .build/ci-validation/
           include-hidden-files: true
           if-no-files-found: warn
