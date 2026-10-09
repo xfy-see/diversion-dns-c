@@ -163,3 +163,27 @@ jobs:
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 30
+
+  delivery:
+    needs: [native, static]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: diversion-*-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          path: .build/delivery
+      - name: Verify every bundle and create an immutable CI prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/prepare-delivery.py --input .build/delivery --output dist/release
+          tag=ci-$GITHUB_SHA-run$GITHUB_RUN_ID-attempt$GITHUB_RUN_ATTEMPT
+          gh release create "$tag" dist/release/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "CI $GITHUB_SHA (run $GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT)" --notes "Four cloud build/test jobs passed. Assets retain the exact source tree, binaries, manifests and CI test logs. Verify checksums and commit/run/attempt before local validation."

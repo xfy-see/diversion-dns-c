@@ -15,19 +15,21 @@
 | Linux ARM64 static | 固定 Zig 0.14.1、PCRE2 10.48，静态 musl 程序和全部测试程序 |
 | Linux x86_64 static | 同样固定依赖的静态 musl 程序和全部测试程序 |
 
+main 分支的四个编译/测试 job 成功后，delivery job 会生成 `ci-<commit>-run<id>-attempt<n>` 预发布版本。四个同源 `.tar.gz` 下载包与 `SHA256SUMS` 可以直接从 GitHub Releases 下载，无需 Actions 登录；它们保留 Actions 包内同一份文件。
+
 每包绑定 commit、run ID/attempt、完整 Git 源码树及逐文件 SHA256。独立保留 CI 测试日志。实际本地工作流不调用 C 编译器；本机测试直接运行下载的程序。
 
 ## 下载后的完整本地校验
 
-先确认精确提交对应的四个 CI job 全部成功，通过 GitHub 插件或 GitHub CLI 下载同次 run/attempt 的 Actions ZIP。以 macOS ARM64 包为例：
+先确认精确提交对应的四个 CI job 全部成功，从对应 CI 预发布版本下载同次 run/attempt 的 `.tar.gz`（用 release asset 的 digest/`SHA256SUMS` 校验），或通过 GitHub 插件/CLI 下载 Actions ZIP。以 macOS ARM64 包为例：
 
 ```sh
 commit=$(git rev-parse HEAD)
 run_id=实际运行ID
 python3 scripts/artifacts.py extract \
-  --archive /path/to/macos-arm64.zip \
+  --archive /path/to/native-macos-arm64.tar.gz \
   --expected-commit "$commit" --expected-run-id "$run_id" \
-  --archive-sha256 GitHub_artifact_digest \
+  --archive-sha256 对应下载文件的SHA256 \
   --checkout . --output ".artifacts/$commit-macos-arm64"
 python3 scripts/validate.py \
   --bundle ".artifacts/$commit-macos-arm64" --checkout . \

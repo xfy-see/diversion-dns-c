@@ -8,8 +8,9 @@ This is the independent C repository requested by the owner. Keep C changes here
 2. Let `.github/workflows/build.yml` compile on GitHub. Do not invoke local C compilers,
    Make build targets, Zig, or reinstall a local C build environment unless the owner
    explicitly changes this instruction. Pure Python verifier tests are allowed locally.
-3. Wait for all four jobs for the exact commit to succeed. Download the matching
-   artifacts. Verify workflow head SHA, run ID/attempt, artifact digest, Git source
+3. Wait for all four build/test jobs for the exact commit to succeed, plus the delivery
+   job on main. Download the matching Actions ZIP or commit/run/attempt CI prerelease
+   asset. Verify workflow head SHA, run ID/attempt, artifact digest, Git source
    tree and every payload hash before executing a downloaded program.
 4. Run `scripts/validate.py` on the downloaded macOS ARM64 bundle. It executes native
    and ASan/UBSan unit, domain, server, plan and nft CLI tests without compilation.
