@@ -49,9 +49,14 @@ def main():
     shutil.copyfile(work / "src/pcre2.h", out / "include/pcre2.h")
     library = out / "lib/libpcre2-8.a"
     shutil.copyfile(work / ".libs/libpcre2-8.a", library)
+    licenses = out / "licenses"
+    licenses.mkdir()
+    for name in ("LICENCE.md", "AUTHORS.md"):
+        shutil.copyfile(source / name, licenses / ("PCRE2-" + name))
     manifest = {"profile": "pcre2-8-no-unicode-no-jit", "version": "10.48",
                 "archive": archive, "configure_options": profiles.PCRE2_CONFIGURE_OPTIONS,
-                "commands": commands, "library": profiles.record(library)}
+                "commands": commands, "library": profiles.record(library),
+                "licenses": {p.name: profiles.record(p) for p in sorted(licenses.iterdir())}}
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(str(out))
 

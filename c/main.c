@@ -9,7 +9,7 @@
 #include <unistd.h>
 
 static void usage(void) {
-    puts("mosdns-c minimal: version | check [-c config] [-d directory] | start [-c config] [-d directory] [--cpu workers]");
+    puts("mosdns-c fixed splitter: version | check [-c config] [-d directory] | start [-c config] [-d directory] [--cpu workers]");
 }
 int main(int argc, char **argv) {
     if (argc == 1 || !strcmp(argv[1], "help") || !strcmp(argv[1], "--help") || !strcmp(argv[1], "-h")) {
@@ -17,13 +17,13 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(argv[1], "version")) {
         if (argc != 2) { fputs("version takes no arguments\n", stderr); return 1; }
-        puts("mosdns-c 0.1.0 minimal"); return 0;
+        puts("mosdns-c 0.2.0 fixed-splitter"); return 0;
     }
     bool check = !strcmp(argv[1], "check");
     if (!check && strcmp(argv[1], "start")) {
         fprintf(stderr, "unsupported command: %s\n", argv[1]); return 1;
     }
-    const char *config = "config.yaml", *dir = NULL;
+    const char *config = "config.conf", *dir = NULL;
     unsigned workers = 4;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(); return 0; }
@@ -39,14 +39,14 @@ int main(int argc, char **argv) {
             workers = (unsigned)n;
         } else { fprintf(stderr, "unknown option: %s\n", argv[i]); return 1; }
     }
-    /* 先切换目录，使配置、include 和规则文件使用同一套相对路径基准。 */
+    /* 先切换目录，使配置和规则文件使用同一套相对路径基准。 */
     if (dir && chdir(dir)) { fprintf(stderr, "chdir: %s\n", strerror(errno)); return 1; }
     char err[MD_ERROR_SIZE] = {0};
     md_engine *e = md_engine_load(config, check, err);
     if (!e) { fprintf(stderr, "%s\n", err); return 1; }
-    /* check 只验证支持的配置和引用，不启动监听器，也不加载规则文件。 */
+    /* check 验证固定配置并加载规则文件，不启动监听器或访问 nft。 */
     if (check) {
-        puts("configuration valid (no listeners or nft writes; rule files and runtime resources not checked)");
+        puts("configuration and rule files valid (no listeners/upstream connections or nft writes; runtime resources not fully checked)");
         md_engine_free(e); return 0;
     }
     /* 客户端提前断开 TCP 时，把写失败交给正常错误路径处理，避免进程被 SIGPIPE 终止。 */

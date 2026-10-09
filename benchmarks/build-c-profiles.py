@@ -28,6 +28,12 @@ PCRE2_CONFIGURE_OPTIONS = [
     "--disable-dependency-tracking", "--disable-pcre2grep-libz",
     "--disable-pcre2grep-libbz2",
 ]
+# The fixed runner imports the retained protocol/mock helpers in integration.py.
+# Copy support modules as well as selected runners so this tree is standalone.
+STANDALONE_TEST_FILES = (
+    "c/tests/domain_fixture.py", "c/tests/fixed_integration.py", "c/tests/integration.py",
+    "c/tests/nft_cli_test.py", "tests/fixtures/matcher_domain.json",
+)
 
 
 class BuildError(RuntimeError):
@@ -77,6 +83,13 @@ def write_json(path, data):
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
     tmp.replace(path)
+
+
+def copy_standalone_test_files(frozen, output):
+    for name in STANDALONE_TEST_FILES:
+        path = output / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(frozen / name, path)
 
 
 # 逐文件确认读取期间内容没变化，再以只读文件固定本次构建输入。
@@ -176,8 +189,8 @@ def main():
     if args.jobs < 1 or args.jobs > 32:
         parser.error("--jobs must be 1 through 32")
     archive_record = record(args.pcre2_archive)
-    if archive_record["sha256"] != args.pcre2_sha256:
-        parser.error("PCRE2 archive SHA256 differs from expected checksum")
+    if args.pcre2_sha256 != PCRE2_SHA256 or archive_record["sha256"] != PCRE2_SHA256:
+        parser.error("PCRE2 archive SHA256 differs from pinned 10.48 checksum")
     args.output.mkdir(mode=0o700)
     out = args.output
     manifest = {"schema_version": 1, "status": "building", "created_utc": utc_now(),
@@ -207,6 +220,11 @@ def main():
             manifest["pcre2"]["release_metadata"] = record(deps / "release-metadata.json")
             manifest["pcre2"]["checksum_validation"] += "; matched official release API asset digest"
         pcre_source = extract_archive(frozen_archive, deps / "source")
+        licenses = out / "licenses"
+        licenses.mkdir()
+        for name in ("LICENCE.md", "AUTHORS.md"):
+            shutil.copyfile(pcre_source / name, licenses / ("PCRE2-" + name))
+        manifest["licenses"] = {p.name: record(p) for p in sorted(licenses.iterdir())}
         pcre_inputs = tree(pcre_source)
         manifest["pcre2"]["inputs"] = pcre_inputs
         for p in pcre_source.rglob("*"):
@@ -245,25 +263,19 @@ def main():
         pcre_lib = pcre_build / ".libs/libpcre2-8.a"
         manifest["pcre2"]["static_library"] = {"path": str(pcre_lib), **record(pcre_lib)}
         c_root = frozen / "c"
-        cpp = ["-I" + str(c_root / "include"), "-I" + str(c_root / "vendor/libyaml/include"),
+        cpp = ["-I" + str(c_root / "include"),
                "-I" + str(pcre_build / "src"), "-I" + str(pcre_source / "src"), "-D_POSIX_C_SOURCE=200809L", "-D_DEFAULT_SOURCE"]
         # Zig's optimized C mode defines NDEBUG. Assertions in the harnesses
         # also perform required calls, so explicitly keep them enabled.
         cflags = flags + ["-UNDEBUG", "-std=c11", "-Wall", "-Wextra", "-Wpedantic", "-Werror", "-pthread"]
         libsrc = ["coremain/engine.c", "pkg/dns.c", "pkg/upstream.c", "pkg/domain.c", "pkg/util.c", "plugin/cache.c", "plugin/nftset.c"]
-        yaml = sorted(str(p.relative_to(c_root)) for p in (c_root / "vendor/libyaml/src").glob("*.c"))
-        sources = libsrc + yaml + ["main.c", "pkg/server.c"]
+        sources = libsrc + ["main.c", "pkg/server.c"]
         objects = {}
 
         def compile_source(name):
             obj = work / "objects" / (name + ".o")
             obj.parent.mkdir(parents=True, exist_ok=True)
-            effective = list(cflags)
-            macros = []
-            if name in yaml:
-                effective.remove("-Werror")
-                macros = ['-DYAML_VERSION_STRING="0.2.5"', "-DYAML_VERSION_MAJOR=0", "-DYAML_VERSION_MINOR=2", "-DYAML_VERSION_PATCH=5"]
-            cmd = [str(args.zig), "cc", "-target", args.target] + cpp + effective + macros + ["-c", str(c_root / name), "-o", str(obj)]
+            cmd = [str(args.zig), "cc", "-target", args.target] + cpp + cflags + ["-c", str(c_root / name), "-o", str(obj)]
             return name, obj, command(cmd, work, env, logs / ("compile-" + name.replace("/", "_") + ".log"))
 
         # 每个源文件写独立对象和日志，可并行编译；链接等待全部对象完成。
@@ -272,7 +284,7 @@ def main():
                 objects[name] = obj
                 manifest["commands"].append(item)
         lib = work / "libmosdns-c.a"
-        manifest["commands"].append(command([str(args.zig), "ar", "rcs", str(lib)] + [str(objects[v]) for v in libsrc + yaml], work, env, logs / "archive.log"))
+        manifest["commands"].append(command([str(args.zig), "ar", "rcs", str(lib)] + [str(objects[v]) for v in libsrc], work, env, logs / "archive.log"))
         ldflags = ["-static", "-Wl,--gc-sections", "-Wl,-s", "-Wl,-z,stack-size=1048576"]
         app = out / "mosdns-c"
         verbose_env = env.copy()
@@ -309,9 +321,12 @@ def main():
                                              "--output", str(size_json)],
                                             work, env, logs / "size-attribution.log"))
         size_result = json.loads(size_json.read_text())
+        if size_result["disk_bytes"]["libyaml"] != 0 or size_result["bss_bytes"]["libyaml"] != 0:
+            raise BuildError("specialized binary unexpectedly retains libyaml sections")
         size_result["versions"] = {"zig": manifest["build"]["compiler"]["version"],
-                                   "libyaml": "0.2.5", "pcre2": "10.48",
+                                   "pcre2": "10.48",
                                    "musl": "bundled with the pinned Zig distribution; upstream version not recorded"}
+        size_result["historical_source_only"] = {"libyaml": "0.2.5; retained source/license, not built or linked"}
         size_result["explicit_link_inputs"] = {
             "main.c.o": record(objects["main.c"]), "pkg/server.c.o": record(objects["pkg/server.c"]),
             "libmosdns-c.a": record(lib), "libpcre2-8.a": record(pcre_lib)}
@@ -323,9 +338,8 @@ def main():
         testdir = out / "tests"
         testdir.mkdir()
         manifest["test_binaries"] = {}
-        names = ["dns_test", "cache_domain_test", "engine_test", "domain_driver", "nft_netlink_test"]
-        if (c_root / "tests/plan_regression_test.c").is_file():
-            names.append("plan_regression_test")
+        names = ["dns_test", "cache_domain_test", "fixed_config_test", "fixed_engine_test",
+                 "domain_driver", "nft_netlink_test"]
         for name in names:
             binary = testdir / name
             cmd = [str(args.zig), "cc", "-target", args.target] + cpp + cflags + ldflags + [str(c_root / ("tests/" + name + ".c")), str(lib), str(pcre_lib), "-pthread", "-o", str(binary)]
@@ -335,10 +349,7 @@ def main():
         cmd = [str(args.zig), "cc", "-target", args.target] + cpp + cflags + ldflags + [str(c_root / "tests/nft_cli_driver.c"), str(c_root / "pkg/dns.c"), "-pthread", "-o", str(driver)]
         manifest["commands"].append(command(cmd, work, env, logs / "link-nft-cli-driver.log"))
         manifest["test_binaries"]["nft_cli_driver"] = {"path": str(driver), **record(driver)}
-        for name in ("c/tests/domain_fixture.py", "c/tests/integration.py", "tests/fixtures/matcher_domain.json"):
-            p = out / name
-            p.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(frozen / name, p)
+        copy_standalone_test_files(frozen, out)
         # file 只识别文件格式，目标机执行和网络/性能测试必须另行记录。
         for artifact in [app] + list(testdir.iterdir()):
             file_result = subprocess.run(["file", str(artifact)], capture_output=True, text=True, check=True)

@@ -55,14 +55,12 @@ jobs:
             options=()
             if [[ $profile == asan ]]; then options+=(SANITIZE=1); fi
             targets=(all)
-            for t in dns_test cache_domain_test engine_test plan_regression_test nft_netlink_test domain_driver; do
+            for t in dns_test cache_domain_test fixed_config_test fixed_engine_test nft_netlink_test domain_driver nft_cli_driver; do
               targets+=("$folder/tests/$t")
             done
             make -C c -j4 CC="$CC" BUILD="$folder" PCRE2_LIB="$lib" PCRE2_CFLAGS="$cpp" "${options[@]}" "${targets[@]}" 2>&1 | tee .build/compile-logs/$profile.log
-            args=()
-            if [[ $profile == asan ]]; then args+=(--sanitize); fi
-            python3 c/tests/nft_cli_test.py --output .build/nft-$profile --compile-only "${args[@]}"
-            cp .build/nft-$profile/nft-cli-driver .build/$profile/tests/nft_cli_driver
+            mkdir -p .build/$profile/licenses
+            cp .build/pcre2-8-no-unicode-no-jit/licenses/* .build/$profile/licenses/
           done
       - name: Package, verify and execute the complete suite
         env:

@@ -15,8 +15,12 @@ import zipfile
 
 # 规则分为两层：外层档案身份/摘要，内层文件集合、Git blob 和运行配置。
 ROOT = Path(__file__).resolve().parents[1]
-TESTS = ('dns_test', 'cache_domain_test', 'engine_test', 'plan_regression_test',
+TESTS = ('dns_test', 'cache_domain_test', 'fixed_config_test', 'fixed_engine_test',
          'nft_netlink_test', 'domain_driver', 'nft_cli_driver')
+# Preserve verification of archived plugin/sequence bundles without allowing an
+# incomplete or mixed collection of current and historical harnesses.
+LEGACY_TESTS = ('dns_test', 'cache_domain_test', 'engine_test', 'plan_regression_test',
+                'nft_netlink_test', 'domain_driver', 'nft_cli_driver')
 REPO = 'xfy-see/diversion-dns-c'
 LIMIT = 400 * 1024 * 1024
 
@@ -24,6 +28,14 @@ LIMIT = 400 * 1024 * 1024
 def require(condition, message):
     if not condition:
         raise ValueError(message)
+
+
+def test_suite(profile):
+    names = set(profile['tests'])
+    suite = 'fixed-splitter' if names == set(TESTS) else 'legacy-plugin'
+    require(names in (set(TESTS), set(LEGACY_TESTS))
+            and profile.get('suite', suite) == suite, 'incomplete or mixed test profile')
+    return suite
 
 
 def digest(data):
@@ -91,11 +103,13 @@ def pack(args):
         label, folder = value.split('=', 1)
         require(label in ('native', 'asan', 'static') and label not in profiles, 'invalid profile')
         folder = Path(folder).resolve()
-        profiles[label] = {'application': f'builds/{label}/mosdns-c',
+        profiles[label] = {'suite': 'fixed-splitter', 'application': f'builds/{label}/mosdns-c',
                            'tests': {t: f'builds/{label}/tests/{t}' for t in TESTS}}
         add(profiles[label]['application'], folder / 'mosdns-c', 0o755)
         for t, name in profiles[label]['tests'].items():
             add(name, folder / 'tests' / t, 0o755)
+        for name in ('PCRE2-LICENCE.md', 'PCRE2-AUTHORS.md'):
+            add(f'builds/{label}/licenses/{name}', folder / 'licenses' / name, 0o644)
         original = folder / 'manifest.json'
         if original.exists():
             m = json.loads(original.read_text())
@@ -187,7 +201,8 @@ def read_archive(path, commit, run_id, archive_sha=None):
         require(blob(b) == entry['git_blob'] and m['files']['source/'+name]['mode'] == entry['mode'], 'source Git blob differs')
     require(set(n[7:] for n in contents if n.startswith('source/')) == set(m['git_tree']), 'source membership differs')
     for label, profile in m['profiles'].items():
-        require(label in ('native','asan','static') and set(profile['tests']) == set(TESTS), 'incomplete profile')
+        require(label in ('native','asan','static'), 'invalid profile')
+        test_suite(profile)
         for name in [profile['application'],*profile['tests'].values()]:
             require(name.startswith('builds/'+label+'/') and name in contents and m['files'][name]['mode']==0o755, 'missing executable')
         if label == 'static' and 'size' in profile:
