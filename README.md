@@ -19,6 +19,8 @@ main 分支的四个编译/测试 job 成功后，delivery job 会生成 `ci-<co
 
 每包绑定 commit、run ID/attempt、完整 Git 源码树及逐文件 SHA256。独立保留 CI 测试日志。实际本地工作流不调用 C 编译器；本机测试直接运行下载的程序。
 
+Linux static 包还在 `builds/static/size/` 保存 `mosdns-c.unstripped`、`mosdns-c.map`、`mosdns-c.mapped` 和 `attribution.json`。正常发布的 `builds/static/mosdns-c` 仍按原参数剥离；CI 用同一条 LLD 链接命令额外生成 map，并要求带 map 的已剥离文件与发布文件 SHA256 完全相同。JSON 按真正保留下来的输入节区统计项目代码、内置 libyaml、PCRE2 和 musl/启动/编译器支持，并单列合并常量、链接器生成内容及对齐/文件元数据；`bss_bytes` 是内存节区，不计入磁盘文件。未剥离 ELF 另供符号检查，不能假定其代码字节与使用 `-s` 的发布链接完全相同。
+
 ## 下载后的完整本地校验
 
 先确认精确提交对应的四个 CI job 全部成功，从对应 CI 预发布版本下载同次 run/attempt 的 `.tar.gz`（用 release asset 的 digest/`SHA256SUMS` 校验），或通过 GitHub 插件/CLI 下载 Actions ZIP。以 macOS ARM64 包为例：
