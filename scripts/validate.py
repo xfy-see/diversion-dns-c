@@ -30,6 +30,9 @@ def main():
         r=subprocess.run([str(v) for v in argv],cwd=source,env=env,capture_output=True,text=True,timeout=timeout)
         (out/(label+'.stdout')).write_text(r.stdout); (out/(label+'.stderr')).write_text(r.stderr)
         commands.append(dict(label=label,argv=[str(v) for v in argv],exit_code=r.returncode))
+        if r.returncode:
+            print(r.stdout, end='', flush=True)
+            print(r.stderr, end='', file=sys.stderr, flush=True)
         artifacts.require(r.returncode==0,'test failed: '+label)
 
     try:

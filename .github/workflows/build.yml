@@ -39,6 +39,7 @@ jobs:
         run: |
           set -eo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 -m unittest discover -s tests -p 'test_*.py' -v
           mkdir -p .build/compile-logs
           "$CC" --version > .build/compile-logs/compiler.txt
           pcre2-config --version > .build/compile-logs/pcre2.txt
@@ -140,7 +141,7 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: |
-          python3 -m unittest discover -s tests -p test_artifacts.py -v
+          python3 -m unittest discover -s tests -p 'test_*.py' -v
           python3 scripts/artifacts.py pack --profile static=.build/static --target "$TARGET" --kind static --output .build/pretest.tar.gz
           python3 scripts/artifacts.py extract --archive .build/pretest.tar.gz --expected-commit "$GITHUB_SHA" --expected-run-id "$GITHUB_RUN_ID" --checkout . --output .build/verified
           python3 scripts/validate.py --bundle .build/verified --checkout . --output .build/ci-validation --ci

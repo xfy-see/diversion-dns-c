@@ -63,15 +63,31 @@ def tcp_exchange(port, packet):
         return receive_exact(s, struct.unpack("!H", receive_exact(s, 2))[0])
 
 
+def bound_loopback_pair():
+    # TCP and UDP ephemeral allocations are independent. Hold both sockets
+    # before starting a fixture; a collision here has not run a product test.
+    for _ in range(128):
+        tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            tcp.bind(("127.0.0.1", 0))
+            port = tcp.getsockname()[1]
+            udp.bind(("127.0.0.1", port))
+            return tcp, udp, port
+        except BaseException as error:
+            tcp.close()
+            udp.close()
+            if isinstance(error, OSError) and error.errno == errno.EADDRINUSE:
+                continue
+            raise
+    raise RuntimeError("could not reserve a TCP+UDP mock port in 128 attempts")
+
+
 class MockDNS:
     def __init__(self, address, ttl=60):
         self.address, self.ttl = address, ttl
-        self.tcp = socket.socket()
-        self.tcp.bind(("127.0.0.1", 0))
-        self.port = self.tcp.getsockname()[1]
+        self.tcp, self.udp, self.port = bound_loopback_pair()
         self.tcp.listen()
-        self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.udp.bind(("127.0.0.1", self.port))
         self.tcp.settimeout(0.1)
         self.udp.settimeout(0.1)
         self.stop = threading.Event()
