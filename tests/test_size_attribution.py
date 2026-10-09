@@ -31,6 +31,8 @@ class SizeAttributionTests(unittest.TestCase):
         for source, expected in cases.items():
             with self.subTest(source=source):
                 self.assertEqual(SIZE.category(source), expected)
+        self.assertEqual(SIZE.category("<internal>", ".rodata.str1.1"),
+                         "shared_merged_constants")
 
     def test_map_retained_ranges(self):
         lines = """             VMA              LMA     Size Align Out     In      Symbol

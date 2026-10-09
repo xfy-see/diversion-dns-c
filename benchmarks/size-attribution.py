@@ -14,7 +14,7 @@ YAML_MEMBERS = {f"{name}.c.o" for name in
                 ("api", "dumper", "emitter", "loader", "parser", "reader", "scanner", "writer")}
 PROJECT_MEMBERS = {f"{name}.c.o" for name in
                    ("engine", "dns", "upstream", "domain", "util", "cache", "nftset")}
-CATEGORIES = ("project", "libyaml", "pcre2", "musl_startup_compiler", "linker_generated",
+CATEGORIES = ("project", "libyaml", "pcre2", "musl_startup_compiler", "shared_merged_constants", "linker_generated",
               "alignment_metadata", "unattributed")
 MAP_ROW = re.compile(r"^\s*([0-9a-fA-F]+)\s+([0-9a-fA-F]+)\s+([0-9a-fA-F]+)\s+(\d+)\s+(\S.*)$")
 INPUT_ROW = re.compile(r"^(.*):\(([^()]*)\)$")
@@ -61,8 +61,10 @@ def elf_sections(path):
     return dict(bytes=len(data), sha256=sha256(data), machine=header[2], sections=sections)
 
 
-def category(source):
+def category(source, input_section=""):
     if source.startswith("<internal>"):
+        if input_section.startswith((".rodata.str", ".rodata.cst")):
+            return "shared_merged_constants"
         return "linker_generated"
     if source.startswith("*fill*"):
         return "alignment_metadata"
@@ -105,30 +107,37 @@ def parse_map(path, sections):
         source = INPUT_ROW.fullmatch(body)
         if current and source and size:
             rows[current].append(dict(addr=addr, size=size, source=source[1], input_section=source[2],
-                                      category=category(source[1])))
+                                      category=category(source[1], source[2])))
         elif body.startswith(".") and not source:
             current = None
     return rows
 
 
-def analyze(release_path, debug_path, map_path):
-    release, debug = elf_sections(release_path), elf_sections(debug_path)
+def analyze(release_path, debug_path, mapped_path, map_path):
+    release, debug, mapped = (elf_sections(p) for p in (release_path, debug_path, mapped_path))
     if release["machine"] != debug["machine"] or release["sha256"] == debug["sha256"]:
         raise ValueError("diagnostic ELF architecture or strip state differs")
+    if release["sha256"] != mapped["sha256"]:
+        raise ValueError("map-linked stripped ELF does not match release SHA256: "
+                         + release["sha256"] + " != " + mapped["sha256"])
     release_alloc = {n: {k: v[k] for k in ("type", "flags", "addr", "size", "sha256")}
                      for n, v in release["sections"].items() if v["flags"] & 2}
     debug_alloc = {n: {k: v[k] for k in ("type", "flags", "addr", "size", "sha256")}
                    for n, v in debug["sections"].items() if v["flags"] & 2}
-    if release_alloc != debug_alloc:
+    release_shapes = {n: {k: v[k] for k in ("type", "flags", "addr", "size")}
+                      for n, v in release_alloc.items()}
+    debug_shapes = {n: {k: v[k] for k in ("type", "flags", "addr", "size")}
+                    for n, v in debug_alloc.items()}
+    if release_shapes != debug_shapes:
         differences = {name: dict(release=release_alloc.get(name), diagnostic=debug_alloc.get(name))
                        for name in sorted(set(release_alloc) | set(debug_alloc))
                        if release_alloc.get(name) != debug_alloc.get(name)}
-        raise ValueError("diagnostic and release ELF allocated sections differ: "
+        raise ValueError("diagnostic and release ELF allocated section shapes differ: "
                          + json.dumps(differences, sort_keys=True))
-    rows = parse_map(map_path, debug["sections"])
+    rows = parse_map(map_path, mapped["sections"])
     disk = dict.fromkeys(CATEGORIES, 0)
     bss = dict.fromkeys(CATEGORIES, 0)
-    inputs = defaultdict(lambda: dict(disk_bytes=0, bss_bytes=0, category=None))
+    inputs = defaultdict(lambda: dict(disk_bytes=0, bss_bytes=0))
     output_sections = []
     for name, section in release["sections"].items():
         if not section["flags"] & 2:
@@ -145,8 +154,7 @@ def analyze(release_path, debug_path, map_path):
             per_category["alignment_metadata"] += gap
             target[item["category"]] += item["size"]
             per_category[item["category"]] += item["size"]
-            source = inputs[item["source"]]
-            source["category"] = item["category"]
+            source = inputs[(item["source"], item["category"])]
             source["bss_bytes" if section["type"] == 8 else "disk_bytes"] += item["size"]
             cursor = item["addr"] + item["size"]
         tail = end - cursor
@@ -168,23 +176,28 @@ def analyze(release_path, debug_path, map_path):
     return dict(schema=1, release=dict(bytes=release["bytes"], sha256=release["sha256"],
                                        machine=release["machine"]),
                 diagnostic=dict(bytes=debug["bytes"], sha256=debug["sha256"],
-                                map_sha256=sha256(map_path.read_bytes()), alloc_sections_equal=True),
+                                alloc_section_shapes_equal=True,
+                                alloc_section_contents_equal=release_alloc == debug_alloc),
+                map_replay=dict(sha256=mapped["sha256"], matches_release=True,
+                                map_sha256=sha256(map_path.read_bytes())),
                 methods=dict(disk="retained LLD map input ranges in SHF_ALLOC file-backed ELF sections; gaps and non-section bytes separate",
                              bss="retained LLD map input ranges in SHF_ALLOC SHT_NOBITS sections; not disk bytes",
-                             caveat="input-section attribution, not semantic ownership; shared constants, inlining, linker synthesis and padding limit interpretation"),
+                             caveat="map replay is byte-identical to release; unstripped ELF may differ in contents despite equal allocated section shapes; pooled constants, inlining, linker synthesis and padding limit semantic ownership"),
                 disk_bytes=disk, bss_bytes=bss, loadable_file_section_bytes=loadable_file_bytes,
                 non_section_file_bytes=overhead, sections=output_sections,
-                linked_inputs=[dict(source=k, **v) for k, v in sorted(inputs.items())])
+                linked_inputs=[dict(source=source, category=cat, **value)
+                               for (source, cat), value in sorted(inputs.items())])
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--release", type=Path, required=True)
     parser.add_argument("--diagnostic", type=Path, required=True)
+    parser.add_argument("--mapped", type=Path, required=True)
     parser.add_argument("--map", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    result = analyze(args.release, args.diagnostic, args.map)
+    result = analyze(args.release, args.diagnostic, args.mapped, args.map)
     args.output.write_text(json.dumps(result, sort_keys=True, indent=2) + "\n")
     print(json.dumps(dict(release=result["release"], disk_bytes=result["disk_bytes"],
                           bss_bytes=result["bss_bytes"])))

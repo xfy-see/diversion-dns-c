@@ -248,34 +248,40 @@ def main():
         manifest["commands"].append(command([str(args.zig), "ar", "rcs", str(lib)] + [str(objects[v]) for v in libsrc + yaml], work, env, logs / "archive.log"))
         ldflags = ["-static", "-Wl,--gc-sections", "-Wl,-s", "-Wl,-z,stack-size=1048576"]
         app = out / "mosdns-c"
-        manifest["commands"].append(command([str(args.zig), "cc", "-target", args.target] + ldflags + ["-o", str(app), str(objects["main.c"]), str(objects["pkg/server.c"]), str(lib), str(pcre_lib), "-pthread"], work, env, logs / "link-app.log"))
+        verbose_env = env.copy()
+        verbose_env["ZIG_VERBOSE_LINK"] = "1"
+        normal_link_log = logs / "link-app.log"
+        manifest["commands"].append(command([str(args.zig), "cc", "-target", args.target] + ldflags + ["-o", str(app), str(objects["main.c"]), str(objects["pkg/server.c"]), str(lib), str(pcre_lib), "-pthread"], work, verbose_env, normal_link_log))
         manifest["binary"] = {"path": str(app), **record(app), "stripped": True, "static": True}
-        # Keep the published link above unchanged. Relink the same objects without
-        # -s so the map can attribute retained input sections, then verify that
-        # every allocated section still matches the published ELF byte-for-byte.
+        # Keep the published link flags unchanged. Zig cc rejects -Wl,-Map, so
+        # replay its exact verbose LLD command with a map and verify that the
+        # resulting stripped ELF has the same full SHA256 as the published ELF.
         size_dir = out / "size"
         size_dir.mkdir()
         diagnostic = size_dir / "mosdns-c.unstripped"
+        mapped = size_dir / "mosdns-c.mapped"
         link_map = size_dir / "mosdns-c.map"
         size_json = size_dir / "attribution.json"
+        lld_args = verbose_lld_command(normal_link_log)
+        lld_args[lld_args.index("-o") + 1] = str(mapped)
+        manifest["commands"].append(command([str(args.zig), "ld.lld"] + lld_args
+                                            + ["-Map=" + str(link_map)], work, env,
+                                            logs / "link-app-map.log"))
+        if record(mapped) != {k: manifest["binary"][k] for k in ("bytes", "sha256")}:
+            raise BuildError("map-linked stripped ELF differs from published program")
+        # An unstripped link preserves symbols for inspection. Its allocated
+        # section sizes/addresses are checked separately, not assumed identical
+        # in content to the stripped release.
         diagnostic_flags = [flag for flag in ldflags if flag != "-Wl,-s"]
-        verbose_env = env.copy()
-        verbose_env["ZIG_VERBOSE_LINK"] = "1"
         verbose_log = logs / "link-app-diagnostic.log"
         manifest["commands"].append(command([str(args.zig), "cc", "-target", args.target] + diagnostic_flags
                                             + ["-o", str(diagnostic), str(objects["main.c"]),
                                                str(objects["pkg/server.c"]), str(lib), str(pcre_lib), "-pthread"],
-                                            work, verbose_env, verbose_log))
-        # Zig 0.14 rejects -Wl,-Map in its C driver. Replay the exact LLD
-        # invocation it reports, adding only the map output. The analyzer
-        # checks the resulting ELF's allocated sections against the release.
-        lld_args = verbose_lld_command(verbose_log)
-        manifest["commands"].append(command([str(args.zig), "ld.lld"] + lld_args
-                                            + ["-Map=" + str(link_map)], work, env,
-                                            logs / "link-app-map.log"))
+                                            work, env, verbose_log))
         manifest["commands"].append(command(["python3", str(frozen / "benchmarks/size-attribution.py"),
                                              "--release", str(app), "--diagnostic", str(diagnostic),
-                                             "--map", str(link_map), "--output", str(size_json)],
+                                             "--mapped", str(mapped), "--map", str(link_map),
+                                             "--output", str(size_json)],
                                             work, env, logs / "size-attribution.log"))
         size_result = json.loads(size_json.read_text())
         size_result["versions"] = {"zig": manifest["build"]["compiler"]["version"],
@@ -285,8 +291,9 @@ def main():
             "main.c.o": record(objects["main.c"]), "pkg/server.c.o": record(objects["pkg/server.c"]),
             "libmosdns-c.a": record(lib), "libpcre2-8.a": record(pcre_lib)}
         write_json(size_json, size_result)
-        manifest["size_attribution"] = {"release_alloc_sections_equal": True,
-                                        "diagnostic": record(diagnostic), "map": record(link_map),
+        manifest["size_attribution"] = {"map_replay_matches_release": True,
+                                        "diagnostic": record(diagnostic), "mapped": record(mapped),
+                                        "map": record(link_map),
                                         "report": record(size_json)}
         testdir = out / "tests"
         testdir.mkdir()
