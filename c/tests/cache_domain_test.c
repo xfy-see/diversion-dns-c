@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #define PCRE2_CODE_UNIT_WIDTH 8
+/* 用人为指定的单调秒数验证 TTL，不依赖真实等待；同时覆盖域名和 nft 参数解析。 */
 #include "mosdns.h"
 #include <pcre2.h>
 #include <assert.h>
@@ -50,6 +51,7 @@ static void assert_ttl(md_packet *r, uint32_t ttl) {
 static void positive(md_packet *q, md_packet *r, uint32_t ttl) {
     assert(!md_dns_error(q, r, 0)); add_a(r, ttl, 0);
 }
+/* 分别验证键隔离、TTL/负缓存、lazy 到期和 LRU 淘汰，不把过期命中当新鲜数据。 */
 static void cache_tests(void) {
     md_packet q, other, response, hit; char err[MD_ERROR_SIZE];
     md_cache *c = md_cache_new(2, 100); assert(c);
@@ -122,6 +124,7 @@ static void *read_write_thread(void *arg) {
     }
     return NULL;
 }
+/* 并发刷新必须只有一个获得标记；并行 put/get 应始终返回独立且一致的报文。 */
 static void concurrency_tests(void) {
     md_cache *c = md_cache_new(2, 100); assert(c); md_packet q;
     query(&q, "concurrent.test", 0x0100, 1);
@@ -134,6 +137,7 @@ static void concurrency_tests(void) {
     md_cache_free(c);
 }
 
+/* 检查依赖实际关闭 Unicode/JIT，并验证字节模式和必须失败的 Unicode 指令。 */
 static void regex_profile_tests(void) {
     uint32_t enabled = 1;
     assert(!pcre2_config(PCRE2_CONFIG_UNICODE, &enabled));
@@ -179,6 +183,7 @@ static void regex_profile_tests(void) {
     md_domain_free(d);
 }
 
+/* 固定八条 cn-site 正则的正例、反例和后缀攻击，保护实际规则的锚定语义。 */
 static void direct_list_regex_tests(void) {
     /* All eight regexp lines, unchanged, from Loyalsoldier/v2ray-rules-dat:
      * https://github.com/Loyalsoldier/v2ray-rules-dat/blob/99f994716ed6323595c9ba5ff6dc36b6a1fe27c7/direct-list.txt#L111725-L111732
@@ -253,6 +258,7 @@ static void domain_tests(void) {
     unlink(path); md_domain_free(d);
 }
 
+/* 这里验证配置解析及非 Linux 错误；不操作目标机集合，也不证明真实内核更新。 */
 static void nft_tests(void) {
     char err[MD_ERROR_SIZE];
     md_nft *n = md_nft_new("inet,filter,cn4,ipv4_addr,24 ip6,filter,cn6,ipv6_addr,48", err); assert(n);

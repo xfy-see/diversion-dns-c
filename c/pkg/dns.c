@@ -1,8 +1,11 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* DNS 报文处理只操作 wire 格式：解析时检查边界，修改时保留问题段和压缩偏移。
+ * 域名匹配使用规范化的小写文本；RR 中不参与匹配的名称允许二进制标签。 */
 #include "mosdns.h"
 #include <stdio.h>
 #include <string.h>
 
+/* 用字节读写网络字节序，避免未对齐访问和主机端序对报文的影响。 */
 uint16_t md_read16(const uint8_t *p) { return (uint16_t)((p[0] << 8) | p[1]); }
 uint32_t md_read32(const uint8_t *p) {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
@@ -24,6 +27,8 @@ static int fail(char *err, const char *s) {
  * surviving name. Expanded names, pointer chains, and original bytes are all
  * bounded independently. Binary names are accepted for RRs; questions use the
  * printable, unambiguous dotted representation used by domain/cache matching. */
+/* end 指向原始名称编码后的字节；遇到压缩指针后，展开位置与 end 分开推进。
+ * visited 防循环，wire 限制展开长度，包边界限制实际读取，三者分别校验。 */
 static int name(const md_packet *p, size_t start, size_t *end, char *out, char *err) {
     uint8_t visited[(MD_MAX_PACKET + 7) / 8] = {0};
     size_t at = start, wire = 1, used = 0;
@@ -64,6 +69,7 @@ static int name(const md_packet *p, size_t start, size_t *end, char *out, char *
     }
 }
 
+/* 本实现仅支持标准 QUERY 操作码和单问题报文；默认 UDP 限制为 512，OPT 扫描后再覆盖。 */
 static int question(const md_packet *p, md_question *q, char *err) {
     if (!p || p->len < 12 || p->len > MD_MAX_PACKET)
         return fail(err, "short DNS header");
@@ -80,12 +86,14 @@ static int question(const md_packet *p, md_question *q, char *err) {
     return 0;
 }
 
+/* 压缩名称可以引用记录外的旧字节，但此处名称的原始编码必须完整位于 RDATA 内。 */
 static int rdata_name(const md_packet *p, size_t at, size_t limit, size_t *end, char *err) {
     if (at >= limit || name(p, at, end, NULL, err)) return -1;
     if (*end > limit) return fail(err, "DNS RDATA name exceeds record");
     return 0;
 }
 
+/* 显式支持的 RR 类型校验其内部结构；其他类型把 RDATA 当作不透明字节串。 */
 static int rdata(const md_packet *p, const md_rr *rr, char *err) {
     size_t at = rr->data_offset, end = at + rr->data_len, next;
     switch (rr->type) {
@@ -125,6 +133,8 @@ static int rdata(const md_packet *p, const md_rr *rr, char *err) {
     return 0;
 }
 
+/* 顺序扫描 answer、authority、additional，并要求计数恰好覆盖整个报文。
+ * OPT 只允许一个且必须在 additional；TTL 字段在 OPT 中承载 EDNS 标志而非生存时间。 */
 static int records(const md_packet *p, md_question *q, md_rr_fn fn, void *arg,
                    size_t *opt_start, size_t *opt_end, char *err) {
     size_t at = q->end;
@@ -162,11 +172,13 @@ static int records(const md_packet *p, md_question *q, md_rr_fn fn, void *arg,
     return 0;
 }
 
+/* 名为 question 的公共入口仍验证后续所有记录，因此下游不能仅凭问题段绕过校验。 */
 int md_dns_question(const md_packet *p, md_question *q, char *err) {
     if (!q) return fail(err, "missing DNS question output");
     if (question(p, q, err)) return -1;
     return records(p, q, NULL, NULL, NULL, NULL, err);
 }
+/* 两次扫描把校验与副作用分开：只有整个报文有效时才调用记录回调。 */
 int md_dns_records(const md_packet *p, md_rr_fn fn, void *arg, char *err) {
     md_question q;
     if (question(p, &q, err)) return -1;
@@ -174,6 +186,7 @@ int md_dns_records(const md_packet *p, md_rr_fn fn, void *arg, char *err) {
     if (records(p, &q, NULL, NULL, NULL, NULL, err)) return -1;
     return fn ? records(p, &q, fn, arg, NULL, NULL, err) : 0;
 }
+/* 事务 ID、QR 方向和问题三元组必须一致；同时拒绝结构不完整的响应。 */
 bool md_dns_response_matches(const md_packet *q, const md_packet *r) {
     md_question a, b;
     if (md_dns_question(q, &a, NULL) || md_dns_question(r, &b, NULL)) return false;
@@ -181,6 +194,8 @@ bool md_dns_response_matches(const md_packet *q, const md_packet *r) {
         md_read16(q->data) == md_read16(r->data) && a.type == b.type &&
         a.class_ == b.class_ && !strcmp(a.name, b.name);
 }
+/* 能解析的问题会原样保留；无法解析时生成无问题的最小错误头。
+ * memmove 允许请求与响应使用同一个报文对象。 */
 int md_dns_error(const md_packet *q, md_packet *r, unsigned rcode) {
     md_question parsed;
     if (!q || !r || rcode > 15) return -1;
@@ -196,6 +211,7 @@ int md_dns_error(const md_packet *q, md_packet *r, unsigned rcode) {
     memset(r->data + 6, 0, 6);
     return 0;
 }
+/* 只删除末尾 OPT，避免移动后续记录而破坏报文内的绝对压缩指针。 */
 int md_dns_strip_opt(md_packet *p) {
     md_question q;
     size_t start = 0, end = 0;
@@ -208,6 +224,8 @@ int md_dns_strip_opt(md_packet *p) {
     md_write16(p->data + 10, (uint16_t)(md_read16(p->data + 10) - 1));
     return 0;
 }
+/* 超过客户端 EDNS 限制时保留完整问题，置 TC 并清空三个 RR 区段；
+ * 不在任意字节处截断记录，客户端可据此改用 TCP 查询。 */
 void md_dns_limit_udp(const md_packet *q, md_packet *r) {
     md_question a, b;
     size_t limit = md_dns_question(q, &a, NULL) ? 512 : a.udp_size;

@@ -1,4 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* 将 DNS 答案中的 A/AAAA 写入预先存在的 nft set。普通 set 使用有界
+ * netlink 批次，interval set 使用 nft CLI 的前缀语法；不创建表或集合。
+ * 执行仅支持 Linux，非 Linux 保留配置解析及可移植报文测试能力。 */
 #define _POSIX_C_SOURCE 200809L
 #include "mosdns.h"
 #include <arpa/inet.h>
@@ -26,6 +29,8 @@
 extern char **environ;
 #endif
 
+/* IPv4/IPv6 各保存一个目标；mask 只用于 interval set 的前缀聚合，
+ * 普通 set 始终写入完整地址。 */
 typedef struct {
     char family[5], table[128], set[128];
     unsigned mask, bytes;
@@ -44,6 +49,8 @@ struct md_nft {
     bool active;
 #endif
 };
+/* 表名、集合名只接受有限 ASCII 标识符，随后可直接作为 nft 的 token。
+ * 这些限制也与可移植 netlink 编码器的标识符检查保持一致。 */
 static bool valid_name(const char *s) {
     size_t n = strlen(s);
     if (!n || n >= 128) return false;
@@ -56,6 +63,8 @@ static bool valid_name(const char *s) {
     }
     return true;
 }
+/* 每段配置是 family,table,set,address_type,mask，最多两段。
+ * 同一种地址类型的后段覆盖前段；解析失败不向调用方交付半成品对象。 */
 md_nft *md_nft_new(const char *args, char *err) {
     md_nft *n = calloc(1, sizeof(*n));
     if (!n) { snprintf(err, MD_ERROR_SIZE, "out of memory creating nftset"); return NULL; }
@@ -91,6 +100,8 @@ md_nft *md_nft_new(const char *args, char *err) {
 #ifdef __linux__
     int initialized = pthread_mutex_init(&n->lock, NULL);
     if (initialized) { snprintf(err, MD_ERROR_SIZE, "initialize nftset mutex: %s", strerror(initialized)); free(n); return NULL; }
+    /* 条件变量和整笔请求的截止时间都使用 CLOCK_MONOTONIC，
+     * 排队耗时也计入 5 秒预算。 */
     pthread_condattr_t attr;
     initialized = pthread_condattr_init(&attr);
     bool attr_created = !initialized, cond_created = false;
@@ -127,6 +138,9 @@ static uint64_t milliseconds(void) {
 /* Callers join all users before md_nft_free and never cancel a queued worker.
  * The stack waiter is unlinked under lock on every return. A new request may
  * claim the active token only as head, so a hot worker cannot bypass waiters. */
+/* FIFO 中的等待节点在调用线程栈上，退出前必须持锁摘除。
+ * active 是整笔 nft 操作的串行令牌：锁只保护队列，不在 I/O 期间持有；
+ * 同一实例一次只允许一个请求操作目标，超时请求不会留在队列中。 */
 static int nft_worker_enter(md_nft *n, uint64_t until, char *err) {
     int waiting = pthread_mutex_lock(&n->lock);
     if (waiting) { snprintf(err, MD_ERROR_SIZE, "lock nftset: %s", strerror(waiting)); return -1; }
@@ -152,6 +166,7 @@ static int nft_worker_enter(md_nft *n, uint64_t until, char *err) {
     else if (waiting) snprintf(err, MD_ERROR_SIZE, "wait for nftset worker: %s", strerror(waiting));
     return waiting ? -1 : 0;
 }
+/* 释放串行令牌并唤醒等待者；是否成为下一位由 FIFO 头部决定。 */
 static int nft_worker_leave(md_nft *n, char *err) {
     int released = pthread_mutex_lock(&n->lock);
     if (released) { snprintf(err, MD_ERROR_SIZE, "release nftset worker: %s", strerror(released)); return -1; }
@@ -162,6 +177,9 @@ static int nft_worker_leave(md_nft *n, char *err) {
     if (released) snprintf(err, MD_ERROR_SIZE, "release nftset worker: %s", strerror(released));
     return released ? -1 : 0;
 }
+/* posix_spawn 直接执行程序，不经 shell；stderr 与 stdout 合并收集。
+ * 输入从已生成的文件描述符读取，输出有固定上限；必须同时等到子进程
+ * 已回收和输出 EOF。超时或读输出失败时终止并回收尚未退出的子进程。 */
 static int run_nft(const char *binary, char *const argv[], int input,
                    char *output, size_t output_size, uint64_t until, char *err) {
     if (milliseconds() >= until) { snprintf(err, MD_ERROR_SIZE, "nftset query exceeded its 5 second deadline"); return -1; }
@@ -248,6 +266,8 @@ static int run_nft(const char *binary, char *const argv[], int input,
 static bool token_equal(const char *start, size_t len, const char *token) {
     return strlen(token) == len && !memcmp(start, token, len);
 }
+/* 每笔写入前读取实际集合类型和 interval 标志，不缓存可能过期的
+ * 元数据。CLI 文本只解析所需 token，类型缺失或不符立即拒绝写入。 */
 static int inspect_set(const char *binary, const nft_target *target, bool *interval, uint64_t until, char *err) {
     char output[65536];
     /* These are validated identifier tokens, not shell words. Literal quote
@@ -284,6 +304,8 @@ _Static_assert(NLM_F_REQUEST == 1 && NLM_F_ACK == 4 && NLM_F_CREATE == 0x400 && 
 _Static_assert(NFTA_SET_ELEM_LIST_TABLE == 1 && NFTA_SET_ELEM_LIST_SET == 2 && NFTA_SET_ELEM_LIST_ELEMENTS == 3 && NFTA_LIST_ELEM == 1 && NFTA_SET_ELEM_KEY == 1 && NFTA_DATA_VALUE == 1 && NFTA_GEN_ID == 1, "nft attribute ABI");
 _Static_assert(AF_NETLINK == 16 && NFPROTO_INET == 1 && NFPROTO_IPV4 == 2 && NFPROTO_IPV6 == 10, "netlink family ABI");
 typedef struct { const nft_target *target; uint8_t (*keys)[16]; size_t count; uint64_t until; } nft_keys;
+/* 只收集 answer section 的 IN A/AAAA，去重后最多保存 4095 个地址。
+ * 扫描及去重过程中检查整笔请求的截止时间，避免大响应耗尽预算。 */
 static int collect_plain_key(const md_packet *p, const md_rr *rr, void *arg) {
     nft_keys *v = arg;
     if (rr->section || rr->class_ != 1 || rr->type != (v->target->bytes == 4 ? 1 : 28)) return 0;
@@ -296,6 +318,8 @@ static int collect_plain_key(const md_packet *p, const md_rr *rr, void *arg) {
     if (v->count == MD_NL_MAX_KEYS) return -1;
     memcpy(v->keys[v->count++], key, rr->data_len); return 0;
 }
+/* 下列发送、接收和 ACK 处理共享同一个截止点，重试 EINTR/EAGAIN
+ * 不会重新获得一份超时预算。 */
 static int nft_nl_wait(int fd, short events, uint64_t until, char *err) {
     while (milliseconds() < until) {
         uint64_t now = milliseconds(); if (now >= until) break;
@@ -321,6 +345,8 @@ static int nft_nl_send(int fd, const uint8_t *wire, size_t length, uint64_t unti
         return -1;
     }
 }
+/* 只接收内核的单播消息；截断、控制数据截断及意外发送方均拒绝。
+ * 编码器负责结构及请求关联检查，本层先确认 recvmsg 的来源和完整性。 */
 static int nft_nl_receive(int fd, uint8_t *wire, size_t capacity, size_t *length, uint64_t until, char *err) {
     for (;;) {
         if (nft_nl_wait(fd, POLLIN, until, err)) return -1;
@@ -336,6 +362,8 @@ static int nft_nl_receive(int fd, uint8_t *wire, size_t capacity, size_t *length
         *length = (size_t)received; return 0;
     }
 }
+/* GETGEN 返回完整的 32 位 ruleset generation，作为后续批次的
+ * 乐观并发条件；不能用 nfgenmsg.res_id 的 16 位摘要替代。 */
 static int nft_nl_generation(int fd, uint32_t port, uint32_t seq, uint8_t *receive, uint64_t until, uint32_t *generation, char *err) {
     uint8_t request[20]; md_nl_requests requests; size_t length; int kernel_errno = 0;
     if (md_nft_nl_getgen_encode(request, sizeof(request), &requests, port, seq) || nft_nl_send(fd, request, requests.length, until, err) || nft_nl_receive(fd, receive, MD_NL_BUFFER_SIZE, &length, until, err)) return -1;
@@ -344,6 +372,10 @@ static int nft_nl_generation(int fd, uint32_t port, uint32_t seq, uint8_t *recei
     if (milliseconds() >= until) { snprintf(err, MD_ERROR_SIZE, "nftset query exceeded its 5 second deadline validating generation"); return -1; }
     return 0;
 }
+/* 使用独立 netlink socket 和序列号范围，避免混入其他事务的 ACK。
+ * 先查询 generation，再读集合元数据并复查 generation；批次携带该值，
+ * 让内核拒绝元数据检查后发生的规则变更。发送后的失败不转用 CLI，
+ * 因为写入结果可能已经生效，重放会掩盖不确定的状态。 */
 static int add_plain_target(const char *binary, const nft_target *t, const md_packet *r, uint64_t until, char *err) {
     /* No fallback after send. Interval targets never enter this function. */
     int fd = -1, rc = -1; uint8_t (*keys)[16] = calloc(MD_NL_MAX_KEYS, sizeof(*keys));
@@ -369,6 +401,8 @@ static int add_plain_target(const char *binary, const nft_target *t, const md_pa
     md_nl_requests requests; uint8_t family = !strcmp(t->family, "inet") ? 1 : !strcmp(t->family, "ip") ? 2 : 10;
     if (md_nft_nl_batch_encode(wire, MD_NL_BUFFER_SIZE, &requests, local.nl_pid, (uint32_t)ticket + 2, family, t->table, t->set, (const uint8_t (*)[16])keys, values.count, t->bytes, after)) { snprintf(err, MD_ERROR_SIZE, "encode bounded nft add batch"); goto done; }
     if (nft_nl_send(fd, wire, requests.length, until, err)) goto done;
+    /* 一个 recvmsg 可以包含多个 ACK；必须检查整包中的边界错误，
+     * 收齐所有要求 ACK 的添加请求后，才报告本批次成功。 */
     do {
         size_t length; int kernel_errno = 0;
         if (nft_nl_receive(fd, receive, MD_NL_BUFFER_SIZE, &length, until, err)) goto done;
@@ -382,6 +416,8 @@ done:
     free(keys); free(wire); free(receive); return rc;
 }
 typedef struct { const nft_target *target; FILE *file; bool interval; unsigned count; } nft_write;
+/* DNS RDATA 本身是网络序地址字节。interval 模式将主机位清零后
+ * 输出规范前缀；普通模式输出原始完整地址，不对地址应用 mask。 */
 static int write_element(const md_packet *p, const md_rr *rr, void *arg) {
     nft_write *v = arg;
     if (rr->section || rr->class_ != 1 || rr->type != (v->target->bytes == 4 ? 1 : 28)) return 0;
@@ -401,6 +437,8 @@ static int write_element(const md_packet *p, const md_rr *rr, void *arg) {
     if (v->interval) fprintf(v->file, "/%u", v->target->mask);
     return ferror(v->file) ? -1 : 0;
 }
+/* 先确认响应中有目标地址，再访问 nft 元数据。interval set 重写输入
+ * 为完整的 add element 命令，通过 nft -f - 解析前缀及区间语义。 */
 static int add_target(const char *binary, const nft_target *t, const md_packet *r, uint64_t until, char *err) {
     if (!t->enabled) return 0;
     /* Collect before reading metadata: no A/AAAA answers means no nft access. */
@@ -427,6 +465,9 @@ static int add_target(const char *binary, const nft_target *t, const md_packet *
 }
 #endif
 
+/* IPv4 后 IPv6 共用排队与 I/O 的 5 秒预算；第一个失败立即返回。
+ * 两种地址目标之间没有统一事务，IPv6 失败不会回滚已完成的 IPv4 写入。
+ * 无论哪条路径出错，取得的串行令牌都由 leave 释放。 */
 int md_nft_apply(md_nft *n, const md_packet *r, char *err) {
     if (!n || !r) { snprintf(err, MD_ERROR_SIZE, "invalid nftset input"); return -1; }
 #ifndef __linux__
@@ -443,6 +484,7 @@ int md_nft_apply(md_nft *n, const md_packet *r, char *err) {
     return rc;
 #endif
 }
+/* 销毁前调用方须停止并等待所有使用者，包含排队线程；此处不取消任务。 */
 void md_nft_free(md_nft *n) {
     if (!n) return;
 #ifdef __linux__

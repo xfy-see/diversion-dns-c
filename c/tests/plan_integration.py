@@ -19,6 +19,7 @@ import unittest
 import integration as base  # Reuses its CLI binary argument and framing helpers.
 
 
+# 独立解析响应压缩名，并拒绝循环/前向指针，以免只断言最后几个地址字节。
 def read_name(packet, start):
     labels, at, end, visited = [], start, None, set()
     while True:
@@ -72,6 +73,7 @@ def parse_response(packet):
     return header, (name, typ, cls), rr
 
 
+# 通过事件精确控制刷新开始与释放，测试旧响应副本和退出等待生命周期。
 class SemanticDNS(base.MockDNS):
     def __init__(self):
         self.refresh_started = threading.Event()
@@ -197,6 +199,7 @@ class PlanIntegration(unittest.TestCase):
             self.assertEqual(parse_response(first)[2][0]["data"], socket.inet_aton("192.0.2.9"))
             self.assertEqual(parse_response(stale)[2][0]["data"], socket.inet_aton("192.0.2.9"))
 
+    # 主动阻塞刷新后发送 SIGTERM：进程需等待刷新结束，防止释放仍被使用的缓存。
     def test_sigterm_joins_active_lazy_refresh_before_cache_free(self):
         with running(self.config(lazy=30)) as (port, proc):
             base.udp_exchange(port, base.query("shutdown.test"))

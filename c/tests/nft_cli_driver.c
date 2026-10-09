@@ -42,6 +42,7 @@ static int __attribute__((unused)) cli_cond_timedwait(pthread_cond_t *cond, pthr
 #include <unistd.h>
 #include <linux/netlink.h>
 #include "nft_netlink.h"
+/* 仅替换 netlink 传输和时钟；CLI 子进程仍接收真实参数，便于核验接口边界。 */
 static const int fake_fd=2147483646;
 static uint8_t fake_reply[MD_NL_BUFFER_SIZE];static size_t fake_length;
 static unsigned opens,closes,sends,generations,batches,key_count,post_receive_clocks;static uint64_t late_ms;static bool batch_received;
@@ -83,6 +84,7 @@ static ssize_t __attribute__((unused)) fake_receive(int fd,struct msghdr *m,int 
 #define recvmsg fake_receive
 #define clock_gettime fake_clock
 
+/* 直接纳入被测实现以调用内部 add_target；宏替换仅存在于测试 driver。 */
 #include NFT_SOURCE
 #ifdef __APPLE__
 #undef pthread_condattr_setclock
@@ -102,6 +104,7 @@ static void record(md_packet *p, unsigned type, unsigned class_, const char *tex
     memcpy(p->data + at + 12, bytes, length); p->len += 12 + length;
 }
 
+/* 构造 Answer/Authority/Additional 及不同 class，确认只学习符合目标的 Answer 地址。 */
 int main(int argc, char **argv) {
     if (argc != 5) return 2;
     bool v6 = !strcmp(argv[2], "ipv6"), no_answer = !strcmp(argv[2], "nodata");

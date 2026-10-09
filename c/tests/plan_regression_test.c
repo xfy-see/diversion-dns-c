@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Layer 1 of docs/testing-plan-131.md. Native and target-device runnable. */
+/* 测试计划的协议与资源回归层：缓存副本、SOA、刷新标记及竞争连接关闭。 */
 #include "mosdns.h"
 #include <arpa/inet.h>
 #include <assert.h>
@@ -69,6 +70,7 @@ static void flags_question_owner_class(void) {
     assert(!md_dns_question(&r, &parsed, err) && parsed.class_ == 3 && parsed.type == 1);
     puts("plan: DNS ID/question/flags/owner/class passed");
 }
+/* 同时破坏写入/取出后的调用方缓冲，确认缓存复制所有权及 SOA 原始内容保持。 */
 static void negative_soa_and_copy(void) {
     md_packet q, r, original, hit; char err[MD_ERROR_SIZE];
     query(&q, 1, 1, 0x0110); assert(!md_dns_error(&q, &r, 3));
@@ -132,6 +134,7 @@ static double seconds(void) {
     struct timespec t; assert(!clock_gettime(CLOCK_MONOTONIC, &t));
     return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
 }
+/* 黑洞 loopback 让事务走到总超时；比较 fd 数并确认请求未被修改。 */
 static void timeout_closes_exchange(void) {
     uint16_t port = 0; int blackhole = socket_bound(SOCK_DGRAM, &port);
     md_upstream u; char addr[64], err[MD_ERROR_SIZE]; md_packet q, r, original;
@@ -169,6 +172,7 @@ static void *winning_udp(void *opaque) {
     assert(!md_dns_error(&q, &r, 0)); add_a(&r, 1, 60);
     assert(sendto(f->udp, r.data, r.len, 0, (struct sockaddr *)&peer, len) == (ssize_t)r.len); return NULL;
 }
+/* 等待 TCP 已收到问题再放行 UDP 胜者，确保观察到的 EOF 是竞争取消的结果。 */
 static void winner_closes_losing_socket(void) {
     uint16_t tcp_port = 0, udp_port = 0; race_fixture f = {0};
     f.tcp = socket_bound(SOCK_STREAM, &tcp_port); f.udp = socket_bound(SOCK_DGRAM, &udp_port);

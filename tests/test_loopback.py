@@ -6,6 +6,7 @@ import sys
 import unittest
 from unittest.mock import patch
 
+# 只导入 Python fixture，传占位程序参数；不启动 C 程序或编译器。
 spec=importlib.util.spec_from_file_location('loopback_fixture',Path(__file__).resolve().parents[1]/'c/tests/integration.py')
 fixture=importlib.util.module_from_spec(spec)
 with patch.object(sys,'argv',['integration.py','unused-program']): spec.loader.exec_module(fixture)
@@ -28,6 +29,7 @@ class SocketPairTests(unittest.TestCase):
     def test_non_collision_error_releases_both_and_propagates(self):
         self.inject_failure(errno.EACCES,False)
 
+    # 仅注入第二个 UDP bind 失败，确认此前 TCP 资源释放以及可重试错误分类。
     def inject_failure(self,code,recover):
         original=socket.socket; opened=[]
         class FailedUDP:

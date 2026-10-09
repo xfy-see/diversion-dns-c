@@ -11,6 +11,7 @@ native = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(native)
 
 
+# 配置契约测试：mock 在调用构建命令前拦截输入/目录错误，不实际编译依赖。
 class PCRE2ProfileTests(unittest.TestCase):
     def test_native_and_static_share_no_unicode_options(self):
         options = native.profiles.PCRE2_CONFIGURE_OPTIONS

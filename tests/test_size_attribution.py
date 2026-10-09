@@ -16,6 +16,7 @@ BUILD = importlib.util.module_from_spec(BUILD_SPEC)
 BUILD_SPEC.loader.exec_module(BUILD)
 
 
+# 小型手写 map 与命令记录用于核验归类/链接重放规则，避免引入目标执行依赖。
 class SizeAttributionTests(unittest.TestCase):
     def test_sources_are_distinct(self):
         cases = {

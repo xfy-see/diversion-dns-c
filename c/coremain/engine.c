@@ -1,4 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* 配置引擎把 YAML/JSON 转为插件图，再按序列规则执行单个 DNS 查询。
+ * 插件配置在加载完成后保持不变；查询上下文独享，缓存和刷新任务各自同步。 */
 #define _POSIX_C_SOURCE 200809L
 #include "mosdns.h"
 #include "yaml.h"
@@ -17,6 +19,7 @@
  * domain file, opens a socket, or applies an nftables operation. */
 typedef struct { char **v; size_t n; } strings;
 typedef struct plugin plugin;
+/* own 拥有本地规则，names 拥有引用名；sets 只借用引擎中的 domain_set 插件。 */
 typedef struct {
     md_domain *own; strings names; plugin **sets;
 } domains;
@@ -41,12 +44,16 @@ struct plugin {
         struct { md_listener listener; char *target; } server;
     } u;
 };
+/* walker 记录下一条规则和 jump 返回点；同步执行时 back 可指向调用栈。
+ * 后台刷新必须复制整条返回链，不能保存原查询栈上的地址。 */
 typedef struct walker { plugin *sequence; size_t pos; const struct walker *back; } walker;
 typedef struct refresh_job refresh_job;
 struct md_engine {
     plugin **plugins; size_t count; md_listener *listeners; size_t listener_count;
     bool check, stopping; pthread_mutex_t lock; refresh_job *jobs;
 };
+/* revision 只在响应被替换时递增，用于判断缓存后续执行是否生成了新答案。
+ * scratch 在本次查询内复用，deadline/depth/steps 限制序列中的循环。 */
 typedef struct {
     md_engine *engine; const md_packet *query; md_packet *response, *scratch;
     md_question question; uint64_t revision, deadline; unsigned depth, steps;
@@ -80,6 +87,7 @@ static void strings_free(strings *s) {
     for (size_t i = 0; i < s->n; i++) free(s->v[i]); free(s->v);
 }
 static yaml_node_t *node(decoder *d, int index) { return yaml_document_get_node(d->doc, index); }
+/* YAML 标量有显式长度；先拒绝内嵌 NUL，才能安全使用 C 字符串接口。 */
 static bool scalar_has_nul(yaml_node_t *n) {
     return n && n->type==YAML_SCALAR_NODE && memchr(n->data.scalar.value,0,n->data.scalar.length)!=NULL;
 }
@@ -97,6 +105,7 @@ static yaml_node_t *field(decoder *d, yaml_node_t *map, const char *key) {
     }
     return NULL;
 }
+/* 每类节点显式列出允许的键，并拒绝重复键，避免拼写错误被静默忽略。 */
 static int keys(decoder *d, yaml_node_t *map, const char *allowed) {
     if (absent(map)) return 0;
     if (map->type != YAML_MAPPING_NODE) return fail(d->err, "expected a mapping");
@@ -117,6 +126,7 @@ static int keys(decoder *d, yaml_node_t *map, const char *allowed) {
     }
     return 0;
 }
+/* 返回值借用 YAML 文档的内存；需要跨越解析阶段的字符串必须另行复制。 */
 static int string_value(decoder *d, yaml_node_t *n, const char **out) {
     if (!n) { *out = ""; return 0; }
     if (scalar_has_nul(n)) return fail(d->err,"configuration string contains an embedded NUL");
@@ -126,6 +136,7 @@ static int string_value(decoder *d, yaml_node_t *n, const char **out) {
 static int string_field(decoder *d, yaml_node_t *m, const char *key, const char **out) {
     return string_value(d, field(d, m, key), out);
 }
+/* 只接受完整的非负数值，并同时检查转换溢出与字段自身的上限。 */
 static int number_text(const char *s, uint64_t maximum, uint64_t *value, char *err) {
     if (!s || !*s || *s == '-' || isspace((unsigned char)*s)) return fail(err, "invalid unsigned number: %s", s ? s : "");
     errno = 0; char *end; unsigned long long n = strtoull(s, &end, !strncasecmp(s, "0x", 2) ? 16 : 10);
@@ -151,6 +162,7 @@ static int string_list(decoder *d, yaml_node_t *n, strings *out) {
     }
     return 0;
 }
+/* 内联匹配器和动作参数按空白拆分，不提供 shell 引号或转义语法。 */
 static int words(const char *text, strings *out, char *err) {
     const char *p = text;
     while (*p) { while (isspace((unsigned char)*p)) p++; if (!*p) break;
@@ -169,6 +181,7 @@ static int split_action(const char *text, char **name, char **args, char *err) {
     while (isspace((unsigned char)*end)) end++;
     *args = copy_string(end, err); return *args ? 0 : -1;
 }
+/* check 只验证文件路径非空；实际规则文件的存在性和内容由 start 加载。 */
 static int domain_add_file(domains *dom, const char *path, bool check, char *err) {
     if (!*path) return fail(err, "domain file path is empty");
     return check ? 0 : md_domain_load(dom->own, path, err);
@@ -187,6 +200,8 @@ static int parse_domain(decoder *d, yaml_node_t *args, domains *dom) {
     status = 0;
 done: strings_free(&exps); strings_free(&files); return status;
 }
+/* qname 的 $name 引用 domain_set，&path 加载文件，其余参数是内联规则。
+ * 引用先保存名称，待所有 include 和插件解析结束后统一绑定。 */
 static int parse_match(decoder *d, const char *text, matcher *m) {
     while (isspace((unsigned char)*text)) text++;
     if (*text == '!') { m->reverse = true; text++; }
@@ -221,6 +236,7 @@ static int parse_cache(decoder *d, yaml_node_t *args, plugin *p) {
     p->u.cache = md_cache_new((size_t)size, (uint32_t)lazy);
     return p->u.cache ? 0 : fail(d->err, "cannot allocate cache");
 }
+/* 已识别但未实现的传输选项也必须报错，不能让配置检查产生假成功。 */
 static int reject_transport_options(decoder *d, yaml_node_t *args, bool upstream) {
     const char *s; uint64_t n; bool b;
     const char *names[] = {"socks5", "bootstrap"};
@@ -268,6 +284,8 @@ static int parse_forward(decoder *d, yaml_node_t *args, plugin *p) {
     }
     return 0;
 }
+/* 先把插件登记到引擎，后续解析失败也能通过 md_engine_free 统一释放。
+ * 内联 cache/forward 同样由引擎持有，规则中的 to 只是借用指针。 */
 static plugin *new_plugin(md_engine *e, plugin_kind kind, const char *tag, char *err) {
     plugin *p=calloc(1,sizeof(*p)); if(!p) { fail(err,"out of memory"); return NULL; }
     p->kind=kind; p->tag=copy_string(tag,err); if(!p->tag) { free(p);return NULL; }
@@ -384,6 +402,8 @@ static int parse_log(decoder *d,yaml_node_t *a) {
     if(production) return fail(d->err,"log.production is unavailable in the C build");
     return 0;
 }
+/* include 先于当前文件的 plugins 加载；相对路径沿用进程工作目录。
+ * 深度限制防止 include 环无限递归；解析失败时由调用方销毁整个引擎。 */
 static int load_config(md_engine *e,const char *path,unsigned depth,char *err) {
     if(depth>8) return fail(err,"maximum include depth reached");
     const char *ext=strrchr(path,'.');
@@ -422,11 +442,13 @@ static int resolve_domains(md_engine *e,domains *d,char *err) {
         plugin *p=find_plugin(e,name);if(!p || p->kind!=PL_DOMAIN) return fail(err,"cannot find domain_set: %s",name);d->sets[i]=p; }
     return 0;
 }
+/* path 仅检查当前引用链，允许多个集合共享子集合，但拒绝回到祖先。 */
 static int domain_cycle(plugin *p,plugin **path,size_t depth,char *err) {
     if(depth>=128) return fail(err,"domain_set reference depth exceeds 128");
     for(size_t i=0;i<depth;i++) if(path[i]==p) return fail(err,"cyclic domain_set reference: %s",p->tag);
     path[depth]=p;for(size_t i=0;i<p->u.domain.names.n;i++) if(domain_cycle(p->u.domain.sets[i],path,depth+1,err)) return -1;return 0;
 }
+/* 动作参数可选定带 tag 的上游；拷贝配置到规则，不改变共享 forward 插件。 */
 static int resolve_forward(rule *r,char *err) {
     if(!r->arguments || !*r->arguments) return 0;
     if(r->to->kind!=PL_FORWARD) return fail(err,"plugin %s does not accept executable arguments",r->to->tag);
@@ -439,6 +461,8 @@ static int resolve_forward(rule *r,char *err) {
     }
     strings_free(&tags);return 0;
 }
+/* 第二阶段绑定插件引用、校验目标类型，并把服务器入口转为插件索引。
+ * 此后插件图用于并发查询；加载期间未完成的对象不会交给服务器。 */
 static int resolve(md_engine *e,char *err) {
     for(size_t i=0;i<e->count;i++) {
         plugin *p=e->plugins[i];
@@ -470,6 +494,7 @@ static bool domain_matches(const domains *d,const char *name) {
     for(size_t i=0;i<d->names.n;i++) if(domain_matches(&d->sets[i]->u.domain,name)) return true;
     return false;
 }
+/* 一条规则的多个匹配器是 AND；空列表自然匹配，! 只反转对应匹配器。 */
 static bool rule_matches(const rule *r,const query_context *q) {
     for(size_t i=0;i<r->match_count;i++) {
         const matcher *m=&r->matches[i];bool yes=false;
@@ -486,6 +511,8 @@ static int forward_query(query_context *q,plugin *p,const rule *r,char *err) {
     int rc=md_forward(upstreams,count,p->u.forward.concurrent,q->query,q->response,err);
     if(!rc) q->revision++;return rc;
 }
+/* 刷新使用复制的查询和返回链重新执行缓存后的规则。
+ * 不依赖前台查询栈；不论分配或执行是否成功，都要清除该键的刷新标记。 */
 static void *refresh_thread(void *opaque) {
     refresh_job *job=opaque;md_packet *response=calloc(1,sizeof(*response));char err[MD_ERROR_SIZE]={0};
     if(response) {
@@ -501,8 +528,11 @@ static void *refresh_thread(void *opaque) {
         free(response);
     }
     md_cache_refresh_end(job->cache,&job->query);
+    /* done 只在工作结束后发布；任务对象由后续启动或引擎销毁 join 后释放。 */
     pthread_mutex_lock(&job->engine->lock);job->done=true;pthread_mutex_unlock(&job->engine->lock);return NULL;
 }
+/* 引擎锁保护任务链和停止状态；缓存另行合并同一键的重复刷新。
+ * 最多保留 64 个未完成任务，资源不足时继续向客户端返回已有缓存。 */
 static void refresh_start(query_context *q,md_cache *cache,const walker *continuation) {
     md_engine *e=q->engine;
     pthread_mutex_lock(&e->lock);
@@ -516,7 +546,9 @@ static void refresh_start(query_context *q,md_cache *cache,const walker *continu
     if(!job) { md_cache_refresh_end(cache,q->query);pthread_mutex_unlock(&e->lock);return; }
     job->continuation=calloc(count,sizeof(walker));
     if(!job->continuation) { free(job);md_cache_refresh_end(cache,q->query);pthread_mutex_unlock(&e->lock);return; }
+    /* 复制 walker 节点并重连 back，插件指针仍借用引擎，其寿命由 join 保证。 */
     size_t i=0;for(const walker *w=continuation;w;w=w->back,i++) { job->continuation[i]=*w;job->continuation[i].back=i+1<count ? &job->continuation[i+1] : NULL; }
+    /* 保留进入缓存之前已经存在的响应，刷新中的 has_resp 仍有同样的输入。 */
     if(q->response->len) {
         job->initial_response=malloc(sizeof(md_packet));
         if(!job->initial_response) { free(job->continuation);free(job);md_cache_refresh_end(cache,q->query);pthread_mutex_unlock(&e->lock);return; }
@@ -532,13 +564,18 @@ static int execute_cache(query_context *q,md_cache *cache,walker next,char *err)
     /* Shared within this query: copy a hit before walking the continuation,
      * so nested cache plugins may safely reuse the same bounded buffer. */
     md_packet *cached=q->scratch;
+    /* 2 表示过期但仍可服务的 lazy 条目：先启动刷新，再返回旧答案走后续规则。 */
     int hit=md_cache_get(cache,q->query,cached,md_now());
     if(hit==2) refresh_start(q,cache,&next);
     if(hit) { memcpy(q->response->data,cached->data,cached->len);q->response->len=cached->len;q->revision++; }
+    /* 命中后仅在答案被后续规则替换时重写缓存，避免反复命中延长原 TTL。
+     * 即使后续副作用报错，已经得到的非空响应仍可入缓存。 */
     uint64_t revision=q->revision;int rc=walk(q,next,err);
     if(q->response->len && (!hit || q->revision!=revision)) md_cache_put(cache,q->query,q->response,md_now());
     return rc;
 }
+/* 每条规则边界检查截止时间和累计步数；递归深度由 walk 单独控制。
+ * jump 带返回点，goto 丢弃返回链；普通 $sequence 调用后仍续跑当前序列。 */
 static int walk_inner(query_context *q,walker w,char *err) {
     while(w.pos<w.sequence->u.sequence.count) {
         if(md_now()>=q->deadline) return fail(err,"query execution deadline exceeded");
@@ -564,6 +601,8 @@ static int walk(query_context *q,walker w,char *err) {
     if(++q->depth>128) { q->depth--;return fail(err,"sequence recursion exceeds 128 levels (possible cycle)"); }
     int status=walk_inner(q,w,err);q->depth--;return status;
 }
+/* 所有解析和引用校验成功才返回引擎；失败包含部分构造时统一释放。
+ * check 引擎保留配置结构供检查，但明确禁止执行真实查询。 */
 md_engine *md_engine_load(const char *path,bool check,char *err) {
     md_engine *e=calloc(1,sizeof(*e));if(!e) { fail(err,"out of memory");return NULL; }
     e->check=check;if(pthread_mutex_init(&e->lock,NULL)) { free(e);fail(err,"cannot initialize engine mutex");return NULL; }
@@ -571,6 +610,8 @@ md_engine *md_engine_load(const char *path,bool check,char *err) {
 }
 size_t md_engine_listener_count(const md_engine *e) { return e->listener_count; }
 const md_listener *md_engine_listener(const md_engine *e,size_t i) { return i<e->listener_count ? &e->listeners[i] : NULL; }
+/* 服务器线程可直接处理“无条件 cache → has_resp accept”的新鲜命中。
+ * 这里只查缓存，不执行序列或启动刷新；未命中、过期或不符合形状时回到工作线程。 */
 bool md_engine_cached_query(md_engine *e,size_t entry,const md_packet *query,md_packet *response) {
     if(!response) return false;response->len=0;
     if(!e || !query || e->check || entry>=e->count) return false;
@@ -586,6 +627,8 @@ bool md_engine_cached_query(md_engine *e,size_t entry,const md_packet *query,md_
     if(md_cache_get(first->to->u.cache,query,response,md_now())==1) return true;
     response->len=0;return false;
 }
+/* 每次调用独享响应、临时缓存包和执行计数，插件配置由引擎共享。
+ * 序列成功返回还必须产生 DNS 响应，否则视为执行失败。 */
 int md_engine_query(md_engine *e,size_t entry,const md_packet *query,md_packet *response,char *err) {
     response->len=0;
     if(e->check) return fail(err,"checked configuration cannot execute queries");
@@ -598,6 +641,7 @@ int md_engine_query(md_engine *e,size_t entry,const md_packet *query,md_packet *
     else return fail(err,"entry is not executable");
     if(!rc && !response->len) return fail(err,"sequence completed without a response");return rc;
 }
+/* 只释放插件拥有的对象；跨插件引用的 to/sets 指针由引擎统一管理。 */
 static void plugin_free(plugin *p) {
     switch(p->kind) {
         case PL_DOMAIN:domain_free(&p->u.domain);break;
@@ -612,6 +656,8 @@ static void plugin_free(plugin *p) {
     }
     free(p->tag);free(p);
 }
+/* 调用方应先停止前台查询；这里阻止新刷新，并在释放插件前等待全部刷新线程。
+ * join 不持有引擎锁，以免线程发布 done 时与销毁过程互相等待。 */
 void md_engine_free(md_engine *e) {
     if(!e) return;pthread_mutex_lock(&e->lock);e->stopping=true;
     refresh_job *jobs=e->jobs;e->jobs=NULL;pthread_mutex_unlock(&e->lock);

@@ -64,6 +64,7 @@ def tree(root):
     return result
 
 
+# 冻结与 C 构建相关的源码和 fixture；额外记录构建/尺寸脚本，保证记录可复核。
 def inputs(root):
     result = {"c/" + name: value for name, value in tree(root / "c").items()}
     for name in ("tests/fixtures/matcher_domain.json", "benchmarks/build-c-profiles.py",
@@ -78,6 +79,7 @@ def write_json(path, data):
     tmp.replace(path)
 
 
+# 逐文件确认读取期间内容没变化，再以只读文件固定本次构建输入。
 def freeze(root, destination, expected):
     destination.mkdir()
     for name, item in expected.items():
@@ -92,6 +94,7 @@ def freeze(root, destination, expected):
         raise BuildError("source snapshot mismatch")
 
 
+# 依赖包只接受普通文件/目录，不接受可逃逸的路径和链接。
 def extract_archive(archive, destination):
     destination.mkdir()
     with tarfile.open(archive) as tar:
@@ -154,6 +157,7 @@ def unstripped_lld_args(release_args, output):
     return args
 
 
+# GitHub 静态交叉构建入口；创建新目录并保存成功/失败记录，不运行目标程序。
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
@@ -213,6 +217,7 @@ def main():
         logs = out / "logs"
         logs.mkdir()
         env = os.environ.copy()
+        # 缓存限于本轮 work 目录，清理构建产物时无需触碰其他项目缓存。
         env["ZIG_GLOBAL_CACHE_DIR"] = str(work / "zig-global-cache")
         env["ZIG_LOCAL_CACHE_DIR"] = str(work / "zig-local-cache")
         wrappers = work / "tools"
@@ -261,6 +266,7 @@ def main():
             cmd = [str(args.zig), "cc", "-target", args.target] + cpp + effective + macros + ["-c", str(c_root / name), "-o", str(obj)]
             return name, obj, command(cmd, work, env, logs / ("compile-" + name.replace("/", "_") + ".log"))
 
+        # 每个源文件写独立对象和日志，可并行编译；链接等待全部对象完成。
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
             for name, obj, item in pool.map(compile_source, sources):
                 objects[name] = obj
@@ -333,6 +339,7 @@ def main():
             p = out / name
             p.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(frozen / name, p)
+        # file 只识别文件格式，目标机执行和网络/性能测试必须另行记录。
         for artifact in [app] + list(testdir.iterdir()):
             file_result = subprocess.run(["file", str(artifact)], capture_output=True, text=True, check=True)
             manifest.setdefault("file_identification", {})[artifact.relative_to(out).as_posix()] = file_result.stdout.strip()
@@ -350,6 +357,7 @@ def main():
         if hasattr(error, "command_record"):
             manifest["commands"].append(error.command_record)
         raise
+    # 即使构建中途失败，也保留 manifest 和失败命令，便于追溯具体输入与步骤。
     finally:
         write_json(out / "manifest.json", manifest)
 

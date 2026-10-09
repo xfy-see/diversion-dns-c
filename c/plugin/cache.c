@@ -1,16 +1,23 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* 共享 DNS 缓存由一个互斥锁保护哈希索引、LRU 链及刷新占位表。
+ * 所有 now 参数都应使用同一单调时钟的秒数，避免系统时间调整改变 TTL。
+ * 过期项在被访问或被容量淘汰时释放，没有后台清扫线程或独立到期队列。 */
 #include "mosdns.h"
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define KEY_SIZE 262
+/* expires 是原始 TTL 的到期点，retained 是允许留存的最终截止点；
+ * lazy_ttl 从 stored 起算，而不是在 expires 后再追加一段时间。 */
 typedef struct cache_entry {
     struct cache_entry *hash_next, *prev, *next;
     uint64_t hash, stored, expires, retained;
     size_t key_len, response_len;
     uint8_t bytes[]; /* exact question key followed by a DNS response */
 } cache_entry;
+/* 刷新占位与缓存数据分离：同一问题只能有一个后台刷新任务，
+ * 缓存项即使被替换或淘汰，刷新任务仍需成对调用 begin/end。 */
 typedef struct refresh_entry {
     struct refresh_entry *next;
     uint64_t hash; size_t key_len;
@@ -30,6 +37,8 @@ static uint64_t hash_key(const uint8_t *key, size_t len) {
     return h;
 }
 typedef struct { unsigned opts; bool unsafe; } key_options;
+/* 缓存不解释 EDNS 选项：只接受至多一个无选项、版本为 0 且
+ * extended RCODE 为 0 的 OPT；带 ECS 等选项或其他记录的查询直接绕过。 */
 static int inspect_query_record(const md_packet *p, const md_rr *rr, void *arg) {
     (void)p;
     key_options *v = arg;
@@ -37,6 +46,9 @@ static int inspect_query_record(const md_packet *p, const md_rr *rr, void *arg) 
         (rr->ttl & UINT32_C(0xffff0000))) v->unsafe = true;
     return 0;
 }
+/* key = AD/CD/DO 位 + 原始 QNAME/QTYPE/QCLASS 字节，保留名称大小写。
+ * 事务 ID 不参与 key；仅缓存标准 IN 查询，压缩问题不能直接复制成 key。
+ * 返回 0 表示此问题不适合缓存，调用方应继续常规解析流程。 */
 static size_t make_key(const md_packet *q, uint8_t key[KEY_SIZE]) {
     md_question question; char err[MD_ERROR_SIZE];
     if (!q || md_dns_question(q, &question, err) || question.class_ != 1 ||
@@ -64,6 +76,8 @@ static cache_entry *find_entry(md_cache *c, const uint8_t *key, size_t len, uint
         if (e->hash == hash && e->key_len == len && !memcmp(e->bytes, key, len)) return e;
     return NULL;
 }
+/* 以下哈希和 LRU 辅助函数由持锁的调用方执行；head 最近使用，tail
+ * 最久未使用。删除节点必须同时从两个索引摘除后才能释放内存。 */
 static void unlink_lru(md_cache *c, cache_entry *e) {
     if (e->prev) e->prev->next = e->next; else c->head = e->next;
     if (e->next) e->next->prev = e->prev; else c->tail = e->prev;
@@ -79,9 +93,12 @@ static void remove_entry(md_cache *c, cache_entry *e) {
     while (*p != e) p = &(*p)->hash_next;
     *p = e->hash_next; unlink_lru(c, e); --c->count; free(e);
 }
+/* TTL 加法采用饱和运算，极端时间值不会因整数溢出变成过去的到期点。 */
 static uint64_t deadline(uint64_t now, uint32_t ttl) {
     return now > UINT64_MAX - ttl ? UINT64_MAX : now + ttl;
 }
+/* 容量为条目数而非字节数；桶数向上取 2 的幂，与哈希掩码保持一致。
+ * 构造阶段失败释放已分配的资源，成功后由 md_cache_free 独占销毁。 */
 md_cache *md_cache_new(size_t capacity, uint32_t lazy_ttl) {
     if (!capacity) capacity = 1024;
     if (capacity > SIZE_MAX / 2) return NULL;
@@ -99,12 +116,16 @@ md_cache *md_cache_new(size_t capacity, uint32_t lazy_ttl) {
     return c;
 }
 typedef struct { md_packet *packet; uint64_t age; bool stale; } adjust_ttl;
+/* OPT 的 TTL 字段承载 EDNS 标志，不能当 TTL 扣减；stale 响应的普通
+ * 记录统一返回 5 秒 TTL，避免客户端继续长期保存过期答案。 */
 static int subtract_ttl(const md_packet *p, const md_rr *rr, void *arg) {
     (void)p; adjust_ttl *v = arg;
     if (rr->type != 41) md_write32(v->packet->data + rr->ttl_offset,
         v->stale ? 5 : v->age < rr->ttl ? rr->ttl - (uint32_t)v->age : 0);
     return 0;
 }
+/* 返回 0 未命中、1 新鲜、2 stale。持锁期间复制完整报文并更新 LRU，
+ * 解锁后才在独立副本上扣 TTL、改事务 ID，不把条目指针暴露给调用方。 */
 int md_cache_get(md_cache *c, const md_packet *q, md_packet *r, uint64_t now) {
     if (!c || !r) return 0;
     uint8_t key[KEY_SIZE]; size_t len = make_key(q, key);
@@ -128,6 +149,8 @@ int md_cache_get(md_cache *c, const md_packet *q, md_packet *r, uint64_t now) {
     return hit;
 }
 typedef struct { uint32_t minimum; unsigned extended_rcode; bool found, signed_; } ttl_minimum;
+/* 各 section 的普通记录共同决定最小 TTL；识别 TSIG/SIG(0)，
+ * 这些签名报文不能在缓存命中时改写 ID、TTL 或去除 OPT。 */
 static int find_minimum_ttl(const md_packet *p, const md_rr *rr, void *arg) {
     (void)p; ttl_minimum *v = arg;
     if (rr->type != 41) {
@@ -137,6 +160,9 @@ static int find_minimum_ttl(const md_packet *p, const md_rr *rr, void *arg) {
     } else v->extended_rcode = rr->ttl >> 24;
     return 0;
 }
+/* 先验证完整响应与原始问题一致，再决定保留时长；截断、签名、
+ * 不支持的 RCODE 或不安全的问题不会缓存。插入失败仅放弃缓存，
+ * 不影响调用方已经取得的上游响应。 */
 void md_cache_put(md_cache *c, const md_packet *q, const md_packet *r, uint64_t now) {
     if (!c || !r || r->len < 12 || (md_read16(r->data + 2) & 0x0200) ||
         !md_dns_response_matches(q, r)) return;
@@ -150,6 +176,8 @@ void md_cache_put(md_cache *c, const md_packet *q, const md_packet *r, uint64_t 
     if (min.signed_) return;
     unsigned rcode = (md_read16(r->data + 2) & 15) | (min.extended_rcode << 4);
     uint32_t ttl, retention;
+    /* NXDOMAIN 留存 30 秒，SERVFAIL 留存 5 秒；无答案的 NOERROR
+     * 最多留存 300 秒，且不延长到 lazy_ttl。正向答案可按配置留存 stale。 */
     if (rcode == 3) ttl = retention = 30;
     else if (rcode == 2) ttl = retention = 5;
     else if (!rcode) {
@@ -168,6 +196,8 @@ void md_cache_put(md_cache *c, const md_packet *q, const md_packet *r, uint64_t 
     e->hash = hash_key(key, len); e->key_len = len; e->response_len = copy.len;
     e->stored = now; e->expires = deadline(now, ttl); e->retained = deadline(now, retention);
     memcpy(e->bytes, key, len); memcpy(e->bytes + len, copy.data, copy.len);
+    /* 报文检查和分配放在锁外；持锁后一次性替换同 key 条目并执行
+     * LRU 容量淘汰，其他读者只能看到完整的旧项或完整的新项。 */
     pthread_mutex_lock(&c->lock);
     cache_entry *old = find_entry(c, key, len, e->hash);
     if (old) remove_entry(c, old);
@@ -176,6 +206,8 @@ void md_cache_put(md_cache *c, const md_packet *q, const md_packet *r, uint64_t 
     e->hash_next = c->buckets[i]; c->buckets[i] = e; push_front(c, e); ++c->count;
     pthread_mutex_unlock(&c->lock);
 }
+/* 只有成功取得占位的调用方才可启动刷新；达到容量或分配失败时拒绝。
+ * 所有结束路径（含任务启动失败）都须调用 refresh_end 释放占位。 */
 bool md_cache_refresh_begin(md_cache *c, const md_packet *q) {
     if (!c) return false;
     uint8_t key[KEY_SIZE]; size_t len = make_key(q, key);
@@ -192,6 +224,7 @@ bool md_cache_refresh_begin(md_cache *c, const md_packet *q) {
 done:
     pthread_mutex_unlock(&c->lock); return ok;
 }
+/* 使用与 begin 相同的问题重建 key；不存在占位时安全返回。 */
 void md_cache_refresh_end(md_cache *c, const md_packet *q) {
     if (!c) return;
     uint8_t key[KEY_SIZE]; size_t len = make_key(q, key);

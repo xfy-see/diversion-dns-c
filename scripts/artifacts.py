@@ -13,6 +13,7 @@ import subprocess
 import tarfile
 import zipfile
 
+# 规则分为两层：外层档案身份/摘要，内层文件集合、Git blob 和运行配置。
 ROOT = Path(__file__).resolve().parents[1]
 TESTS = ('dns_test', 'cache_domain_test', 'engine_test', 'plan_regression_test',
          'nft_netlink_test', 'domain_driver', 'nft_cli_driver')
@@ -33,6 +34,7 @@ def blob(data):
     return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
 
 
+# 档案路径必须是规范相对路径；解包前拒绝路径穿越及不一致的名称。
 def safe_path(name):
     p = PurePosixPath(name)
     require(bool(name) and not p.is_absolute() and '..' not in p.parts
@@ -54,6 +56,7 @@ def git_tree(root, commit):
     return entries
 
 
+# 同时校验提交号、Git 树及工作区字节，防止用同 SHA 的脏源码验证产物。
 def source_matches(root, manifest):
     require(subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root).decode().strip()
             == manifest['commit'], 'checkout commit differs')
@@ -65,6 +68,7 @@ def source_matches(root, manifest):
                 'checkout input differs: ' + name)
 
 
+# 仅允许该仓库的 GitHub job 打包；源码、二进制、日志和摘要形成同一证据链。
 def pack(args):
     commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT).decode().strip()
     require(os.environ.get('GITHUB_SHA') == commit and os.environ.get('GITHUB_REPOSITORY') == REPO,
@@ -102,6 +106,7 @@ def pack(args):
                 require(digest((folder / 'tests' / t).read_bytes()) == m['test_binaries'][t]['sha256'], 'linked test differs')
             for name, item in m['inputs'].items():
                 require(digest((ROOT / name).read_bytes()) == item['sha256'], 'frozen source differs')
+            # 静态尺寸报告必须对应发布 ELF 的全部字节，不能用另一个链接结果代替。
             if label == 'static':
                 size_files = {'diagnostic': 'mosdns-c.unstripped', 'mapped': 'mosdns-c.mapped',
                               'map': 'mosdns-c.map',
@@ -143,6 +148,7 @@ def pack(args):
     print(json.dumps(dict(completed=True,archive=str(args.output),sha256=digest(args.output.read_bytes()),commit=commit)))
 
 
+# 先在内存中验证所有成员及膨胀上限，再写磁盘，避免半验证半解包。
 def read_archive(path, commit, run_id, archive_sha=None):
     data = path.read_bytes()
     require(len(data) <= LIMIT, 'archive exceeds bound')
@@ -170,6 +176,7 @@ def read_archive(path, commit, run_id, archive_sha=None):
             and m['run_id'] == run_id and m['run_attempt'] >= 1, 'artifact identity differs')
     require(m['target'] in ('macos-arm64','linux-amd64','linux-arm64')
             and m['kind'] in ('native','static'), 'unexpected platform')
+    # 完整集合相等既发现缺文件，也拒绝 manifest 没有声明的额外载荷。
     require(set(contents) == set(m['files']), 'payload membership differs')
     for name, info in m['files'].items():
         b=contents[name]
@@ -201,6 +208,7 @@ def read_archive(path, commit, run_id, archive_sha=None):
     return m, contents
 
 
+# 执行前和执行后复核解包目录；receipt 绑定 manifest，checkout 可进一步绑定源码。
 def verify_bundle(bundle, checkout=None):
     m=json.loads((bundle/'manifest.json').read_text())
     expected={'manifest.json','verification.json',*m['files']}
@@ -219,6 +227,7 @@ def verify_bundle(bundle, checkout=None):
     return m
 
 
+# 每次解包使用新目录，保留下载摘要和验证回执，避免覆盖旧测试证据。
 def extract(args):
     require(re.fullmatch('[0-9a-f]{40}',args.expected_commit) is not None, 'exact commit required')
     m, contents=read_archive(args.archive,args.expected_commit,args.expected_run_id,args.archive_sha256)

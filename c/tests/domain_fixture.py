@@ -11,6 +11,7 @@ driver = str(Path(sys.argv[1]).resolve())
 fixture = json.loads((Path(__file__).resolve().parents[2] /
                       "tests/fixtures/matcher_domain.json").read_text())
 assert fixture["format_version"] == 1
+# 共享 Go/Rust fixture 仅跳过明确列出的语言/Unicode 差异，原因与计数均可见。
 skipped = {
     "regexp_go_character_class_capture_and_brace_syntax":
         "Go RE2 character classes, capture names, braces and rejection rules differ from PCRE2",
@@ -27,6 +28,7 @@ checks = 0
 cases = 0
 
 
+# 借助预编译 driver 加载规则并逐条查询；加载失败仍可验证此前规则的保留行为。
 def run(text, queries):
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as rules:
         rules.write(text)
@@ -81,6 +83,7 @@ for rule, expected in ascii_cases:
         assert actual == str(int(matches)), (rule, domain, actual)
         profile_checks += 1
 
+# 关闭 Unicode 必须拒绝相关表达式，且保留文件行号；不能静默改成 ASCII 匹配。
 unsupported = [r"regexp:(*UTF)^example\.test$", r"regexp:(*UCP)^example\.test$",
                r"regexp:^\p{L}+\.test$", r"regexp:^\P{L}+\.test$", r"regexp:^\X\.test$"]
 for rule in unsupported:

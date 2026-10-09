@@ -11,6 +11,7 @@ import zipfile
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
 import artifacts as a
 
+# 以小型虚拟可执行载荷检查验证器的拒绝边界；这里不会执行这些字节。
 COMMIT='a'*40
 
 
@@ -70,6 +71,7 @@ class ArtifactTests(unittest.TestCase):
     def test_incomplete_harnesses(self):
         with self.assertRaises(ValueError): self.check(lambda m,f:m['profiles']['native']['tests'].pop('dns_test'))
 
+    # 即使 manifest 中 SHA256 自洽，源码仍必须匹配声明的 Git blob。
     def test_source_commit_blob_tampering(self):
         def change(m,f):
             f['source/main.c']=b'changed'

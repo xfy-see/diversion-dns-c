@@ -10,6 +10,7 @@ int main(int argc, char **argv) {
     md_domain *d = md_domain_new();
     if (!d) return 2;
     char err[MD_ERROR_SIZE];
+    /* 首行报告加载状态；即使某行失败也继续查询，从而观察部分加载的既有规则。 */
     if (md_domain_load(d, argv[1], err)) printf("error:%s\n", err);
     else puts("ok");
     char *line = NULL; size_t cap = 0; ssize_t n;

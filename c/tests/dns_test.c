@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* 用原始报文和 loopback 上游覆盖 DNS 校验、TCP 分帧、TC 回退与重传资源释放。 */
 #include "mosdns.h"
 #include <arpa/inet.h>
 #include <assert.h>
@@ -34,6 +35,7 @@ static int count_rr(const md_packet *p, const md_rr *rr, void *v) {
     (void)p; assert(rr->type == 1 && rr->section == 0 && rr->ttl == 60);
     (*(unsigned *)v)++; return 0;
 }
+/* 在同一报文上逐项破坏字段，验证 ID/名称/结构校验不会仅依赖报头。 */
 static void dns_tests(void) {
     md_packet q, r, copy;
     md_question parsed; char err[MD_ERROR_SIZE];
@@ -182,6 +184,7 @@ static int bound_socket(int type, uint16_t *port) {
     if (type == SOCK_STREAM) assert(!listen(fd, 2));
     return fd;
 }
+/* 可控 UDP/TCP 响应验证回退和多上游竞争；错误响应不能抢先压过有效答案。 */
 static void upstream_tests(void) {
     for (unsigned mode = 1; mode <= 3; mode++) {
         uint16_t port = 0;
@@ -291,6 +294,7 @@ static void *serve_retry(void *arg) {
     }
     return NULL;
 }
+/* 丢请求、丢响应、损坏回复及超时分别验证重传时序与 fd 清理；不是吞吐基准。 */
 static void retry_tests(void) {
     for (retry_mode mode = DROP_QUERY; mode <= LATE_TCP; mode++) {
         unsigned before = open_fds();

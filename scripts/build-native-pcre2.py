@@ -17,6 +17,7 @@ profiles = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(profiles)
 
 
+# 供 GitHub 原生 job 使用；本地复测直接运行下载产物，不调用本构建入口。
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--archive", type=Path, required=True)
@@ -25,6 +26,7 @@ def main():
     args = parser.parse_args()
     if not 1 <= args.jobs <= 32:
         parser.error("--jobs must be 1 through 32")
+    # 先核对固定版本摘要，再解包/构建；与静态 profile 共用同一组选项。
     archive = profiles.record(args.archive)
     if archive["sha256"] != profiles.PCRE2_SHA256:
         parser.error("PCRE2 archive SHA256 differs from pinned 10.48 checksum")
@@ -37,6 +39,7 @@ def main():
     logs.mkdir()
     env = os.environ.copy()
     commands = []
+    # 源目录与工作目录分离，日志和最终库摘要保留在本次输出中。
     commands.append(profiles.command([str(source / "configure")] +
                     profiles.PCRE2_CONFIGURE_OPTIONS, work, env, logs / "configure.log"))
     commands.append(profiles.command(["make", "-j" + str(args.jobs), "libpcre2-8.la"],

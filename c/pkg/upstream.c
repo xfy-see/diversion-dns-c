@@ -1,4 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* 上游转发采用非阻塞 socket 和 poll 驱动状态机。连接池只在显式启用的
+ * worker 线程内存在；普通库调用使用新连接，不依赖服务端线程生命周期。 */
 #define _GNU_SOURCE
 #include "mosdns.h"
 #include <arpa/inet.h>
@@ -33,6 +35,8 @@ static int port_number(const char *s, unsigned *port) {
     *port = n;
     return 0;
 }
+/* 只解析数字 IP，不做 DNS 引导查询；带端口的 IPv6 必须使用方括号。
+ * 无端口的 IPv6 可直接写地址，作用域支持接口名或数值。 */
 int md_parse_address(const char *s, unsigned default_port, struct sockaddr_storage *a,
                      socklen_t *len, char *err) {
     if (!s || !*s || strlen(s) >= 256 || default_port > 65535 || !a || !len)
@@ -81,6 +85,7 @@ int md_parse_address(const char *s, unsigned default_port, struct sockaddr_stora
     }
     return 0;
 }
+/* dial_addr 只覆盖实际拨号目标，传输协议仍由 addr 决定。 */
 int md_upstream_init(md_upstream *u, const char *addr, const char *dial_addr,
                      uint32_t mark, const char *device, char *err) {
     if (!u || !addr || !*addr) return fail(err, "upstream address is required");
@@ -107,9 +112,12 @@ int md_upstream_init(md_upstream *u, const char *addr, const char *dial_addr,
     return 0;
 }
 
+/* UDP 等待一个数据报；TCP 分别累计两字节长度和消息体，短读/短写均可继续。 */
 typedef enum { CONNECTING, SENDING, UDP_READING, TCP_LENGTH, TCP_BODY, DEAD } phase;
 #define WORKER_TCP_CAPACITY 8
 #define WORKER_TCP_IDLE_MS 30000
+/* 空闲 socket 归池所有，借出后由 exchange 持有 fd。每条连接记录已用 ID，
+ * 复用同一 ID 前退休连接，避免旧响应被当成新查询的结果。 */
 typedef struct {
     int fd;
     bool busy, tcp;
@@ -139,8 +147,10 @@ typedef struct {
     exchange exchanges[3];
     bool exchanges_in_use;
 } worker_connections;
+/* 池和可复用报文缓冲都属于当前线程，不需要跨 worker 加锁。 */
 static _Thread_local worker_connections *worker_tcp;
 
+/* 超时和闲置回收使用单调时钟，系统时间校准不会延长或缩短查询期限。 */
 static uint64_t milliseconds(void) {
     struct timespec t;
     if (clock_gettime(CLOCK_MONOTONIC, &t)) return 0;
@@ -155,18 +165,22 @@ void md_forward_worker_cleanup(void) {
     for (unsigned i = 0; i < WORKER_TCP_CAPACITY; i++) retire(&worker_tcp->slots[i]);
     free(worker_tcp); worker_tcp = NULL;
 }
+/* 分配失败时保持 NULL，后续转发自动退回临时 exchange 和新 socket。 */
 void md_forward_worker_enable(void) {
     md_forward_worker_cleanup();
     worker_tcp = calloc(1, sizeof(*worker_tcp));
     if (worker_tcp)
         for (unsigned i = 0; i < WORKER_TCP_CAPACITY; i++) worker_tcp->slots[i].fd = -1;
 }
+/* 池键包含目标、配置协议、mark 和设备，避免复用改变了路由约束的连接。 */
 static bool same_endpoint(const md_upstream *a, const md_upstream *b) {
     return a->tcp == b->tcp && a->address_len == b->address_len &&
         a->address_len <= sizeof(a->address) &&
         !memcmp(&a->address, &b->address, a->address_len) &&
         a->so_mark == b->so_mark && !strcmp(a->bind_device, b->bind_device);
 }
+/* owner 只比较对象身份：同一配置对象改了拨号参数时淘汰旧连接，
+ * 不通过可能已失效的 owner 指针读取配置。 */
 static void prepare_worker(const md_upstream *us, size_t count) {
     if (!worker_tcp) return;
     uint64_t now = milliseconds();
@@ -179,11 +193,14 @@ static void prepare_worker(const md_upstream *us, size_t count) {
         if (retargeted || now - c->last >= WORKER_TCP_IDLE_MS) retire(c);
     }
 }
+/* 只有无待收字节且未关闭的 socket 才可复用；残留帧或旧数据报都会淘汰。 */
 static bool quiet_socket(int fd) {
     uint8_t byte;
     ssize_t n = recv(fd, &byte, 1, MSG_PEEK);
     return n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
 }
+/* 优先借出安全的同目标连接，否则使用空槽或最久未用的空闲槽；
+ * busy 槽不会被重入调用覆盖，池满时调用方可直接建立非池化连接。 */
 static worker_connection *take_connection(const md_upstream *u, bool tcp, uint16_t id, bool allow_reuse) {
     if (!worker_tcp) return NULL;
     worker_connection *available = NULL;
@@ -204,12 +221,15 @@ static worker_connection *take_connection(const md_upstream *u, bool tcp, uint16
     memset(available->ids, 0, sizeof(available->ids));
     return available;
 }
+/* 失败和未胜出的 exchange 都关闭自己持有的 fd，并释放对应池槽。 */
 static void stop(exchange *x) {
     if (x->fd >= 0) close(x->fd);
     x->fd = -1; x->state = DEAD; x->udp_retry = 0;
     if (x->cached) { retire(x->cached); x->cached = NULL; }
     x->reused = x->dirty = false;
 }
+/* 在 connect 前应用路由 mark/绑定设备；不支持的平台直接报错，
+ * 避免配置要求分流时悄悄使用默认路由。 */
 static int socket_options(int fd, const md_upstream *u, char *err) {
 #ifdef __linux__
     if (u->so_mark && setsockopt(fd, SOL_SOCKET, SO_MARK, &u->so_mark, sizeof(u->so_mark)))
@@ -230,6 +250,7 @@ static int socket_options(int fd, const md_upstream *u, char *err) {
         return syserr(err, "set socket flags");
     return 0;
 }
+/* 借用时把 fd 从池槽移到 exchange；成功后 keep_response 才将所有权交还。 */
 static int begin_connection(exchange *x, const md_upstream *u, bool tcp, bool allow_reuse, char *err) {
     stop(x); x->tcp = tcp; x->upstream = u; x->done = 0;
     if ((x->cached = take_connection(u, tcp, x->query_id, allow_reuse))) {
@@ -250,6 +271,8 @@ static int begin_connection(exchange *x, const md_upstream *u, bool tcp, bool al
 static int begin(exchange *x, const md_upstream *u, bool tcp, char *err) {
     return begin_connection(x, u, tcp, true, err);
 }
+/* 仅在恰好收完匹配响应、无污染/挂断事件且没有剩余数据时保留连接。
+ * UDP 的额外数据报和 TCP 的额外帧都会阻止复用。 */
 static void keep_response(exchange *x, short events) {
     if (!x->cached || x->dirty ||
         x->state != (x->tcp ? TCP_LENGTH : UDP_READING) || x->done ||
@@ -282,6 +305,9 @@ static int resend_udp(exchange *x, const md_packet *q, char *err) {
     return 0;
 }
 /* 1 is a matching complete response; 0 means pending; -1 means failed. */
+/* 复用连接若在尚未发送任何字节时失效，可重建一次新连接；
+ * 已部分发送的 TCP 查询不走这条重试路径。dirty 标记收到过异常内容，
+ * 此后仍可等待有效响应，但完成后不能把连接放回池中。 */
 static int advance(exchange *x, short events, const md_packet *q, char *err) {
     if (x->reused && x->state == SENDING && !x->done &&
         !(events & POLLOUT) && (events & (POLLERR | POLLNVAL | POLLHUP)))
@@ -329,6 +355,7 @@ static int advance(exchange *x, short events, const md_packet *q, char *err) {
         if (msg.msg_flags & MSG_TRUNC) { x->dirty = true; return 0; }
         x->packet.len = (size_t)n;
         if (!md_dns_response_matches(q, &x->packet)) { x->dirty = true; return 0; }
+        /* 只有匹配当前问题的 TC 响应触发 TCP 回退，沿用目标和 socket 路由约束。 */
         if (md_read16(x->packet.data + 2) & 0x0200u) {
             const md_upstream *u = x->upstream;
             if (begin(x, u, true, err)) return -1;
@@ -365,6 +392,8 @@ static int advance(exchange *x, short events, const md_packet *q, char *err) {
     }
     return 0;
 }
+/* 每次最多竞争三个轮转选出的上游，共享五秒总期限；UDP 每秒重发。
+ * 首个 NOERROR/NXDOMAIN 胜出；其他 RCODE 暂存，等待竞争者成功或全部结束。 */
 int md_forward(const md_upstream *us, size_t count, unsigned concurrent,
                const md_packet *q, md_packet *r, char *err) {
     md_question parsed;
@@ -373,6 +402,7 @@ int md_forward(const md_upstream *us, size_t count, unsigned concurrent,
     if (!concurrent) concurrent = 1;
     if (concurrent > 3) concurrent = 3;
     if (concurrent > count) concurrent = (unsigned)count;
+    /* 同步 worker 调用复用大报文缓冲；重入调用独立分配，避免覆盖尚在读取的响应。 */
     bool scoped = worker_tcp && !worker_tcp->exchanges_in_use;
     exchange *xs = scoped ? worker_tcp->exchanges : malloc(concurrent * sizeof(*xs));
     if (!xs) return fail(err, "out of memory for upstream exchanges");
@@ -442,6 +472,7 @@ int md_forward(const md_upstream *us, size_t count, unsigned concurrent,
         snprintf(err, MD_ERROR_SIZE, "%s", last_error);
     }
 finished:
+    /* 胜出且符合条件的连接已交回池；这里关闭所有其他仍在竞争的连接。 */
     for (unsigned i = 0; i < concurrent; i++) stop(&xs[i]);
     if (scoped) worker_tcp->exchanges_in_use = false;
     else free(xs);

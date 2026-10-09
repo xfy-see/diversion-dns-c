@@ -1,4 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* 域名规则在加载时建立索引，查询时只读；调用方应在发布规则集前完成加载。
+ * full 和 domain 使用哈希表，keyword 和 regexp 使用链表；domain 查询按
+ * 标签边界枚举后缀，不需要逐条扫描大型域名列表。 */
 #define _POSIX_C_SOURCE 200809L
 #define PCRE2_CODE_UNIT_WIDTH 8
 #include "mosdns.h"
@@ -38,6 +41,8 @@ static bool table_has(const domain_table *t, const char *s) {
         if (e->hash == h && !strcmp(e->text, s)) return true;
     return false;
 }
+/* 桶数始终为 2 的幂，因此 hash & (size - 1) 可以直接定位桶。
+ * 扩容只重连已有节点；字符串及其所有权仍属于规则表。 */
 static int table_grow(domain_table *t) {
     size_t size = t->size ? t->size * 2 : 64;
     if (size < t->size || size > SIZE_MAX / sizeof(*t->buckets)) return -1;
@@ -54,6 +59,7 @@ static int table_grow(domain_table *t) {
     free(t->buckets); t->buckets = b; t->size = size;
     return 0;
 }
+/* 相同规则只保存一次；负载达到 3/4 时先扩容，避免长冲突链。 */
 static int table_add(domain_table *t, const char *s) {
     if (table_has(t, s)) return 0;
     if ((!t->size || t->count >= t->size * 3 / 4) && table_grow(t)) return -1;
@@ -73,6 +79,8 @@ static void table_free(domain_table *t) {
 }
 /* Go's full/keyword normalization removes one final dot. Its domain scanner
  * removes a second dot. ASCII folding preserves bytes outside A-Z. */
+/* 只折叠 ASCII 大写字母；非 ASCII 字节原样保留，避免引入 Unicode
+ * 归一化。不同规则类型移除尾点的次数用于兼容原有 Go 扫描语义。 */
 static void normalize(char *s, unsigned dots) {
     size_t n = strlen(s);
     while (dots-- && n && s[n - 1] == '.') s[--n] = '\0';
@@ -85,6 +93,8 @@ static bool ascii_space(unsigned char c) {
 
 md_domain *md_domain_new(void) { return calloc(1, sizeof(md_domain)); }
 
+/* 无类型前缀的规则按 domain 后缀处理。非正则规则复制后归一化，
+ * 正则表达式保留原始文本，编译失败时把 PCRE2 的偏移和原因返回给配置层。 */
 int md_domain_add(md_domain *d, const char *rule, char *err) {
     if (!d || !rule) { snprintf(err, MD_ERROR_SIZE, "invalid domain rule"); return -1; }
     const char *pattern = strchr(rule, ':');
@@ -101,6 +111,8 @@ int md_domain_add(md_domain *d, const char *rule, char *err) {
     if (type == REGEX) {
         for (domain_regex *r = d->regexes; r; r = r->next)
             if (!strcmp(r->text, pattern)) return 0;
+        /* 使用 PCRE2 的 8 位字节接口，不启用 UTF/UCP；当前构建也关闭
+         * Unicode 支持。普通域名仍可使用分组、回溯引用、前后查找等语法。 */
         int code; PCRE2_SIZE offset;
         pcre2_code *compiled = pcre2_compile((PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED,
                                             0, &code, &offset, NULL);
@@ -140,6 +152,8 @@ oom:
     snprintf(err, MD_ERROR_SIZE, "out of memory loading domain rules"); return -1;
 }
 
+/* 文件按行读取，# 后视为注释；空白行跳过，规则内部不允许 ASCII 空白。
+ * 失败保留已加入的规则，调用方负责销毁未成功加载的整个规则集。 */
 int md_domain_load(md_domain *d, const char *path, char *err) {
     FILE *f = fopen(path, "r");
     if (!f) { snprintf(err, MD_ERROR_SIZE, "open domain file %s: %s", path, strerror(errno)); return -1; }
@@ -164,6 +178,9 @@ int md_domain_load(md_domain *d, const char *path, char *err) {
     free(line); fclose(f); return rc;
 }
 
+/* 常见 DNS 名称使用栈上副本；每次匹配的 PCRE2 上下文独立分配，
+ * 因此已冻结的规则集可供多个工作线程读取。名称副本分配失败时未命中，
+ * 正则执行失败时继续尝试其他规则；共享规则和调用方名称均不被修改。 */
 bool md_domain_match(const md_domain *d, const char *name) {
     if (!d || !name) return false;
     char local[256], *s = local; size_t n = strlen(name);
@@ -181,6 +198,8 @@ bool md_domain_match(const md_domain *d, const char *name) {
             /* Bound backtracking for user-provided PCRE2 expressions. */
             pcre2_set_match_limit(ctx, 100000);
             pcre2_set_depth_limit(ctx, 1000);
+            /* 本模块只需要是否命中；返回 0 也代表匹配成功，只是捕获
+             * 槽位不足，不能把它误判成未命中。 */
             for (domain_regex *r = d->regexes; r; r = r->next)
                 if (pcre2_match(r->code, (PCRE2_SPTR)s, strlen(s), 0, 0, data, ctx) >= 0) { result = true; break; }
         }
@@ -189,6 +208,8 @@ bool md_domain_match(const md_domain *d, const char *name) {
     if (!result) {
         normalize(s, 1);
         result = d->root;
+        /* 从最右标签向左扩展；每个查表字符串都始于标签边界，
+         * domain:example.com 会命中子域名，但不会命中 badexample.com。 */
         size_t end = strlen(s);
         while (!result && end) {
             size_t start = end;
@@ -201,6 +222,7 @@ bool md_domain_match(const md_domain *d, const char *name) {
     if (s != local) free(s);
     return result;
 }
+/* 同时释放索引节点、规则字符串和 PCRE2 编译对象；销毁前须停止查询。 */
 void md_domain_free(md_domain *d) {
     if (!d) return;
     table_free(&d->full); table_free(&d->suffix);

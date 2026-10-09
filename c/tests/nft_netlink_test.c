@@ -1,3 +1,4 @@
+/* 纯内存 wire 测试：golden 编码、ACK 来源/请求对应、逐字节截断和 generation 校验。 */
 #include "nft_netlink.h"
 #include <assert.h>
 #include <errno.h>
@@ -5,6 +6,7 @@
 #include <stdlib.h>
 static unsigned checks;
 #define CHECK(v) do { assert(v); ++checks; } while(0)
+/* 构造可控 ACK，分别覆盖完整请求回显和 capped 回显；不调用 socket。 */
 static size_t ack(uint8_t *out,const md_nl_requests *r,size_t i,int error,unsigned flags) {
     const uint8_t *q=r->wire+r->offset[i];size_t copied=error&&!(flags&0x100)?md_nl_u32(q):16;
     size_t n=20+md_nl_align(copied);memset(out,0,n);md_nl_put32(out,(uint32_t)n);md_nl_put16(out+4,2);md_nl_put16(out+6,(uint16_t)flags);md_nl_put32(out+8,md_nl_u32(q+8));md_nl_put32(out+12,r->port);int32_t e=error;memcpy(out+16,&e,4);memcpy(out+20,q,copied);return n;
@@ -30,6 +32,7 @@ int main(void) {
     CHECK(!md_nft_nl_ack_consume(&r,reply,n,&error)&&!error&&md_nft_nl_ack_complete(&r));
     CHECK(md_nft_nl_ack_consume(&r,reply,n,&error)<0); /* duplicate */
     r=saved;size_t boundary=ack(copy,&r,0,0,0);CHECK(md_nft_nl_ack_consume(&r,copy,boundary,&error)<0); /* unrequested success */
+    /* 所有截断长度都必须失败，避免只测试一两个固定短报文。 */
     for(size_t cut=0;cut<n;++cut){r=saved;CHECK(md_nft_nl_ack_consume(&r,reply,cut,&error)<0);}
     const size_t offsets[]={0,4,6,8,12,16,20,24,26,28,32};
     for(size_t i=0;i<sizeof(offsets)/sizeof(offsets[0]);++i){r=saved;memcpy(copy,reply,n);copy[offsets[i]]^=1;CHECK(md_nft_nl_ack_consume(&r,copy,n,&error)<0);}
@@ -42,6 +45,7 @@ int main(void) {
     CHECK(md_nft_nl_batch_encode(wire,MD_NL_BUFFER_SIZE,&r,41771,700,1,"diag","learn4",(const uint8_t (*)[16])keys,1,4,0)<0);
     CHECK(md_nft_nl_batch_encode(wire,MD_NL_BUFFER_SIZE,&r,41771,700,1,"diag","9bad",(const uint8_t (*)[16])keys,1,4,1)<0);
     CHECK(md_nft_nl_batch_encode(wire,MD_NL_BUFFER_SIZE,&r,41771,700,1,"diag","learn4",(const uint8_t (*)[16])keys,MD_NL_MAX_KEYS+1,4,1)<0);
+    /* 最大 IPv6 批量验证拆分后的全部 ACK 到齐，不能首个成功就结束。 */
     for(size_t i=0;i<MD_NL_MAX_KEYS;++i)md_nl_be32(keys[i],(uint32_t)i);
     CHECK(!md_nft_nl_batch_encode(wire,MD_NL_BUFFER_SIZE,&r,41771,1000,10,"diag","learn6",(const uint8_t (*)[16])keys,MD_NL_MAX_KEYS,16,1));
     CHECK(r.count==10&&r.length<MD_NL_BUFFER_SIZE);

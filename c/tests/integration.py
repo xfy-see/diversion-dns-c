@@ -20,6 +20,7 @@ BIN = Path(sys.argv.pop(1)).resolve()
 ROOT = Path(__file__).resolve().parents[2]
 
 
+# 按测试需要构造 DNS 原始字节，显式控制 ID、类型、类和 EDNS/DNSSEC 字段。
 def query(name, ident=100, qtype=1, flags=0x0100, edns=None, do=False, qclass=1):
     wire = b"".join(bytes([len(x)]) + x.encode() for x in name.rstrip(".").split(".")) + b"\0"
     packet = struct.pack("!6H", ident, flags, 1, 0, 0, int(edns is not None))
@@ -83,6 +84,7 @@ def bound_loopback_pair():
     raise RuntimeError("could not reserve a TCP+UDP mock port in 128 attempts")
 
 
+# 两个可控上游返回不同地址并计数；同时验证答案和请求次数才能证明分流/缓存行为。
 class MockDNS:
     def __init__(self, address, ttl=60):
         self.address, self.ttl = address, ttl
@@ -188,6 +190,7 @@ def unused_port(low=20000, high=21024):
     raise RuntimeError("no free TCP+UDP test service port in bounded range")
 
 
+# 最小分流配置覆盖四类域名规则，并为缓存命中提供 accept 终止点。
 def plugins(a, b, port, lazy=0):
     return [
         {"tag": "cn", "type": "domain_set", "args": {"exps": ["domain:cn", "full:exact.test", "keyword:needle", "regexp:^asset-[0-9]+\\.test$"]}},
@@ -205,6 +208,7 @@ def plugins(a, b, port, lazy=0):
     ]
 
 
+# 每例使用临时配置和独立进程；退出必须成功回收，避免遗留服务影响后续用例。
 @contextlib.contextmanager
 def running(config):
     with tempfile.TemporaryDirectory(prefix="mosdns-c-test-") as tmp:
@@ -255,6 +259,7 @@ class Integration(unittest.TestCase):
             path.write_text(json.dumps(config))
             return subprocess.run([str(BIN), "check", "-c", str(path)], capture_output=True, timeout=5)
 
+    # UDP 先填充、TCP 用新 ID 命中；上游只收到一次请求才算跨传输缓存复用成功。
     def test_site_split_cache_udp_tcp(self):
         config = self.config()
         with running(config) as port:

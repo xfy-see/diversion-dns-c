@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* 临时配置验证最小配置契约、控制流和缓存快速路径；查询使用 reject，不依赖公网。 */
 #define _POSIX_C_SOURCE 200809L
 #define _DARWIN_C_SOURCE
 #include "mosdns.h"
@@ -33,6 +34,7 @@ static unsigned query(md_engine *e,const char *name) {
     if(md_engine_query(e,listener->entry,&q,&r,err)) { fprintf(stderr,"query: %s\n",err);abort(); }
     assert(md_read16(r.data)==1234);assert(md_read16(r.data+2)&0x8000);return md_read16(r.data+2)&15;
 }
+/* check 跳过外部规则文件读取，启动则必须读取；未知/不支持配置须显式报错。 */
 static void config_validation(void) {
     char err[MD_ERROR_SIZE]={0};
     const char *missing="plugins:\n"
@@ -96,6 +98,7 @@ static void regex_profile_validation(void) {
         assert(!unlink(path));
     }
 }
+/* 组合匹配器与 jump/goto/return 各自语义单独断言，并覆盖运行时递归上限。 */
 static void matching_and_flow(void) {
     char err[MD_ERROR_SIZE]={0};
     const char *config="plugins:\n"
@@ -146,6 +149,7 @@ static void included_json(void) {
     e=md_engine_load(config,true,err);assert(!e);assert(strstr(err,"include depth"));
     unlink(included);unlink(config);
 }
+/* 仅标准 cache→has_resp/accept 可直接返回；相似但有其他动作/条件时仍走完整序列。 */
 static void cached_accept_guards(void) {
     const char *next[]={"{matches: has_resp, exec: accept}",
                         "{matches: has_resp, exec: 'reject 2'}",

@@ -16,6 +16,7 @@ import shutil
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
+# 子进程按标识符/地址语法检查真实 argv 和 stdin；它不替代 Linux 内核的接受结果。
 CHILD = r'''#!/usr/bin/env python3
 import ipaddress,json,os,re,sys
 args=sys.argv[1:]; body=sys.stdin.read() if args==['-f','-'] else ''
@@ -66,6 +67,7 @@ def main():
     out.mkdir(parents=True, exist_ok=False)
     if args.driver and args.old_source:
         parser.error('--driver and --old-source cannot be combined')
+    # 传 --driver 使用 CI 已编译程序；本地下载验证只能走该分支。
     compiler = None if args.driver else Path(shutil.which(os.environ.get('CC', 'cc'))).resolve()
     child = out / 'grammar-nft'
     child.write_text(CHILD); child.chmod(0o700)
@@ -95,6 +97,7 @@ def main():
     if args.compile_only:
         (out/'compile.json').write_text(json.dumps({'compiled':True,'commands':commands,'driver':str(driver)},indent=2)+'\n')
         return
+    # 每例同时核对退出码、子进程调用记录和 fake netlink 计数，覆盖两条更新路径。
     checks = []
     def case(label, mode='ipv4', interval=False, table='c131_cplan', name='cn_site4', expected_rc=0, binary=driver):
         log=out/(label+'.calls.jsonl')

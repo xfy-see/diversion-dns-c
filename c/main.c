@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* 命令行入口负责选项检查、工作目录切换和引擎生命周期；网络收发由服务器模块负责。 */
 #include "mosdns.h"
 #include <errno.h>
 #include <signal.h>
@@ -38,16 +39,20 @@ int main(int argc, char **argv) {
             workers = (unsigned)n;
         } else { fprintf(stderr, "unknown option: %s\n", argv[i]); return 1; }
     }
+    /* 先切换目录，使配置、include 和规则文件使用同一套相对路径基准。 */
     if (dir && chdir(dir)) { fprintf(stderr, "chdir: %s\n", strerror(errno)); return 1; }
     char err[MD_ERROR_SIZE] = {0};
     md_engine *e = md_engine_load(config, check, err);
     if (!e) { fprintf(stderr, "%s\n", err); return 1; }
+    /* check 只验证支持的配置和引用，不启动监听器，也不加载规则文件。 */
     if (check) {
         puts("configuration valid (no listeners or nft writes; rule files and runtime resources not checked)");
         md_engine_free(e); return 0;
     }
+    /* 客户端提前断开 TCP 时，把写失败交给正常错误路径处理，避免进程被 SIGPIPE 终止。 */
     signal(SIGPIPE, SIG_IGN);
     int result = md_server_run(e, workers, err);
+    /* md_server_run 返回后工作线程已退出，再释放引擎并等待可能的缓存刷新。 */
     md_engine_free(e);
     if (result) fprintf(stderr, "%s\n", err);
     return result ? 1 : 0;

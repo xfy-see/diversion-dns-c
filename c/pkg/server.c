@@ -1,4 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/* 一个 poll 事件循环管理监听器和 TCP 帧，worker 执行可能阻塞的查询图。
+ * job 经待执行/完成队列转移所有权，最终统一由事件循环回收。 */
 #include "mosdns.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -16,6 +18,7 @@
 #define MAX_JOBS 64
 #define MAX_IDLE_JOBS 8
 #define UDP_RECEIVE_BUFFER_BYTES (256 * 1024)
+/* slot < 0 表示 UDP；TCP 同时保存 slot 和 generation，防连接关闭后槽位复用。 */
 typedef struct job {
     struct job *next;
     int socket, slot;
@@ -25,6 +28,8 @@ typedef struct job {
     size_t entry;
     md_packet query, response;
 } job;
+/* lock 保护两条跨线程队列和 outstanding；后者包含排队、执行、完成及待写回复，
+ * 因此慢 TCP 客户端也受 MAX_JOBS 限制。wake 管道只是通知，完成队列才是结果来源。 */
 typedef struct {
     md_engine *engine;
     pthread_mutex_t lock;
@@ -37,6 +42,8 @@ typedef struct {
     bool stopping;
     int wake[2];
 } pool;
+/* TCP 每条连接至多有一个处理中的查询，读完消息体后 busy 置位，
+ * 完整回复写出后才继续读取下一帧；header/sent 保存非阻塞 I/O 的进度。 */
 typedef struct {
     int fd;
     uint64_t generation, last;
@@ -46,6 +53,7 @@ typedef struct {
     bool busy;
     job *output;
 } connection;
+/* 信号处理器只置位，释放队列/socket 和等待线程均在正常执行路径完成。 */
 static volatile sig_atomic_t stop_requested;
 static void stop_signal(int sig) { (void)sig; stop_requested = 1; }
 static int nonblock(int fd) {
@@ -53,6 +61,7 @@ static int nonblock(int fd) {
     return flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0 ||
            fcntl(fd, F_SETFD, FD_CLOEXEC) < 0 ? -1 : 0;
 }
+/* 只缓存少量空闲大报文对象，平衡每次 malloc 的成本和空闲内存占用。 */
 static job *acquire_job(pool *p) {
     job *j = p->idle;
     if (j) { p->idle = j->next; p->idle_count--; }
@@ -70,12 +79,14 @@ static void recycle_job(pool *p, job *j) {
         j->next = p->idle; p->idle = j; p->idle_count++;
     } else free(j);
 }
+/* 只能由事件循环调用：先释放 outstanding 配额，再放回线程私有空闲链表。 */
 static void release_job(pool *p, job *j) {
     pthread_mutex_lock(&p->lock);
     p->outstanding--;
     pthread_mutex_unlock(&p->lock);
     recycle_job(p, j);
 }
+/* 成功入队后 job 交给 worker；失败时调用方仍负责发送错误或释放 job。 */
 static bool enqueue(pool *p, job *j) {
     pthread_mutex_lock(&p->lock);
     if (p->stopping || p->outstanding >= MAX_JOBS) {
@@ -88,6 +99,7 @@ static bool enqueue(pool *p, job *j) {
     pthread_mutex_unlock(&p->lock);
     return true;
 }
+/* 缓存命中的 TCP 回复跳过 worker，但未写完之前仍占用一个 job 配额。 */
 static bool retain_output(pool *p) {
     pthread_mutex_lock(&p->lock);
     bool ok = !p->stopping && p->outstanding < MAX_JOBS;
@@ -95,6 +107,8 @@ static bool retain_output(pool *p) {
     pthread_mutex_unlock(&p->lock);
     return ok;
 }
+/* 每个 worker 建立自己的上游连接池，退出时释放；执行期间独占取出的 job。
+ * UDP 可直接发回完整数据报，TCP 写操作必须交还事件循环保持帧进度一致。 */
 static void *work(void *arg) {
     pool *p = arg;
     md_forward_worker_enable();
@@ -133,6 +147,8 @@ static void *work(void *arg) {
     md_forward_worker_cleanup();
     return NULL;
 }
+/* generation 在每次关闭时递增；已经提交给 worker 的 job 仍会完成，
+ * 完成项据此丢弃旧连接的结果，不会发给占用同一槽位的新客户端。 */
 static void close_connection(pool *p, connection *c) {
     if (c->fd >= 0) close(c->fd);
     free(c->body);
@@ -141,6 +157,7 @@ static void close_connection(pool *p, connection *c) {
     memset(c, 0, sizeof(*c));
     c->fd = -1; c->generation = generation;
 }
+/* 清空通知后一次取走当前完成链表；管道写满也不会丢结果，因为队列受锁保护。 */
 static void completions(pool *p, connection *cs) {
     uint8_t bytes[128];
     while (read(p->wake[0], bytes, sizeof(bytes)) > 0) {}
@@ -166,6 +183,7 @@ static void completions(pool *p, connection *cs) {
         j = next;
     }
 }
+/* 严格按长度前缀收包，拒绝短于 DNS 头的帧；完整结构校验通过后才能执行。 */
 static void tcp_read(pool *p, connection *c, int slot) {
     while (!c->busy) {
         uint8_t *dest = c->header_len < 2 ? c->header + c->header_len : c->body + c->body_len;
@@ -195,6 +213,7 @@ static void tcp_read(pool *p, connection *c, int slot) {
                 if (md_dns_question(&j->query, &q, err) || (q.flags & 0x8000)) {
                     recycle_job(p, j); close_connection(p, c); return;
                 }
+                /* 快路径只处理引擎确认可直接返回的鲜缓存，其他查询仍执行完整查询图。 */
                 if (md_engine_cached_query(p->engine, j->entry, &j->query, &j->response)) {
                     if (!retain_output(p)) { recycle_job(p, j); close_connection(p, c); return; }
                     c->output = j; c->sent = 0;
@@ -207,6 +226,7 @@ static void tcp_read(pool *p, connection *c, int slot) {
         }
     }
 }
+/* sendmsg 拼接长度和消息体，sent 跨事件保存进度，避免为 TCP 前缀复制整个回复。 */
 static void tcp_write(pool *p, connection *c) {
     job *j = c->output;
     while (c->sent < j->response.len + 2) {
@@ -227,6 +247,7 @@ static void tcp_write(pool *p, connection *c) {
     release_job(p, j); c->output = NULL; c->busy = false;
     c->header_len = c->body_len = c->expected = c->sent = 0;
 }
+/* UDP 鲜缓存可在事件循环当场回复；队列满时返回 SERVFAIL，并回收未入队对象。 */
 static void udp_read(pool *p, int fd, size_t entry) {
     /* Bound each drain so a hot UDP listener cannot starve TCP/completions. */
     for (unsigned i = 0; i < 16; i++) {
@@ -256,6 +277,7 @@ static void udp_read(pool *p, int fd, size_t entry) {
         }
     }
 }
+/* 启动时记录实际 UDP 接收缓冲值；操作系统可能夹紧请求值，日志保留这个差异。 */
 int md_server_run(md_engine *e, unsigned workers, char *err) {
     size_t count = md_engine_listener_count(e);
     if (!count || count > 64 || workers < 1 || workers > 64) {
@@ -333,6 +355,7 @@ int md_server_run(md_engine *e, unsigned workers, char *err) {
         pf[n] = (struct pollfd){p.wake[0], POLLIN, 0}; slots[n++] = -2;
         for (size_t i = 0; i < count; i++) { pf[n] = (struct pollfd){fds[i], POLLIN, 0}; slots[n++] = -1; }
         uint64_t now = md_now();
+        /* worker 尚未完成的 TCP 连接暂不参与读写轮询；完成通知会重新挂上写事件。 */
         for (int i = 0; i < MAX_CONNECTIONS; i++) {
             connection *c = &cs[i];
             if (c->fd < 0) continue;
@@ -372,6 +395,8 @@ int md_server_run(md_engine *e, unsigned workers, char *err) {
     if (stop_requested) result = 0;
     sigaction(SIGINT, &old_int, NULL); sigaction(SIGTERM, &old_term, NULL);
 cleanup:
+    /* 先禁止新任务并等待所有 worker，再释放 job 和监听器；保证 worker 发 UDP 时
+     * socket 仍有效，且不会访问已释放的队列或引擎引用。 */
     pthread_mutex_lock(&p.lock); p.stopping = true;
     pthread_cond_broadcast(&p.ready); pthread_mutex_unlock(&p.lock);
     for (unsigned i = 0; i < started; i++) pthread_join(threads[i], NULL);

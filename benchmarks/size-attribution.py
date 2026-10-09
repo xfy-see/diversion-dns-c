@@ -24,6 +24,7 @@ def sha256(data):
     return hashlib.sha256(data).hexdigest()
 
 
+# 直接读取 ELF64 小端节表，校验边界；不执行被分析的目标文件。
 def elf_sections(path):
     data = path.read_bytes()
     if data[:6] != b"\x7fELF\x02\x01":
@@ -61,6 +62,7 @@ def elf_sections(path):
     return dict(bytes=len(data), sha256=sha256(data), machine=header[2], sections=sections)
 
 
+# 仅按已知链接输入分类；合并常量和未知输入单列，避免强行归属给项目代码。
 def category(source, input_section=""):
     if source.startswith("<internal>"):
         if input_section.startswith((".rodata.str", ".rodata.cst")):
@@ -89,6 +91,7 @@ def category(source, input_section=""):
     return "unattributed"
 
 
+# 只累计保留在输出节中的输入区间；符号行不重复计入字节。
 def parse_map(path, sections):
     if path.stat().st_size == 0:
         raise ValueError("empty LLD map")
@@ -113,6 +116,7 @@ def parse_map(path, sections):
     return rows
 
 
+# map 必须来自与发布文件字节完全相同的重放链接；诊断文件只辅助比较节布局。
 def analyze(release_path, debug_path, mapped_path, map_path):
     release, debug, mapped = (elf_sections(p) for p in (release_path, debug_path, mapped_path))
     if release["machine"] != debug["machine"] or release["sha256"] == debug["sha256"]:
@@ -135,6 +139,7 @@ def analyze(release_path, debug_path, mapped_path, map_path):
         raise ValueError("diagnostic and release ELF allocated section shapes differ: "
                          + json.dumps(differences, sort_keys=True))
     rows = parse_map(map_path, mapped["sections"])
+    # BSS 只在加载后占空间，与磁盘字节分开计数；填充和元数据也必须对账。
     disk = dict.fromkeys(CATEGORIES, 0)
     bss = dict.fromkeys(CATEGORIES, 0)
     inputs = defaultdict(lambda: dict(disk_bytes=0, bss_bytes=0))
@@ -167,6 +172,7 @@ def analyze(release_path, debug_path, mapped_path, map_path):
         raise ValueError("LLD map did not identify project and PCRE2 input sections")
     loadable_file_bytes = sum(s["size"] for s in release["sections"].values()
                               if s["flags"] & 2 and s["type"] != 8)
+    # 磁盘归因覆盖整个 ELF 文件，节表、文件头和对齐余量作为单独开销。
     overhead = release["bytes"] - loadable_file_bytes
     if overhead < 0:
         raise ValueError("ELF file is smaller than its loadable sections")

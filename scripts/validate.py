@@ -12,12 +12,14 @@ import sys
 import artifacts
 
 
+# 此入口只运行已验证的同架构产物；编译由 GitHub 工作流完成。
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--bundle',type=Path,required=True); p.add_argument('--output',type=Path,required=True)
     p.add_argument('--checkout',type=Path); p.add_argument('--ci',action='store_true')
     args=p.parse_args(); bundle=args.bundle.resolve(); out=args.output.resolve()
     m=artifacts.verify_bundle(bundle,args.checkout)
+    # 先确认主机/产物架构一致，再创建本轮结果目录；不尝试执行跨架构程序。
     expected={'Darwin':'macos','Linux':'linux'}[platform.system()]+'-'+{'arm64':'arm64','aarch64':'arm64','x86_64':'amd64'}[platform.machine()]
     artifacts.require(m['target']==expected, 'artifact cannot run on this host')
     artifacts.require(not out.exists(), 'fresh result directory required'); out.mkdir(parents=True)
@@ -36,6 +38,7 @@ def main():
         artifacts.require(r.returncode==0,'test failed: '+label)
 
     try:
+        # 每个 profile 独立设置环境并运行完整套件，避免普通通过掩盖 sanitizer 失败。
         for label, profile in m['profiles'].items():
             env=dict(os.environ,PYTHONDONTWRITEBYTECODE='1')
             if platform.system()=='Darwin': env['DYLD_LIBRARY_PATH']=str(bundle/'runtime')
@@ -55,10 +58,12 @@ def main():
             artifacts.require(nft['ok'] and nft['count']==15 and not nft['commands'],'nft test unexpectedly compiled')
             run(label+'-version',[app,'version'],env)
             run(label+'-check',[app,'check','-c',source/'c/examples/minimal.yaml'],env)
+        # 全部命令完成后再次核验，记录期间产物是否保持完整。
         artifacts.verify_bundle(bundle,args.checkout)
         result['completed']=True
     except BaseException as e:
         result['error']=repr(e); raise
+    # 测试阶段失败也保存已完成命令与错误；completed 只有完整成功时才为 true。
     finally:
         result['finished_utc']=datetime.now(timezone.utc).isoformat()
         (out/'result.json').write_text(json.dumps(result,indent=2)+'\n')
