@@ -10,6 +10,10 @@ PATH = Path(__file__).resolve().parents[1] / "benchmarks" / "size-attribution.py
 SPEC = importlib.util.spec_from_file_location("size_attribution", PATH)
 SIZE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(SIZE)
+BUILD_PATH = Path(__file__).resolve().parents[1] / "benchmarks" / "build-c-profiles.py"
+BUILD_SPEC = importlib.util.spec_from_file_location("build_c_profiles", BUILD_PATH)
+BUILD = importlib.util.module_from_spec(BUILD_SPEC)
+BUILD_SPEC.loader.exec_module(BUILD)
 
 
 class SizeAttributionTests(unittest.TestCase):
@@ -40,6 +44,13 @@ class SizeAttributionTests(unittest.TestCase):
             rows = SIZE.parse_map(path, {".text": {"addr": 0x1000, "size": 0x20}})
         self.assertEqual([row["category"] for row in rows[".text"]], ["project", "pcre2"])
         self.assertEqual(sum(row["size"] for row in rows[".text"]), 0x20)
+
+    def test_zig_verbose_link_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "link.log"
+            path.write_text("ld.lld -static -o '/tmp/diagnostic elf' /tmp/main.o /tmp/libc.a\n")
+            self.assertEqual(BUILD.verbose_lld_command(path),
+                             ["-static", "-o", "/tmp/diagnostic elf", "/tmp/main.o", "/tmp/libc.a"])
 
 
 if __name__ == "__main__":

@@ -114,6 +114,23 @@ def command(command, cwd, env, log):
     return value
 
 
+def verbose_lld_command(log):
+    """Recover Zig's exact LLD inputs; zig cc does not accept -Wl,-Map."""
+    matches = []
+    for line in log.read_text().splitlines():
+        try:
+            parts = shlex.split(line)
+        except ValueError:
+            continue
+        for index, part in enumerate(parts):
+            if part == "ld.lld" or part.endswith("/ld.lld"):
+                matches.append(parts[index + 1:])
+                break
+    if len(matches) != 1 or "-o" not in matches[0]:
+        raise BuildError("expected one verbose ld.lld command in " + str(log))
+    return matches[0]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
@@ -241,11 +258,21 @@ def main():
         diagnostic = size_dir / "mosdns-c.unstripped"
         link_map = size_dir / "mosdns-c.map"
         size_json = size_dir / "attribution.json"
-        diagnostic_flags = [flag for flag in ldflags if flag != "-Wl,-s"] + ["-Wl,-Map," + str(link_map)]
+        diagnostic_flags = [flag for flag in ldflags if flag != "-Wl,-s"]
+        verbose_env = env.copy()
+        verbose_env["ZIG_VERBOSE_LINK"] = "1"
+        verbose_log = logs / "link-app-diagnostic.log"
         manifest["commands"].append(command([str(args.zig), "cc", "-target", args.target] + diagnostic_flags
                                             + ["-o", str(diagnostic), str(objects["main.c"]),
                                                str(objects["pkg/server.c"]), str(lib), str(pcre_lib), "-pthread"],
-                                            work, env, logs / "link-app-diagnostic.log"))
+                                            work, verbose_env, verbose_log))
+        # Zig 0.14 rejects -Wl,-Map in its C driver. Replay the exact LLD
+        # invocation it reports, adding only the map output. The analyzer
+        # checks the resulting ELF's allocated sections against the release.
+        lld_args = verbose_lld_command(verbose_log)
+        manifest["commands"].append(command([str(args.zig), "ld.lld"] + lld_args
+                                            + ["-Map=" + str(link_map)], work, env,
+                                            logs / "link-app-map.log"))
         manifest["commands"].append(command(["python3", str(frozen / "benchmarks/size-attribution.py"),
                                              "--release", str(app), "--diagnostic", str(diagnostic),
                                              "--map", str(link_map), "--output", str(size_json)],
