@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""Execute the complete portable suite from a verified CI bundle; no compilation."""
+import argparse
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import platform
+import subprocess
+import sys
+
+import artifacts
+
+
+def main():
+    p=argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--bundle',type=Path,required=True); p.add_argument('--output',type=Path,required=True)
+    p.add_argument('--checkout',type=Path); p.add_argument('--ci',action='store_true')
+    args=p.parse_args(); bundle=args.bundle.resolve(); out=args.output.resolve()
+    m=artifacts.verify_bundle(bundle,args.checkout)
+    expected={'Darwin':'macos','Linux':'linux'}[platform.system()]+'-'+{'arm64':'arm64','aarch64':'arm64','x86_64':'amd64'}[platform.machine()]
+    artifacts.require(m['target']==expected, 'artifact cannot run on this host')
+    artifacts.require(not out.exists(), 'fresh result directory required'); out.mkdir(parents=True)
+    source=bundle/'source'; commands=[]
+    result=dict(completed=False,commit=m['commit'],run_id=m['run_id'],target=m['target'],profiles=list(m['profiles']),
+                started_utc=datetime.now(timezone.utc).isoformat(),compilers_invoked=False,commands=commands,
+                scope='All five C suites, shared domain fixture, 16 service and 5 plan integrations, 15 nft CLI grammar checks per profile. No real kernel NFT writes or performance/stability proof.')
+
+    def run(label, argv, env, timeout=90):
+        r=subprocess.run([str(v) for v in argv],cwd=source,env=env,capture_output=True,text=True,timeout=timeout)
+        (out/(label+'.stdout')).write_text(r.stdout); (out/(label+'.stderr')).write_text(r.stderr)
+        commands.append(dict(label=label,argv=[str(v) for v in argv],exit_code=r.returncode))
+        artifacts.require(r.returncode==0,'test failed: '+label)
+
+    try:
+        for label, profile in m['profiles'].items():
+            env=dict(os.environ,PYTHONDONTWRITEBYTECODE='1')
+            if platform.system()=='Darwin': env['DYLD_LIBRARY_PATH']=str(bundle/'runtime')
+            if label=='asan':
+                env['ASAN_OPTIONS']='detect_leaks='+('0' if platform.system()=='Darwin' else '1')+':halt_on_error=1'
+                env['UBSAN_OPTIONS']='halt_on_error=1'
+            tests={t:bundle/n for t,n in profile['tests'].items()}; app=bundle/profile['application']
+            for t in ('dns_test','cache_domain_test','engine_test','plan_regression_test','nft_netlink_test'):
+                run(label+'-'+t,[tests[t]],env)
+            run(label+'-domain',[sys.executable,source/'c/tests/domain_fixture.py',tests['domain_driver']],env)
+            run(label+'-integration',[sys.executable,source/'c/tests/integration.py',app],env)
+            run(label+'-plan-integration',[sys.executable,source/'c/tests/plan_integration.py',app],env)
+            argv=[sys.executable,source/'c/tests/nft_cli_test.py','--driver',tests['nft_cli_driver'],'--output',out/(label+'-nft')]
+            if label=='asan': argv.append('--sanitize')
+            run(label+'-nft-cli',argv,env)
+            nft=json.loads((out/(label+'-nft/result.json')).read_text())
+            artifacts.require(nft['ok'] and nft['count']==15 and not nft['commands'],'nft test unexpectedly compiled')
+            run(label+'-version',[app,'version'],env)
+            run(label+'-check',[app,'check','-c',source/'c/examples/minimal.yaml'],env)
+        artifacts.verify_bundle(bundle,args.checkout)
+        result['completed']=True
+    except BaseException as e:
+        result['error']=repr(e); raise
+    finally:
+        result['finished_utc']=datetime.now(timezone.utc).isoformat()
+        (out/'result.json').write_text(json.dumps(result,indent=2)+'\n')
+    print(json.dumps(dict(completed=True,commit=m['commit'],profiles=list(m['profiles']),commands=len(commands),compilers_invoked=False)))
+
+
+if __name__=='__main__': main()

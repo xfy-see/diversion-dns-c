@@ -1,0 +1,163 @@
+name: Build and test C
+run-name: C ${{ github.sha }}
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: macos-arm64
+          - os: ubuntu-24.04
+            target: linux-amd64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Dependencies
+        run: |
+          if [[ $(uname) == Darwin ]]; then
+            brew install pcre2
+          else
+            sudo apt-get update
+            sudo apt-get install -y libpcre2-dev
+          fi
+      - name: Build native and ASan/UBSan programs
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          mkdir -p .build/compile-logs
+          cc --version > .build/compile-logs/compiler.txt
+          pcre2-config --version > .build/compile-logs/pcre2.txt
+          if [[ $(uname) == Darwin ]]; then
+            prefix=$(brew --prefix pcre2)
+            lib=$prefix/lib/libpcre2-8.a
+            cpp=-I$prefix/include
+          else
+            lib=/usr/lib/$(cc -dumpmachine)/libpcre2-8.a
+            cpp=-I/usr/include
+          fi
+          test -f "$lib"
+          for profile in native asan; do
+            folder=../.build/$profile
+            options=()
+            if [[ $profile == asan ]]; then options+=(SANITIZE=1); fi
+            targets=(all)
+            for t in dns_test cache_domain_test engine_test plan_regression_test nft_netlink_test domain_driver; do
+              targets+=("$folder/tests/$t")
+            done
+            make -C c -j4 BUILD="$folder" PCRE2_LIB="$lib" PCRE2_CFLAGS="$cpp" "${options[@]}" "${targets[@]}" 2>&1 | tee .build/compile-logs/$profile.log
+            args=()
+            if [[ $profile == asan ]]; then args+=(--sanitize); fi
+            python3 c/tests/nft_cli_test.py --output .build/nft-$profile --compile-only "${args[@]}"
+            cp .build/nft-$profile/nft-cli-driver .build/$profile/tests/nft_cli_driver
+          done
+      - name: Package, verify and execute the complete suite
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          runtime=()
+          if [[ $(uname) == Darwin ]]; then
+            runtime+=(--runtime-file "$(cc -print-resource-dir)/lib/darwin/libclang_rt.asan_osx_dynamic.dylib")
+          fi
+          profiles=(--profile native=.build/native --profile asan=.build/asan)
+          python3 scripts/artifacts.py pack "${profiles[@]}" --target "$TARGET" --kind native "${runtime[@]}" --logs .build/compile-logs --output .build/pretest.tar.gz
+          python3 scripts/artifacts.py extract --archive .build/pretest.tar.gz --expected-commit "$GITHUB_SHA" --expected-run-id "$GITHUB_RUN_ID" --checkout . --output .build/verified
+          python3 scripts/validate.py --bundle .build/verified --checkout . --output .build/ci-validation --ci
+          python3 scripts/artifacts.py pack "${profiles[@]}" --target "$TARGET" --kind native "${runtime[@]}" --logs .build/compile-logs --logs .build/ci-validation --output dist/bundle.tar.gz
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: diversion-native-${{ matrix.target }}-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          path: dist/bundle.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: failure()
+        with:
+          name: failure-native-${{ matrix.target }}-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          path: |
+            .build/compile-logs/
+            .build/ci-validation/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 30
+  static:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: linux-amd64
+            zig_target: x86_64-linux-musl
+            zig_arch: x86_64
+            zig_sha: 24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+            zig_target: aarch64-linux-musl
+            zig_arch: aarch64
+            zig_sha: f7a654acc967864f7a050ddacfaa778c7504a0eca8d2b678839c21eea47c992b
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Pinned Zig and PCRE2 sources
+        env:
+          ZIG_ARCH: ${{ matrix.zig_arch }}
+          ZIG_SHA: ${{ matrix.zig_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p .build/tools .build/deps
+          curl --fail --location --retry 3 https://ziglang.org/download/0.14.1/zig-$ZIG_ARCH-linux-0.14.1.tar.xz -o .build/tools/zig.tar.xz
+          printf '%s  %s\n' "$ZIG_SHA" .build/tools/zig.tar.xz | sha256sum -c -
+          tar -xJf .build/tools/zig.tar.xz -C .build/tools
+          curl --fail --location --retry 3 https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.48/pcre2-10.48.tar.gz -o .build/deps/pcre2-10.48.tar.gz
+          echo 'ebcc25aadf2a51fa1fefa9b8bc9e7a79b3dae86870a0f1152a22e42befd46888  .build/deps/pcre2-10.48.tar.gz' | sha256sum -c -
+      - name: Cross build frozen static application and test harnesses
+        env:
+          ZIG_ARCH: ${{ matrix.zig_arch }}
+          ZIG_TARGET: ${{ matrix.zig_target }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 benchmarks/build-c-profiles.py --output .build/static --zig .build/tools/zig-$ZIG_ARCH-linux-0.14.1/zig --target "$ZIG_TARGET" --pcre2-archive .build/deps/pcre2-10.48.tar.gz --pcre2-sha256 ebcc25aadf2a51fa1fefa9b8bc9e7a79b3dae86870a0f1152a22e42befd46888 --pcre2-origin https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.48/pcre2-10.48.tar.gz --jobs 4
+      - name: Verify and test static binaries on matching Linux hardware
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          python3 -m unittest discover -s tests -p test_artifacts.py -v
+          python3 scripts/artifacts.py pack --profile static=.build/static --target "$TARGET" --kind static --output .build/pretest.tar.gz
+          python3 scripts/artifacts.py extract --archive .build/pretest.tar.gz --expected-commit "$GITHUB_SHA" --expected-run-id "$GITHUB_RUN_ID" --checkout . --output .build/verified
+          python3 scripts/validate.py --bundle .build/verified --checkout . --output .build/ci-validation --ci
+          python3 scripts/artifacts.py pack --profile static=.build/static --target "$TARGET" --kind static --logs .build/ci-validation --output dist/bundle.tar.gz
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: diversion-static-${{ matrix.target }}-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          path: dist/bundle.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: failure()
+        with:
+          name: failure-static-${{ matrix.target }}-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          path: |
+            .build/static/manifest.json
+            .build/static/logs/
+            .build/ci-validation/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 30

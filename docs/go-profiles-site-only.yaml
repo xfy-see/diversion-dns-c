@@ -1,0 +1,62 @@
+# Static example for full and minimal Go builds; no system DNS takeover.
+# Requires Linux and an existing CN-site list, interfaces, nft sets and routes.
+# Verify/update the default DNS IP and WireGuard interface before use.
+# c131tm was an isolated test interface; this config does not create it.
+# Required nft sets: inet mosdns_cn cn_site4 (ipv4_addr), cn_site6 (ipv6_addr).
+# Existing routing must send mark 0x01000000 direct and 0x02000000 via WireGuard,
+# and guard against the latter leaking onto another interface if the tunnel fails.
+log:
+  level: info
+plugins:
+  - tag: cn_site
+    type: domain_set
+    args:
+      files: ["/etc/mosdns/cn-site.txt"]
+  - tag: cache
+    type: cache
+    args:
+      size: 1024
+      lazy_cache_ttl: 0
+  - tag: router_default_forward
+    type: forward
+    args:
+      so_mark: 16777216 # 0x01000000
+      bind_to_device: "br-lan"
+      upstreams:
+        - addr: "192.168.100.1:53"
+  - tag: foreign_forward
+    type: forward
+    args:
+      so_mark: 33554432 # 0x02000000
+      bind_to_device: "c131tm"
+      upstreams:
+        - addr: "1.1.1.1:53"
+  - tag: finalize
+    type: sequence
+    args:
+      - matches: ["qname $cn_site"]
+        exec: nftset inet,mosdns_cn,cn_site4,ipv4_addr,32 inet,mosdns_cn,cn_site6,ipv6_addr,128
+      - exec: accept
+  - tag: resolve_cn_site
+    type: sequence
+    args:
+      - exec: $router_default_forward
+      - exec: goto finalize
+  - tag: main
+    type: sequence
+    args:
+      - exec: $cache
+      - matches: ["has_resp"]
+        exec: goto finalize
+      - matches: ["qname $cn_site"]
+        exec: goto resolve_cn_site
+      - exec: $foreign_forward
+      - exec: goto finalize
+  - type: udp_server
+    args:
+      listen: "127.0.0.1:15361"
+      entry: main
+  - type: tcp_server
+    args:
+      listen: "127.0.0.1:15361"
+      entry: main

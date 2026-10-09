@@ -1,0 +1,5 @@
+# The root ignores vendor/ for Go. The C parser is part of this source tree.
+!vendor/
+!vendor/**
+__pycache__/
+*.plist

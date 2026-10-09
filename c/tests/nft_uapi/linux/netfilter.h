@@ -1,0 +1,3 @@
+#define NFPROTO_INET 1
+#define NFPROTO_IPV4 2
+#define NFPROTO_IPV6 10
