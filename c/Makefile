@@ -27,7 +27,8 @@ endif
 CFLAGS ?= -Os -flto -g
 LDFLAGS ?= -flto
 CFLAGS += -UNDEBUG -std=c11 -Wall -Wextra -Wpedantic -Werror -pthread
-LDLIBS += $(REGEX_LIB) -pthread
+EXTRA_LDLIBS ?=
+LDLIBS += $(REGEX_LIB) -pthread $(EXTRA_LDLIBS)
 ifeq ($(SANITIZE),1)
 CFLAGS += -O1 -fsanitize=address,undefined -fno-omit-frame-pointer
 LDFLAGS += -fsanitize=address,undefined
@@ -65,7 +66,7 @@ $(BUILD)/tests/nft_cli_driver: CPPFLAGS += -Itests/nft_uapi
 endif
 $(BUILD)/tests/nft_cli_driver: tests/nft_cli_driver.c pkg/dns.c plugin/nftset.c include/mosdns.h include/nft_netlink.h | check-backend
 	@mkdir -p $(dir $@)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) tests/nft_cli_driver.c pkg/dns.c -pthread -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) tests/nft_cli_driver.c pkg/dns.c -pthread $(EXTRA_LDLIBS) -o $@
 unit: $(addprefix $(BUILD)/tests/,$(TESTS) $(DRIVERS))
 	$(BUILD)/tests/dns_test
 	$(BUILD)/tests/cache_domain_test

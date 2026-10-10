@@ -1,7 +1,8 @@
 # Optional OpenWrt POSIX-lite package
 
-This is a local **packaging experiment**, not a firmware or release-default
-change. The normal PCRE2 backend and portable static build remain available.
+This is an **experimental unsigned APK**, built locally or by the separate
+`Experimental OpenWrt lite APK` Actions workflow. It is not a firmware or
+release-default change. The normal PCRE2 backend and portable static build remain available.
 The application payload is `/usr/sbin/diversion-dns-c-lite` plus normal OpenWrt
 package bookkeeping; it does not install
 configuration, create an init service, start a listener, or change firewall/DNS
@@ -20,7 +21,7 @@ alone is insufficient. Kernel-module vermagic is a separate requirement from
 this ordinary userspace application's libc ABI. Do not upgrade or replace the
 router's libc to make an experimental binary work.
 
-The source staging helper exports committed `c/` and `LICENSE` files into a
+The source staging helper exports committed `c/`, `LICENSE`, and the package recipe into a
 fresh package directory and records their hashes. Uncommitted application
 changes are not silently included. Commit local application changes first if
 they are intended inputs. The helper does not download, compile, install, or
@@ -35,7 +36,7 @@ make defconfig
 make -j4 package/diversion-dns-c-lite/compile V=s
 ```
 
-The evaluation generated an unsigned local APK. Its content checksum and
+The workflow generates an unsigned experimental APK. Its content checksum and
 payload were verified locally; it is not an authenticated release from a
 configured package repository. Do not alter a router's trust configuration or
 install it merely to complete this experiment.
@@ -69,8 +70,10 @@ python3 scripts/check-openwrt-elf.py path/to/diversion-dns-c-lite \
   --rootfs path/to/extracted-rootfs
 ```
 
-The checker requires ELF64 little-endian AArch64, the musl loader at
-`/lib/ld-musl-aarch64.so.1`, only `libc.so` as a shared dependency, the preserved
+The default checker requires ELF64 little-endian AArch64 with loader
+`/lib/ld-musl-aarch64.so.1`. For MT7621 pass `--arch mipsel_24kc`: it requires
+ELF32 little-endian MIPS32r2/O32/soft-float and `/lib/ld-musl-mipsel-sf.so.1`.
+Both modes require only `libc.so` as a shared dependency, an exactly 1 MiB RW
 non-executable stack request, and all strong imports exported by the supplied
 runtime. It follows dynamic tables even when OpenWrt `sstrip` removes section
 headers. Weak optional GCC frame-registration hooks are reported separately.
@@ -95,3 +98,85 @@ Keep these quantities separate:
 
 See [the local evaluation](../../docs/openwrt-dynamic-evaluation-20261010.md)
 for verified inputs, measured values, and the current limitations.
+
+## Dual-architecture GitHub Actions
+
+`.github/workflows/openwrt-apk.yml` runs on branch pushes, pull requests and
+manual dispatch. It does not publish a GitHub Release and does not alter the
+existing PCRE2 build/delivery workflow. Its two independently named artifacts
+contain an architecture-suffixed APK, SHA256SUMS, the exact Git source archive,
+source manifest, SDK configuration, buildinfo, ABI checks and raw test logs:
+
+- OpenWrt 25.12.5, `qualcommax/ipq60xx`, `aarch64_cortex-a53`
+- OpenWrt 25.12.5, `ramips/mt7621`, `mipsel_24kc`
+
+Official SDK URLs, GCC 14.3.0 and archive SHA256s are pinned in `targets.json`.
+The cache contains verified download archives only, keyed by OS, architecture,
+SDK hash, compiler version and source/recipe/workflow inputs, with no fallback
+restore prefixes. Every build extracts a fresh SDK and uses fresh target objects
+and fresh PCRE2 reference objects. Download hashes are checked even on cache hits.
+No SDK, firmware/rootfs, emulator or key material is uploaded as an artifact.
+Host tools come from the runner's official Ubuntu repositories; their versions,
+target compiler and emulator identity are recorded in build/test evidence.
+
+The 32-bit MIPS recipe statically links the SDK's libatomic helpers for the
+existing 64-bit atomic counter. AArch64 does not receive `-latomic`.
+`EXTRA_LDLIBS` also reaches the standalone nft CLI test rule; the production
+counter and assertions are unchanged. Both builds retain `-Os`, SDK LTO/GC and
+hardening, `-static-libgcc`, and the 1 MiB stack request. With
+`DIVERSION_BUILD_TESTS=1` the SDK builds the seven test binaries using the exact
+package compiler and flags; only the application is put in the APK.
+
+The verifier checks architecture, package dependencies, a two-file payload
+whitelist, all payload hashes and installed-size metadata before extraction.
+It expects default signature verification to reject the unsigned APK. Its only
+`--allow-untrusted` uses are offline `verify`/`extract` of the just-built,
+SHA256-recorded package into an isolated directory with an empty key directory.
+These commands do not install a package, execute package scripts or change trust.
+There are deliberately no router-install or signature-bypass installation steps.
+SHA256 provides content integrity, not publisher authentication; an unsigned APK
+is not trusted for normal installation by default.
+
+OpenWrt 25.12.5's SDK has two unconditional APK signing-key prerequisites even
+when `CONFIG_SIGNED_PACKAGES` is disabled. Before building, the script changes
+only those two dependencies to be conditional, records the patch, disables
+signing, and checks for absence of key filenames both before and after the build.
+It never creates, imports, reads or publishes keys. An unexpected SDK helper
+layout fails closed and needs review before a version update.
+
+Each matrix leg runs, with nonzero exit codes failing the job:
+
+- Five same-SDK C harnesses, including 157 netlink mock assertions and 43,200
+  concurrent regex matches across eight threads
+- Shared domain fixture and explicit POSIX-lite rejection/locale/limit tests
+- 18 nft CLI mock/grammar checks
+- 12 loopback integration tests executing the final APK-extracted application
+- 81,089 portable-subset differential comparisons against native same-source
+  PCRE2 10.48, plus explicit syntax/input differences and the two known PCRE2
+  budget differences; PCRE2's budget unit is also executed
+
+The test application is stripped independently and must match the packaged ELF
+byte-for-byte. A failed test, source/hash mismatch, unexpected runtime dependency,
+wrong ABI, missing import or unexpected signing key prevents a successful artifact.
+
+QEMU uses the libc from that exact official SDK. This proves SDK userspace
+compatibility, not compatibility with an installed or reduced (`MKLIBS`) device
+libc. Local historical reference-firmware checks are documented separately;
+CI does not claim to read or test either user's current router firmware.
+The declared `libpthread` package marker may still require the matching package
+repository even though pthread symbols are provided by musl's libc.
+No real kernel nft writes, device acceptance, RSS/QPS, sustained-load stability
+or actual installed flash increase is inferred from these tests.
+
+For an authorized local reproduction with already verified archives:
+
+```sh
+python3 scripts/build-openwrt-apk.py --arch mipsel_24kc --source-ref HEAD \
+  --sdk-archive /path/to/verified-sdk.tar.zst \
+  --pcre2-archive /path/to/pcre2-10.48.tar.gz \
+  --work .build/apk-work-mips --output .build/apk-output-mips
+```
+
+Both directories must be new. Use `aarch64_cortex-a53` and its SDK for ARM64.
+The wrapper freezes committed build inputs and rejects modified helper/recipe
+files. It only works on build artifacts and never connects to a router.

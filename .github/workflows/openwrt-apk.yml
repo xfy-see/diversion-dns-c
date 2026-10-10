@@ -1,0 +1,94 @@
+name: Experimental OpenWrt lite APK
+run-name: OpenWrt APK ${{ github.sha }}
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  apk:
+    name: APK / ${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [aarch64_cortex-a53, mipsel_24kc]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Select pinned SDK
+        id: sdk
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 - <<'PY'
+          import json, os
+          target = json.load(open('packaging/openwrt/targets.json'))[os.environ['ARCH']]
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              for key in ('sdk_url', 'sdk_sha256', 'gcc_version'):
+                  print(f'{key}={target[key]}', file=out)
+          PY
+      - name: Cache verified download archives only
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .build/downloads
+          # No restore prefixes, expanded SDK, compiler objects or target caches.
+          key: openwrt-apk-v1-${{ runner.os }}-${{ matrix.arch }}-gcc${{ steps.sdk.outputs.gcc_version }}-${{ steps.sdk.outputs.sdk_sha256 }}-${{ hashFiles('c/**', 'packaging/openwrt/**', 'scripts/*openwrt*', '.github/workflows/openwrt-apk.yml') }}
+      - name: Install official Ubuntu host build and emulation dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential clang flex bison gawk gettext git \
+            libncurses-dev libssl-dev python3 python3-setuptools python3-yaml rsync unzip zlib1g-dev file wget curl \
+            zstd qemu-user binutils patch perl xz-utils time
+      - name: Fetch and verify official inputs
+        env:
+          SDK_URL: ${{ steps.sdk.outputs.sdk_url }}
+          SDK_SHA256: ${{ steps.sdk.outputs.sdk_sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p .build/downloads
+          if [[ ! -f .build/downloads/sdk.tar.zst ]]; then
+            curl --fail --location --retry 3 "$SDK_URL" -o .build/downloads/sdk.tar.zst
+          fi
+          printf '%s  %s\n' "$SDK_SHA256" .build/downloads/sdk.tar.zst | sha256sum -c -
+          if [[ ! -f .build/downloads/pcre2-10.48.tar.gz ]]; then
+            curl --fail --location --retry 3 https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.48/pcre2-10.48.tar.gz -o .build/downloads/pcre2-10.48.tar.gz
+          fi
+          echo 'ebcc25aadf2a51fa1fefa9b8bc9e7a79b3dae86870a0f1152a22e42befd46888  .build/downloads/pcre2-10.48.tar.gz' | sha256sum -c -
+      - name: Test build and verification helpers
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Build unsigned APK and execute its final payload plus same-SDK tests
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          python3 scripts/build-openwrt-apk.py --arch "$ARCH" --source-ref "$GITHUB_SHA" \
+            --sdk-archive .build/downloads/sdk.tar.zst --pcre2-archive .build/downloads/pcre2-10.48.tar.gz \
+            --work ".build/work/$ARCH" --output ".build/output/$ARCH" --jobs 4
+          (cd ".build/output/$ARCH" && sha256sum -c SHA256SUMS)
+      - name: Upload tested unsigned package, source and evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: experimental-openwrt-apk-${{ matrix.arch }}-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          path: .build/output/${{ matrix.arch }}/
+          include-hidden-files: false
+          if-no-files-found: error
+          retention-days: 90
+      - name: Preserve failed-build evidence
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: failure-openwrt-apk-${{ matrix.arch }}-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          path: .build/output/${{ matrix.arch }}/
+          include-hidden-files: false
+          if-no-files-found: warn
+          retention-days: 30
