@@ -96,7 +96,7 @@ static int nft_fast_collect(const md_packet *p,const md_rr *rr,void *arg) {
     nft_fast_keys *v=arg;
     if(rr->section||rr->class_!=1||rr->type!=(v->t->bytes==4?1:28))return 0;
     if(rr->data_len!=v->t->bytes||milliseconds()>=v->until)return -1;
-    const uint8_t *key=p->data+rr->data_offset;uint64_t ttl=(uint64_t)rr->ttl*1000+5000;
+    const uint8_t *key=p->data+rr->data_offset;uint64_t ttl=(uint64_t)rr->ttl*1000+15000;
     for(size_t i=0;i<v->count;i++)if(!memcmp(v->s->keys[i],key,v->t->bytes)){if(v->s->timeouts[i]<ttl)v->s->timeouts[i]=ttl;return 0;}
     if(v->count==MD_NL_MAX_KEYS)return -1;
     memset(v->s->keys[v->count],0,16);memcpy(v->s->keys[v->count],key,v->t->bytes);v->s->timeouts[v->count++]=ttl;return 0;
@@ -119,10 +119,10 @@ static int nft_fast_target(nft_fast_state *s,const nft_target *t,unsigned family
     for(size_t i=0;i<v.count;i++){
         nft_fast_entry *entry=&s->entries[family_index][nft_fast_slot(s->keys[i],t->bytes)];
         bool known=entry->bytes==t->bytes&&!memcmp(entry->key,s->keys[i],t->bytes)&&entry->expires>now;
-        /* The 4s slack covers TTL rounding and DNS/cache clock boundaries. */
-        if(known&&entry->expires>=now+s->timeouts[i]-4000)continue;
-        uint64_t existing=known?entry->expires-now:0;
-        if(!known&&nft_fast_existing(s,t,s->keys[i],until,&existing,err))return -1;
+        /* Cover the entire cohort deadline, plus TTL rounding, before skipping. */
+        if(known&&entry->expires>=until+s->timeouts[i]-14000)continue;
+        uint64_t existing=0;
+        if(nft_fast_existing(s,t,s->keys[i],until,&existing,err))return -1;
         if(existing>s->timeouts[i])s->timeouts[i]=existing+1000;
         if(pending!=i){memcpy(s->keys[pending],s->keys[i],16);s->timeouts[pending]=s->timeouts[i];}pending++;
     }
