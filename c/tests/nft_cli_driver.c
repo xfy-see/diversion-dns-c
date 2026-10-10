@@ -80,7 +80,8 @@ static ssize_t __attribute__((unused)) fake_send(int fd,const void *data,size_t 
         for(unsigned i=1;i<=2;i++){size_t z=md_nl_u16(p+a);assert(!md_nl_attr(&w,(uint16_t)i,p+a+4,z-4));a+=md_nl_align(z);}
         unsigned bytes=getenv("FAST_V6")?16:4;const uint8_t *address=p+a+16;
         assert(!md_nl_nested_start(&w,3,&es)&&!md_nl_nested_start(&w,1,&el)&&!md_nl_nested_start(&w,1,&key)&&!md_nl_attr(&w,1,address,bytes)&&!md_nl_nested_end(&w,key));
-        uint8_t ttl[8]={0};md_nl_be32(ttl+4,300000);assert(!md_nl_attr(&w,5,ttl,8)&&!md_nl_nested_end(&w,el)&&!md_nl_nested_end(&w,es));md_nl_message_end(&w,at);fake_length=w.length;return (ssize_t)n;
+        uint8_t ttl[8]={0};md_nl_be32(ttl+4,300000);assert(!md_nl_attr(&w,5,ttl,8)&&!md_nl_nested_end(&w,el)&&!md_nl_nested_end(&w,es));if(!getenv("FAST_V6")){md_nl_put16(fake_reply+es+2,3);md_nl_put16(fake_reply+el+2,1);md_nl_put16(fake_reply+key+2,1);}
+        md_nl_message_end(&w,at);fake_length=w.length;return (ssize_t)n;
     }
     ++batches;size_t off=0;unsigned frames=0;
     while(off<n){const uint8_t *m=p+off;size_t len=md_nl_u32(m);assert(len<=n-off&&len>=20&&md_nl_u32(m+12)==41771);++frames;

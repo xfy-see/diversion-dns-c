@@ -60,7 +60,9 @@ static int nft_fast_metadata(nft_fast_state *s,const nft_target *t,uint64_t unti
     }
     if(e){snprintf(err,MD_ERROR_SIZE,"fast nft metadata: %s",strerror(e));return -1;}return 0;
 }
-/* Query exactly one element, not a set dump. ENOENT is a normal cache miss.
+/* Linux replies use nla_nest_start_noflag; accept the nested flag both absent
+ * and present while still validating every nested length and returned key.
+ * Query exactly one element, not a set dump. ENOENT is a normal cache miss.
  * Attribute traversal validates nesting and returned key before expiration. */
 static int nft_fast_existing(nft_fast_state *s,const nft_target *t,const uint8_t key[16],uint64_t until,uint64_t *remaining,char *err) {
     uint8_t request[384];md_nl_requests req={0};req.wire=request;req.port=s->port;
@@ -75,12 +77,12 @@ static int nft_fast_existing(nft_fast_state *s,const nft_target *t,const uint8_t
     p+=20;length-=20;unsigned seen=0;bool found=false;
     while(length){if(length<4)goto invalid;size_t a=md_nl_u16(p);unsigned type=md_nl_u16(p+2);if(a<4||md_nl_align(a)>length)goto invalid;
         if(type==1||type==2){const char *v=type==1?t->table:t->set;if((seen&(1u<<type))||a!=strlen(v)+5||memcmp(p+4,v,a-4))goto invalid;seen|=1u<<type;}
-        else if(type==(3|0x8000)){
+        else if((type&~0x8000u)==3){
             if(seen&8)goto invalid;seen|=8;const uint8_t *el=p+4;size_t eln=a-4;
-            if(eln<4||md_nl_u16(el)!=eln||md_nl_u16(el+2)!=(1|0x8000))goto invalid;
+            if(eln<4||md_nl_u16(el)!=eln||(md_nl_u16(el+2)&~0x8000u)!=1)goto invalid;
             el+=4;eln-=4;unsigned fields=0;
             while(eln){if(eln<4)goto invalid;size_t z=md_nl_u16(el);unsigned ty=md_nl_u16(el+2);if(z<4||md_nl_align(z)>eln)goto invalid;
-                if(ty==(1|0x8000)){if(fields&1||z!=8+t->bytes||md_nl_u16(el+4)!=4+t->bytes||md_nl_u16(el+6)!=1||memcmp(el+8,key,t->bytes))goto invalid;fields|=1;}
+                if((ty&~0x8000u)==1){if(fields&1||z!=8+t->bytes||md_nl_u16(el+4)!=4+t->bytes||md_nl_u16(el+6)!=1||memcmp(el+8,key,t->bytes))goto invalid;fields|=1;}
                 else if(ty==5){if(fields&2||z!=12)goto invalid;fields|=2;*remaining=((uint64_t)md_nl_read_be32(el+4)<<32)|md_nl_read_be32(el+8);}
                 el+=md_nl_align(z);eln-=md_nl_align(z);
             }
