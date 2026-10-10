@@ -254,6 +254,7 @@ class FrozenSourceContracts(unittest.TestCase):
 class SyntheticBuild:
     """Fake the external SDK interface; exercise real orchestration and files."""
     def __init__(self, root, arch="aarch64_cortex-a53", fail=None, omit_apk=False, mutate_payload=False):
+        root = root.resolve()
         self.root = root
         self.module = load("build-openwrt-apk")
         self.arch = arch
@@ -436,6 +437,21 @@ class BuildOrchestrationContracts(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         return SyntheticBuild(Path(tmp.name), **kwargs)
+
+    def test_orchestration_fixture_resolves_symlinked_temporary_directory(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name).resolve()
+        physical = root / "physical"
+        physical.mkdir()
+        alias = root / "alias"
+        alias.symlink_to(physical, target_is_directory=True)
+        build = SyntheticBuild(alias)
+        build.invoke()
+        self.assertEqual(build.root, physical)
+        wrapper = build.work / "wrappers/packaged-app"
+        self.assertIn("-L " + str(build.toolchain), wrapper.read_text())
+        self.assertEqual(json.loads((build.out / "buildinfo.json").read_text())["status"], "passed")
 
     def test_both_architectures_verify_and_run_the_extracted_final_apk(self):
         for arch in ("aarch64_cortex-a53", "mipsel_24kc"):

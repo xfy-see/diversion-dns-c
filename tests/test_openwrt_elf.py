@@ -59,7 +59,7 @@ class OpenWrtELF(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.directory = Path(self.temporary.name)
+        self.directory = Path(self.temporary.name).resolve()
         self.binary = self.directory / "diversion-dns-c-lite"
         self.root = self.directory / "rootfs"
         (self.root / "lib").mkdir(parents=True)
@@ -84,6 +84,17 @@ class OpenWrtELF(unittest.TestCase):
     def check(self, arch=checker.DEFAULT_ARCH):
         with mock.patch.object(checker, "readelf", side_effect=self.readelf):
             return checker.check(self.binary, self.root, arch)
+
+    def test_fixture_resolves_symlinked_temporary_directory(self):
+        # macOS exposes /var/folders through /private/var/folders. Reproduce
+        # that alias on any host so path-sensitive readelf doubles stay exact.
+        alias = self.directory / "temporary-alias"
+        alias.symlink_to(self.directory, target_is_directory=True)
+        with mock.patch.object(tempfile, "tempdir", str(alias)):
+            case = OpenWrtELF("test_default_aarch64_sectionless_binary")
+            result = unittest.TestResult()
+            case.run(result)
+        self.assertTrue(result.wasSuccessful(), result.errors + result.failures)
 
     def test_default_aarch64_sectionless_binary(self):
         self.install()
