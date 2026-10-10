@@ -1,12 +1,87 @@
-# mosdns C 最小实现
+# 专用 C DNS 分流器
 
-与 Go/Rust 并存的 C11/POSIX 前台实现，参考 [Go minimal](../docs/go-profiles.md)，沿用 `coremain → plugin → pkg` 分层和 YAML 的 plugin/sequence 模型。初版实现 site-only DNS 分流；没有自动安装、路由配置或系统 DNS 接管。
+C11/POSIX 前台程序，固定执行“原始 QNAME 匹配 CN → 共享缓存 → CN 或 foreign 上游 →
+CN nft 最终处理 → 返回”的请求链。运行时配置已替换为有界 `key=value` 解析器，
+没有 YAML、插件注册表、动态 sequence、include 或 tag 引用。
 
-## 构建和运行
+完整配置、迁移限制、缓存与 nft 行为见 [固定分流器配置说明](../docs/fixed-splitter.md)。
+历史 [site-only YAML](../docs/go-profiles-site-only.yaml)、旧 YAML 示例和旧 graph 测试仍保留，
+供历史产物验证和迁移回归使用，不能作为当前运行配置。
 
-需要 C11 编译器、Make、POSIX threads，以及固定为 10.48 的 PCRE2 8-bit 静态库，关闭 Unicode 和 JIT。原生 CI、ASan/UBSan 和 Linux 静态 release 使用同一依赖配置；保留 PCRE2，不替换 regexp 引擎。仓库内置 [libyaml 0.2.5](vendor/libyaml/ORIGIN.md) 源码及 MIT 许可证，domain/full/keyword 和 YAML 解析范围不变。Makefile 默认只使用 `.build/pcre2-8-no-unicode-no-jit`，缺少依赖时失败，不回退到系统 PCRE2，也不自动下载依赖。默认应用构建目录也隔离为 `.build/c-native-no-unicode-no-jit`，避免复用旧 Unicode 构建。
+## 运行
 
-默认遵循 [仓库工作流](../AGENTS.md)，由 GitHub Actions 编译并验证对应提交的产物；只有用户明确授权本地编译时，才在仓库根目录运行以下依赖构建和 Make 命令（下文测试中的构建命令也一样）：
+先从精确提交对应的 CI 产物取得已验证的二进制；从仓库根目录运行：
+
+```sh
+/path/to/mosdns-c version
+/path/to/mosdns-c check -c c/examples/minimal.conf
+/path/to/mosdns-c start -c c/examples/minimal.conf --cpu 4
+```
+
+默认读取 `config.conf`，默认工作线程 4 个（`--cpu` 范围 1–64）。`-d/--dir` 在读取配置前
+切换工作目录；配置和规则文件的相对路径都基于该目录。演示规则在
+[c/examples/cn-site.txt](examples/cn-site.txt)，请先替换为实际规则与上游。
+
+`check` **加载实际规则文件并编译 regexp**，检查配置、数字地址和 nft 参数，不打开
+listener、不发送 DNS 查询、不写 nft。规则缺失或格式错误会使检查失败，带文件和行号。
+端口占用、上游可达性、mark/绑定接口权限及 nft 运行环境仍需单独验收。
+
+生产 Linux 的 [site-only.conf](examples/site-only.conf) 需要预先存在的 CN 规则、接口、
+nft 集合和路由。程序不会安装服务、接管系统 DNS、创建 WireGuard 或添加防泄漏规则。
+
+## 保留的运行能力
+
+| 模块 | 当前行为 |
+|---|---|
+| 域名 | 文件型 domain/full/keyword/regexp，ASCII 大小写归一化；一次加载后只读 |
+| 固定分流 | 原始 QNAME 决定唯一上游组；CNAME/Answer 地址不改路由；无跨组 fallback |
+| 上游 | 数字 IPv4/IPv6、UDP/TCP、每组最多 3 并发；ID/问题校验；UDP 每秒重发、TC 转 TCP |
+| 缓存 | 引擎共享、有界 hash+LRU、TTL 递减、负缓存、lazy TTL 5 秒返回与异步同 key 去重 |
+| 服务 | 有界队列、UDP、TCP 持久连接/连续帧/部分读写、UDP 大小限制、SIGINT/SIGTERM 清理 |
+| Linux 出口 | 每组 SO_MARK、SO_BINDTODEVICE；设置失败报错 |
+| nftset | CN 响应包括缓存命中都最终处理；只学习 Answer 中 IN A/AAAA；保留普通/interval 集合写入路径 |
+
+每个引擎配置不可变，缓存 key 保留 QNAME 原始大小写、QTYPE/QCLASS、AD/CD/DO。
+当前仅缓存合格的 IN 查询；带非空 EDNS options、其他附加数据或压缩问题绕过缓存。
+修改规则或出口配置必须重启，不能让不同配置共用热缓存。
+
+NXDOMAIN 缓存 30 秒、SERVFAIL 5 秒；无 Answer 的 NOERROR 受记录最小 TTL 和 300 秒
+上限约束。正向 lazy 总保留期从最初存储时间计算，不是 TTL 加 stale 时长。stale 响应
+普通记录 TTL 为 5 秒，后台刷新仍走同一个已分类出口及 CN 最终处理路径。
+
+上游工作线程连接池继续每线程 8 槽、空闲 30 秒，按端点、传输、mark 和接口隔离。
+一个连接内不复用已用过的 DNS ID；异常或脏连接关闭。库调用和非工作线程使用新连接。
+没有 pipeline。UDP 每秒用同一 connected socket 和原 ID 重发，共享原 5 秒交换预算；
+TC 转 TCP 后停止 UDP 重发。
+
+nft 普通集合仍有 generation 前后校验和完整 Netlink 成功回执；interval 集合仍走
+argv/stdin CLI，不启动 shell。不创建表/集合，不发送元素 TTL，使用集合默认 timeout。
+配置 mask 作用于 interval 前缀，普通集合使用具体地址。FIFO 等待、检查和写入共享
+原有 5 秒预算；不明确的提交结果不自动重放。没有 Answer 地址不代表完全跳过 nft
+环境检查：CN 负回答仍可能因非 Linux 或没有标准路径的 `nft` 失败。
+
+UDP 接收缓冲单独请求 256 KiB 并读回实际值，受内核限制；Linux 读回值含双倍
+bookkeeping，不等于 RSS。UDP/TCP listener 合计最多 64 个，TCP 连接最多 128 个，
+未完成请求最多 64 个，异步 lazy 刷新最多 64 个。TCP 每连接串行处理，可处理已排队的
+连续帧；队列满时 UDP 返回 SERVFAIL、TCP 关闭连接。无 UDP packet-info 源地址选择、
+Unix listener、HTTP API、指标、磁盘 cache dump、加密 DNS、SOCKS 或 bootstrap。
+
+## 正则依赖与构建约定
+
+PCRE2 固定 10.48，8-bit 静态库、禁用 Unicode/JIT/16-bit/32-bit。无系统库 fallback。
+默认依赖目录 `.build/pcre2-8-no-unicode-no-jit`，应用目录
+`.build/c-native-no-unicode-no-jit`，避免复用旧 Unicode 构建。
+libyaml 不再编译或链接进程序/库；`vendor/libyaml/` 的历史源码与 MIT 许可证保留。
+Python 的 PyYAML 仅用于可选的 [离线迁移工具](../scripts/migrate-site-config.py)。
+
+regexp 按字节匹配，`\d`/`\w` 保持 ASCII 类语义，存在匹配/回溯深度上限；与 Go RE2
+语法及最坏复杂度不同。`(*UTF)`、`(*UCP)`、`\p{...}`、`\P{...}` 和 `\X` 编译失败。
+DNS 服务只接受可打印 ASCII 问题标签，包含常规 punycode；不做 IDNA 或 Unicode
+大小写归一化。库级 UTF-8 字节测试不代表服务支持 raw Unicode 问题名。
+
+默认遵循 [AGENTS.md](../AGENTS.md)：由 GitHub Actions 构建和验证，不在本地调用 C
+编译器、Make build target 或 Zig。只有得到单独明确授权，才运行本机构建命令。
+CI/已授权构建环境使用以下固定依赖流程：
 
 ```sh
 mkdir -p .build/deps
@@ -17,70 +92,51 @@ python3 scripts/build-native-pcre2.py \
   --archive .build/deps/pcre2-10.48.tar.gz \
   --output .build/pcre2-8-no-unicode-no-jit --jobs 4
 make -C c -j4
-./.build/c-native-no-unicode-no-jit/mosdns-c version
-./.build/c-native-no-unicode-no-jit/mosdns-c check -c c/examples/minimal.yaml
-./.build/c-native-no-unicode-no-jit/mosdns-c start -c c/examples/minimal.yaml --cpu 4
-```
-
-`--cpu` 指工作线程数，范围 1–64，默认 4。`-d/--dir` 改变工作目录；配置中的 include 和规则文件相对路径也按这个目录解析。示例监听 `127.0.0.1:15362`，上游地址需要按实际网络调整。已有 Linux site-only 配置可以使用 [go-profiles-site-only.yaml](../docs/go-profiles-site-only.yaml)，运行前须准备其中的规则文件、接口、mark 路由和 nft 集合。
-
-依赖脚本校验 PCRE2 10.48 源码包 SHA-256 `ebcc25aadf2a51fa1fefa9b8bc9e7a79b3dae86870a0f1152a22e42befd46888`，要求全新输出目录，并记录配置、构建日志和静态库哈希。`--disable-unicode --disable-jit --disable-pcre2-16 --disable-pcre2-32` 是此产物的兼容性约定。其他安装前缀或交叉工具链可通过 Make 变量指定，但必须使用相同依赖配置：
-
-```sh
-make -C c BUILD=../.build/c-custom \
-  CC=/path/to/target-cc AR=/path/to/target-ar \
-  PCRE2_CFLAGS=-I/path/to/target/include \
-  PCRE2_LIB=/path/to/target/lib/libpcre2-8.a
-```
-
-交叉链接必须使用目标平台的 PCRE2 静态库。macOS 的 `.a` 不能用于 Linux。默认构建保留调试信息；它的体积不作为与其他语言 release 产物的公平对照。
-
-## 能力范围
-
-| 模块 | 初版行为 |
-|---|---|
-| 配置/CLI | YAML/YML/JSON、include、tag 引用；`start/check/version/help` |
-| 六类插件 | `domain_set`、`cache`、`forward`、`sequence`、`udp_server`、`tcp_server` |
-| 域名规则 | domain/full/keyword/regexp、规则文件、组合 domain_set；ASCII 大小写归一化 |
-| sequence | AND、`!`、qname/has_resp/_true/_false、accept/reject/return/jump/goto、`$plugin`、快捷 cache/forward/nftset |
-| 上游 | 数字 IPv4/IPv6、UDP/TCP、数字 dial_addr、tag 选择；最多三个并发上游；ID/问题校验；UDP 每秒重发、TC 转 TCP |
-| 内存缓存 | 有界 hash+LRU、TTL 递减、NXDOMAIN 30 秒/SERVFAIL 5 秒、lazy 返回 TTL 5 秒并异步刷新/同 key 去重 |
-| 服务 | 有界工作队列、UDP、TCP 持久连接/连续帧/部分读写、客户端 UDP 大小限制、SIGINT/SIGTERM 清理 |
-| Linux 路由约束 | SO_MARK、SO_BINDTODEVICE；设置失败返回错误 |
-| nftset | 读取已有集合类型，学习 Answer 中 IN 类 A/AAAA；interval 集合使用配置前缀 |
-
-`check` 读取配置/include、编译内联规则表达式、校验插件、参数和引用，不加载外部规则文件（包括 `domain_set.files` 和 `qname &文件`）、不打开 listener、不执行 nft。因此 `check` 成功不能证明规则文件的 regexp 可用；内联 Unicode 表达式会在 `check` 时报错，外部文件中的同类表达式要到实际启动加载文件时才报错，包含文件路径和行号，并使启动失败。部署前应使用同一产物、完整规则文件和隔离的测试配置核对实际加载/启动结果，不能把 `check` 当作完整规则预检。mark、接口绑定和 nft 操作在查询时验证。无 API、指标、磁盘 cache dump、加密 DNS、SOCKS 或 bootstrap。
-
-## 当前兼容边界
-
-- 配置键区分大小写，拒绝未知/重复键和多份 YAML document，不支持 Go 的 dotted-key 归一化。JSON 使用 libyaml 解析，因此也接受 YAML 语法；没有单独的严格 JSON 语法检查。日志输出到 stderr，`log.level` 校验但不控制细分日志等级；非空 `log.file` 和 `log.production: true` 被拒绝。
-- regexp 使用无 Unicode、无 JIT 的 8-bit PCRE2，按字节匹配，`\d`/`\w` 保持 ASCII 类语义；匹配/回溯深度有上限，与 Go RE2 的语法和最坏复杂度不同。`(*UTF)`、`(*UCP)`、`\p{...}`、`\P{...}` 和 `\X` 编译失败；不会忽略错误规则、转成字面量或回退到其他引擎。域名大小写只处理 ASCII；DNS 问题名只接受可打印 ASCII 标签（含常规 punycode），不接受 raw Unicode、二进制标签、多问题或非 QUERY opcode。国际化域名规则和查询须预先使用 ASCII/punycode，本实现不做 IDNA 转换或 Unicode 大小写归一化。库级字节匹配测试中的 UTF-8 字节不代表 DNS 服务支持 raw Unicode 域名。
-- 服务端工作线程使用有界 UDP/TCP 上游连接池：每线程 8 槽、空闲 30 秒，按端点、传输、mark 和接口隔离；一个连接内不复用已用过的 DNS ID，异常或脏连接关闭。库调用及非工作线程仍新建连接。不提供 pipeline；非零 upstream idle_timeout/max_conns、enable_pipeline 和 TLS 相关参数会报错。UDP 等待回答期间，每秒在同一 connected socket 上重发原始查询与 ID，保留 mark/接口设置；重发不延长交换共享的 5 秒期限，TC 转 TCP 后停止 UDP 重发。sequence 设置 5 秒执行预算并在动作边界检查，正在执行的交换最多还需 5 秒；递归/循环也有深度与步数上限。
-- `reject` 支持 0–15 的基础 RCODE。UDP 大回答生成带 TC 的 question-only 回答，客户端可转 TCP；不会保留可容纳的部分 Answer 或补造 OPT。
-- 缓存保持 IN 类、问题大小写和 AD/CD/DO 隔离。带非空 EDNS options、额外非 OPT 数据或压缩问题的查询绕过缓存。只剥离末尾 OPT；非末尾 OPT 回答不缓存，以保留 DNS 压缩偏移。lazy_cache_ttl 与 Go 相同，是自存储时起的总保留时间，并非额外 stale 时长。
-- nftset 需要标准路径的 `nft`，每次查询新读集合元数据；普通地址集合通过 Linux Netlink 事务写入，interval 集合保留 argv/stdin CLI 写入。不启动 shell，不创建表或集合。表名和集合名限定 1–127 字节，以 ASCII 字母或下划线开头，后续仅字母、数字、下划线或连字符。普通集合写入前以完整 ruleset generation 包围第二次元数据检查，并在 batch 中校验 generation；必须收到完整成功回执，错误、代际改变或提交状态不明确时失败，不自动重放。仅学习 Answer 中 IN A/AAAA，不发送元素 TTL，使用集合默认 timeout；没有用户态 membership 缓存或元素维护线程。整个 apply 的 FIFO 等待、元数据检查和写入共享原有 5 秒预算。macOS 可检查配置，实际 mark/接口绑定和 nftset 仍只支持 Linux。
-- UDP listener 单独请求 256 KiB 接收缓冲并读回实际值，受内核上限约束；Linux 读回值包含双倍 bookkeeping，不等于进程 RSS。最多 64 个 listener、128 个 TCP 连接、64 个未完成查询和 64 个异步 lazy 刷新；TCP 每连接串行处理，支持已排队的连续帧。队列满时 UDP 返回 SERVFAIL，TCP 关闭连接。没有 Go 的 UDP packet-info 源地址选择或 Unix listener 支持。
-
-## 验证
-
-```sh
 make -C c test
-make -C c -j4 BUILD=../.build/c-asan SANITIZE=1
-make -C c test BUILD=../.build/c-asan SANITIZE=1
-python3 c/tests/nft_cli_test.py --output .build/c-nft-cli-native
-python3 c/tests/nft_cli_test.py --output .build/c-nft-cli-asan --sanitize
 ```
 
-测试使用临时回环端口和 mock DNS。系统限制本地 socket 绑定时需要允许测试进程绑定回环端口。单元测试覆盖报文边界、缓存寿命/LRU/线程并发、十万条域名规则、配置错误、引用和 sequence 控制流；端到端测试覆盖实际分流、缓存、lazy 刷新、UDP/TCP、截断回退、ID 校验、并发客户端和只读检查。
+依赖脚本校验源码 SHA-256
+`ebcc25aadf2a51fa1fefa9b8bc9e7a79b3dae86870a0f1152a22e42befd46888`，
+拒绝复用输出目录，保存构建日志及静态库哈希。交叉链接必须使用目标平台同配置的 PCRE2
+库；macOS `.a` 不能用于 Linux。应用、固定 PCRE2 依赖及独立测试默认使用 `-Os -flto`，
+链接也开启 LTO；静态 Linux 发布仍使用 musl、section GC、strip 和原 1 MiB stack 设置，
+没有关闭 unwind 表。ASan/UBSan profile 保留 `-O1` 和 frame pointer 以便诊断。
+更改编译参数时必须使用全新的输出目录，不能复用旧 `.o`/`.a`。LTO 会把项目、依赖及
+部分 runtime 合并为一个输入，尺寸报告将它们记为 `mixed_lto`，不声称能拆出各自字节。
+原始精确链接重放、完整 ELF 哈希和诊断节布局校验继续保留；PCRE2 配置、输入库与
+最终诊断符号独立验证。默认本机构建保留调试信息，不能把体积直接和其他语言
+剥离后的 release 做公平对照。
 
-`tests/nft_cli_test.py` 使用 Darwin 上的窄 UAPI shim 和 fake Netlink I/O 检查实际生产路径；普通集合验证两次元数据读取、GETGEN 与成功回执事务，interval 仍验证原 argv/stdin 前缀。`tests/nft_netlink_test.c` 检查生产使用的报文编码和回执解析。它们同时覆盖仅学习 Answer 中 IN 地址、空回答无写入及非法名称拒绝。Linux 交叉构建另外使用真实 UAPI 静态断言。可用 `--old-source <旧nftset.c>` 验证旧实现的字面双引号会使此回归失败。它不执行真实 nft，也不代替设备内核写入与路由验证。
+## 验证与历史证据
 
-UDP 重发修复针对已确认的丢包耐受性差异：旧 C 只发送一次，冻结 Go 每秒重发。独立首包丢弃诊断可复现这项差异。131 首轮冷缓存 UDP 并发 4 的超时原因仍未证实；后续相同固定 N 的一次成功重播和本机故障注入均不能单独定位原始 LAN 故障。原始记录保留在 [测试报告](../optimization/c-profiles-20261009/REPORT.md)。
+当前 CI 测试目标为 `dns_test`、`cache_domain_test`、`fixed_config_test`、
+`fixed_engine_test`、`nft_netlink_test`，外加共享域名 fixture、`fixed_integration.py`、
+nft CLI mock 和 CLI smoke。native 与 ASan/UBSan 均运行；Linux ARM64/x86_64 提供
+固定依赖静态产物。实际是否通过应以精确提交的 CI 及下载验证回执为准。
 
-`tests/cache_domain_test.c` 首先检查实际链接的 PCRE2 已关闭 Unicode/JIT，避免误连系统库而得到假通过；逐条测试 [Loyalsoldier direct-list 固定版本](https://github.com/Loyalsoldier/v2ray-rules-dat/blob/99f994716ed6323595c9ba5ff6dc36b6a1fe27c7/direct-list.txt#L111725-L111732) 的全部八条 regexp，覆盖正例、负例、锚点、数字/单词类、重复次数、分组、ASCII 大小写及 punycode。源文件 Git blob 为 `7f1511773bce814fa841dcab4ff2a6314bd8575b`。另有五类 Unicode 功能编译拒绝和文件路径/行号回归；`tests/engine_test.c` 检查内联表达式拒绝、外部文件 `check` 跳过与启动加载失败的区别。
+仅 Python 的校验可以在本地执行，不调用 C 编译器：
 
-`tests/domain_fixture.py` 复用已有 `tests/fixtures/matcher_domain.json` 的 ASCII/公共 regexp 语法子集；原有四项 Unicode/RE2 专项仍逐项输出跳过原因，未扩大跳过范围，也未声明完整 matcher 兼容。它另外独立测试 ASCII 类、引用、八进制、单词边界、按字节匹配，以及五类 Unicode 功能必须拒绝；这些新增测试不属于跳过项。目标设备、真实 nftset 内核写入、mark 路由和性能尚需各自验证。本机 mock 通过与 Linux 交叉编译不代替这些实机证据。
+```sh
+python3 -m unittest discover -s tests -p 'test_*.py' -v
+```
 
-初版历史验证通过三个单元套件、14 项端到端测试、共享 fixture 的 70 条断言及 ASan/UBSan；Linux ARM64/x86_64 的 24 个编译单元通过。详细范围和本机证据位置见 [验证记录](VALIDATION.md)，这些数字不作为本次无 Unicode 产物的验证结论。
+迁移回归需要可选 PyYAML；缺少该模块时明确跳过这组测试。旧 `engine_test.c`、
+`plan_regression_test.c`、`integration.py`、`plan_integration.py` 和 YAML 资产保持原样，
+不属于当前固定分流器的构建目标；验证脚本保留历史 bundle 的旧 suite 路径。
 
-最新分版本实机结果、文件大小、RSS/HWM 和尚未通过的范围见[当前测试状态](../optimization/c-profiles-20261009/STATUS.md)。本文件中的初版数字属于历史验证；不能把它们当作当前产物的实测结果。
+域名 fixture 保留原有 70 条断言和四项 Unicode/RE2 专项的明确跳过，不声明完整 Go
+matcher 兼容。八条 Loyalsoldier direct-list 固定 regexp、Unicode 功能拒绝和文件行号
+错误仍是保留项。nft mock 使用生产报文编码/回执和 Darwin 窄 UAPI shim，不执行真实 nft，
+不能证明设备上的 Netlink 权限、集合行为或 mark/接口出口。
+
+[历史验证记录](VALIDATION.md) 与 [旧 graph 测试说明](TESTING-PLAN-COVERAGE.md)
+只解释历史实现和历史证据。原 r12 性能数字在[根 README](../README.md)保留，不是本次
+专用实现的新成绩。真实内核写入、目标设备出口、二进制/RSS/QPS 和持续稳定性仍须
+各自提供独立测量；配置预检、编译成功或 mock 通过都不能代替它们。
+
+## Optional regex experiment
+
+The default remains PCRE2 without Unicode/JIT. An experimental libc ERE
+backend can be selected with `REGEX_BACKEND=posix-lite`; its deliberately
+restricted syntax and printable-ASCII subject contract are documented in
+[REGEX-POSIX-LITE.md](REGEX-POSIX-LITE.md). It is not a drop-in PCRE2 replacement.

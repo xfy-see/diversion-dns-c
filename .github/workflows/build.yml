@@ -55,14 +55,12 @@ jobs:
             options=()
             if [[ $profile == asan ]]; then options+=(SANITIZE=1); fi
             targets=(all)
-            for t in dns_test cache_domain_test engine_test plan_regression_test nft_netlink_test domain_driver; do
+            for t in dns_test cache_domain_test fixed_config_test fixed_engine_test nft_netlink_test domain_driver nft_cli_driver; do
               targets+=("$folder/tests/$t")
             done
             make -C c -j4 CC="$CC" BUILD="$folder" PCRE2_LIB="$lib" PCRE2_CFLAGS="$cpp" "${options[@]}" "${targets[@]}" 2>&1 | tee .build/compile-logs/$profile.log
-            args=()
-            if [[ $profile == asan ]]; then args+=(--sanitize); fi
-            python3 c/tests/nft_cli_test.py --output .build/nft-$profile --compile-only "${args[@]}"
-            cp .build/nft-$profile/nft-cli-driver .build/$profile/tests/nft_cli_driver
+            mkdir -p .build/$profile/licenses
+            cp .build/pcre2-8-no-unicode-no-jit/licenses/* .build/$profile/licenses/
           done
       - name: Package, verify and execute the complete suite
         env:
@@ -85,6 +83,44 @@ jobs:
           if-no-files-found: error
           retention-days: 90
           compression-level: 0
+      - name: Build opt-in posix-lite native and ASan/UBSan programs
+        run: |
+          set -euo pipefail
+          mkdir -p .build/lite-compile-logs
+          uname -a > .build/lite-compile-logs/host.txt
+          "$CC" --version > .build/lite-compile-logs/compiler.txt
+          for profile in native asan; do
+            test ! -e ".build/lite/$profile"
+            folder=../.build/lite/$profile
+            sanitize=0
+            if [[ $profile == asan ]]; then sanitize=1; fi
+            targets=(all)
+            for t in dns_test cache_domain_test fixed_config_test fixed_engine_test nft_netlink_test domain_driver nft_cli_driver; do
+              targets+=("$folder/tests/$t")
+            done
+            make -C c -j4 CC="$CC" BUILD="$folder" REGEX_BACKEND=posix-lite SANITIZE="$sanitize" "${targets[@]}" 2>&1 | tee .build/lite-compile-logs/$profile.log
+          done
+      - name: Package, verify and execute opt-in native lite suite
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          # Nonempty arrays also work with nounset on macOS Bash 3.2.
+          pack_options=(--profile native=.build/lite/native --profile asan=.build/lite/asan --regex-backend posix-lite --target "$TARGET" --kind native)
+          if [[ $(uname) == Darwin ]]; then
+            pack_options+=(--runtime-file "$(cc -print-resource-dir)/lib/darwin/libclang_rt.asan_osx_dynamic.dylib")
+          fi
+          python3 scripts/artifacts.py pack "${pack_options[@]}" --logs .build/lite-compile-logs --output .build/lite-pretest.tar.gz
+          python3 scripts/artifacts.py extract --archive .build/lite-pretest.tar.gz --expected-commit "$GITHUB_SHA" --expected-run-id "$GITHUB_RUN_ID" --checkout . --output .build/lite-verified
+          python3 scripts/validate.py --bundle .build/lite-verified --checkout . --output .build/lite-ci-validation --ci
+          python3 scripts/artifacts.py pack "${pack_options[@]}" --logs .build/lite-compile-logs --logs .build/lite-ci-validation --output dist/experimental-lite/bundle.tar.gz
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: experimental-lite-native-${{ matrix.target }}-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          path: dist/experimental-lite/bundle.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: failure()
         with:
@@ -93,6 +129,8 @@ jobs:
             .build/compile-logs/
             .build/pcre2-8-no-unicode-no-jit/logs/
             .build/ci-validation/
+            .build/lite-compile-logs/
+            .build/lite-ci-validation/
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 30
@@ -152,6 +190,60 @@ jobs:
           if-no-files-found: error
           retention-days: 90
           compression-level: 0
+      - name: Build opt-in posix-lite static application and harnesses
+        env:
+          ZIG_ARCH: ${{ matrix.zig_arch }}
+          ZIG_TARGET: ${{ matrix.zig_target }}
+        run: |
+          set -euo pipefail
+          test ! -e .build/lite/static
+          mkdir -p .build/lite-compile-logs
+          zig="$PWD/.build/tools/zig-$ZIG_ARCH-linux-0.14.1/zig"
+          "$zig" version > .build/lite-compile-logs/compiler.txt
+          uname -a > .build/lite-compile-logs/host.txt
+          export ZIG_GLOBAL_CACHE_DIR="$PWD/.build/lite-zig-global-cache"
+          export ZIG_LOCAL_CACHE_DIR="$PWD/.build/lite-zig-local-cache"
+          folder=../.build/lite/static
+          targets=(all)
+          for t in dns_test cache_domain_test fixed_config_test fixed_engine_test nft_netlink_test domain_driver nft_cli_driver; do
+            targets+=("$folder/tests/$t")
+          done
+          # Keep the static musl profile's LTO, size policy and 1 MiB thread stack.
+          make -C c -j4 CC="$zig cc -target $ZIG_TARGET" AR="$zig ar" BUILD="$folder" REGEX_BACKEND=posix-lite \
+            CFLAGS="-Os -flto -ffunction-sections -fdata-sections -UNDEBUG -std=c11 -Wall -Wextra -Wpedantic -Werror -pthread" \
+            LDFLAGS="-flto -static -Wl,--gc-sections -Wl,-s -Wl,-z,stack-size=1048576" \
+            "${targets[@]}" 2>&1 | tee .build/lite-compile-logs/static.log
+          case "$ZIG_TARGET" in
+            x86_64-linux-musl) machine="Advanced Micro Devices X86-64" ;;
+            aarch64-linux-musl) machine="AArch64" ;;
+            *) echo "unexpected static target: $ZIG_TARGET" >&2; exit 1 ;;
+          esac
+          for binary in .build/lite/static/mosdns-c .build/lite/static/tests/*; do
+            log=".build/lite-compile-logs/$(basename "$binary")-elf.txt"
+            readelf --wide --file-header --program-headers --dynamic "$binary" > "$log"
+            awk -v machine="$machine" '
+              $1 == "Machine:" { sub(/^[[:space:]]*Machine:[[:space:]]*/, ""); machines++; if ($0 != machine) bad=1 }
+              $1 == "INTERP" || /\(NEEDED\)/ { bad=1 }
+              $1 == "GNU_STACK" { stack++; if ($6 != "0x100000" || $7 != "RW") bad=1 }
+              END { exit(bad || machines != 1 || stack != 1) }
+            ' "$log"
+          done
+      - name: Verify and execute opt-in static lite suite on matching hardware
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          python3 scripts/artifacts.py pack --profile static=.build/lite/static --regex-backend posix-lite --target "$TARGET" --kind static --logs .build/lite-compile-logs --output .build/lite-pretest.tar.gz
+          python3 scripts/artifacts.py extract --archive .build/lite-pretest.tar.gz --expected-commit "$GITHUB_SHA" --expected-run-id "$GITHUB_RUN_ID" --checkout . --output .build/lite-verified
+          python3 scripts/validate.py --bundle .build/lite-verified --checkout . --output .build/lite-ci-validation --ci
+          python3 scripts/artifacts.py pack --profile static=.build/lite/static --regex-backend posix-lite --target "$TARGET" --kind static --logs .build/lite-compile-logs --logs .build/lite-ci-validation --output dist/experimental-lite/bundle.tar.gz
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: experimental-lite-static-${{ matrix.target }}-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          path: dist/experimental-lite/bundle.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: failure()
         with:
@@ -162,6 +254,8 @@ jobs:
             .build/static/mosdns-c
             .build/static/size/
             .build/ci-validation/
+            .build/lite-compile-logs/
+            .build/lite-ci-validation/
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 30

@@ -48,6 +48,9 @@ typedef struct md_domain md_domain;
 md_domain *md_domain_new(void);
 int md_domain_add(md_domain *d, const char *rule, char *err);
 int md_domain_load(md_domain *d, const char *path, char *err);
+/* With the opt-in MD_REGEX_POSIX build, regexes only see printable ASCII
+ * subjects <=253 bytes after one trailing dot; other subjects are regex misses.
+ * Full/domain/keyword behavior is unchanged. See REGEX-POSIX-LITE.md. */
 bool md_domain_match(const md_domain *d, const char *name);
 void md_domain_free(md_domain *d);
 
@@ -91,18 +94,18 @@ md_nft *md_nft_new(const char *args, char *err);
 int md_nft_apply(md_nft *n, const md_packet *r, char *err);
 void md_nft_free(md_nft *n);
 
-/* engine 拥有配置、插件和监听器描述；listener 返回借用指针，
- * 生命周期随 engine，entry 是配置解析后的插件索引，不是端口号。 */
+/* engine 拥有不可变分流配置、规则、缓存、nft 和监听器。
+ * listener 返回借用指针，entry 固定为 0；重新加载须建立新的 engine/cache。 */
 typedef struct md_engine md_engine;
 typedef struct { char listen[256]; bool tcp; size_t entry; unsigned idle_timeout; } md_listener;
-/* check=false loads domain files; check=true validates config without side effects. */
+/* Both modes load rule files and resolve named IPv6 scopes. check=true
+ * never opens listeners/upstream connections or writes nft. */
 md_engine *md_engine_load(const char *path, bool check, char *err);
 size_t md_engine_listener_count(const md_engine *e);
 const md_listener *md_engine_listener(const md_engine *e, size_t i);
 int md_engine_query(md_engine *e, size_t entry, const md_packet *q, md_packet *r, char *err);
-/* A fresh cache hit may finish synchronously only for the exact leading
- * unconditional cache -> has_resp/accept pair. Never runs downstream effects
- * or lazy refresh. A miss/ineligible/stale query leaves r->len=0. */
+/* Always returns false: cached responses use normal workers for mandatory nft
+ * finalization and lazy refresh. Leaves r->len=0 when r is non-NULL. */
 bool md_engine_cached_query(md_engine *e, size_t entry, const md_packet *q, md_packet *r);
 /* 销毁等待后台刷新结束；调用方先停服务/查询，避免访问已释放插件。 */
 void md_engine_free(md_engine *e);

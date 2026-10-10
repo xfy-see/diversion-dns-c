@@ -1,0 +1,104 @@
+{
+  "measured_date": "2026-10-09",
+  "scope": "Native Linux x86_64 glibc comparison, static PCRE2 only; not ARM64/musl or device evidence",
+  "host": "Linux-6.18.44-x86_64-with-glibc2.41",
+  "compiler": "cc (Debian 14.2.0-19) 14.2.0",
+  "baseline_commit": "2992cb7917ae5de5a5e97e58ae72182ac15e0c1d",
+  "pcre2_archive_sha256": "ebcc25aadf2a51fa1fefa9b8bc9e7a79b3dae86870a0f1152a22e42befd46888",
+  "pcre2_static_library_sha256": "62403efa36bc0f9baa6fd4f3541a46b1e9d0d19ab8392869a75acac233a9d052",
+  "specialized_application_sources_sha256": {
+    "c/Makefile": "463bfdb87d131b15679ea0f4928e5b4e32b114f180644d8b831c273b7cbcbe0d",
+    "c/main.c": "539cf520bcc3e275e3cc0555316d63d1c7ef6f52e169c2db73431f2b7676c023",
+    "c/coremain/engine.c": "9e96356a640eaf143b8514bf202dbc421952aa86e7e567ff30891b8f296c7ed1",
+    "c/pkg/server.c": "b917d871ef60e4cd59889b60cbd5c8807503a3d27a1a131c0becd3e83859aa40",
+    "c/pkg/dns.c": "6101477624add34be67e30c1e4ee623ee394f0b4a85b074c020c5b0754785c01",
+    "c/pkg/upstream.c": "2da58a851f51c9a7fa690d4ca60a90481cb2eb9152e8924443c4d64b7e6ce7eb",
+    "c/pkg/domain.c": "bc1f226cfa2d5b231500a2e2ad16216da7fbfd2fda6c41b8d4aca7ff04c60304",
+    "c/pkg/util.c": "0c21ba2c26e30e252844791e4ad4193bd1f6866e0cb5eb0361a1c8d23f0c25ff",
+    "c/plugin/cache.c": "e9f8d706d14247e152f05149125d58e221527bdba5e7b569099be32645c79420",
+    "c/plugin/nftset.c": "bff218bef632dd9cca6e433eb7f880584881fee6b68c2facc38df6ae78282de5",
+    "c/include/mosdns.h": "a9f54ac2fff955b3dc67648459e69d01f89fc6d4bd99981c4104007627e2a055",
+    "c/include/nft_netlink.h": "d5a0158fd05a6f726b40daf4e844e38d233b245480cf599365c466cd32bcbc17"
+  },
+  "profiles": {
+    "baseline-standard-final": {
+      "application": {
+        "bytes": 813904,
+        "sha256": "c482e01c8cc4cafeac885c0f9c6d9b10f6d6c585e6fe4c8d44cd38aad79c7716"
+      },
+      "stripped": {
+        "bytes": 322840,
+        "sha256": "d27d042886a3483de3bb1f1b3a36b4645e49746bfef83e55548a7df6824d1d57"
+      },
+      "cflags": "-O2 -g -std=c11 -Wall -Wextra -Wpedantic -Werror -Wno-error=misleading-indentation -pthread",
+      "ldflags": "",
+      "yaml_symbol_count": 127,
+      "pcre2_symbol_count": 88,
+      "size": "   text\t   data\t    bss\t    dec\t    hex\tfilename\n308741\t1992\t64\t310797\t4be0d",
+      "needed": [
+        "libc.so.6"
+      ]
+    },
+    "baseline-size-final": {
+      "application": {
+        "bytes": 294720,
+        "sha256": "aba693c5927472c74ec62f2ad7a5148cc781537a5bfc8fd34dc12b7b41c2be71"
+      },
+      "stripped": {
+        "bytes": 273720,
+        "sha256": "ff93dea7adf49c77c3f7e590ca9750c18ded75ff238f18fb6472995f8281aaed"
+      },
+      "cflags": "-Os -DNDEBUG -ffunction-sections -fdata-sections -std=c11 -Wall -Wextra -Wpedantic -Werror -Wno-error=misleading-indentation -pthread",
+      "ldflags": "-Wl,--gc-sections",
+      "yaml_symbol_count": 53,
+      "pcre2_symbol_count": 88,
+      "size": "   text\t   data\t    bss\t    dec\t    hex\tfilename\n259730\t2008\t64\t261802\t3feaa",
+      "needed": [
+        "libc.so.6"
+      ]
+    },
+    "specialized-standard-final": {
+      "application": {
+        "bytes": 453856,
+        "sha256": "e1a11e4e7fb32c456dbcb1e5a60df4f6b54e4307c456dfe85da01d5246fe32e4"
+      },
+      "stripped": {
+        "bytes": 220376,
+        "sha256": "96bf78c3b479045a32d0afc7e296359fea86919230577435a7d27d0a526fec10"
+      },
+      "cflags": "-O2 -g -std=c11 -Wall -Wextra -Wpedantic -Werror -Wno-error=misleading-indentation -pthread",
+      "ldflags": "",
+      "yaml_symbol_count": 0,
+      "pcre2_symbol_count": 88,
+      "size": "   text\t   data\t    bss\t    dec\t    hex\tfilename\n207695\t2072\t64\t209831\t333a7",
+      "needed": [
+        "libc.so.6"
+      ]
+    },
+    "specialized-size-final": {
+      "application": {
+        "bytes": 225432,
+        "sha256": "b2d3c87f744da18d22533a0b7ba7b1ad380a2f1d3fe68fd53bc3f674f62a1f93"
+      },
+      "stripped": {
+        "bytes": 208088,
+        "sha256": "65ac59b8f50eafcc2e16be9ea0acb7e92f81d5f70891166b0f2880e8e1f9809e"
+      },
+      "cflags": "-Os -DNDEBUG -ffunction-sections -fdata-sections -std=c11 -Wall -Wextra -Wpedantic -Werror -Wno-error=misleading-indentation -pthread",
+      "ldflags": "-Wl,--gc-sections",
+      "yaml_symbol_count": 0,
+      "pcre2_symbol_count": 88,
+      "size": "   text\t   data\t    bss\t    dec\t    hex\tfilename\n192700\t2032\t64\t194796\t2f8ec",
+      "needed": [
+        "libc.so.6"
+      ]
+    }
+  },
+  "raw_evidence_directory": ".build/local-evidence",
+  "source_snapshot": ".build/specialized-final-source",
+  "limitations": [
+    "GCC baseline -Wmisleading-indentation warnings retained via -Wno-error=misleading-indentation, applied to both versions; all other enabled warnings are errors.",
+    "No ARM64 or static musl measurement; no target-device throughput or kernel NFT evidence.",
+    "Application built with optimized flags; the same pinned PCRE2 archive was built once using the native dependency script default flags."
+  ]
+}

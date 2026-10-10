@@ -1,0 +1,3 @@
+# Small demonstration list; use the real CN-site list in production.
+domain:cn
+full:example.com

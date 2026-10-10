@@ -15,15 +15,36 @@ import zipfile
 
 # 规则分为两层：外层档案身份/摘要，内层文件集合、Git blob 和运行配置。
 ROOT = Path(__file__).resolve().parents[1]
-TESTS = ('dns_test', 'cache_domain_test', 'engine_test', 'plan_regression_test',
+TESTS = ('dns_test', 'cache_domain_test', 'fixed_config_test', 'fixed_engine_test',
          'nft_netlink_test', 'domain_driver', 'nft_cli_driver')
+# Preserve verification of archived plugin/sequence bundles without allowing an
+# incomplete or mixed collection of current and historical harnesses.
+LEGACY_TESTS = ('dns_test', 'cache_domain_test', 'engine_test', 'plan_regression_test',
+                'nft_netlink_test', 'domain_driver', 'nft_cli_driver')
 REPO = 'xfy-see/diversion-dns-c'
 LIMIT = 400 * 1024 * 1024
+REGEX_BACKENDS = ('pcre2', 'posix-lite')
+PCRE2_LICENSES = ('PCRE2-LICENCE.md', 'PCRE2-AUTHORS.md')
 
 
 def require(condition, message):
     if not condition:
         raise ValueError(message)
+
+
+def regex_backend(profile):
+    # Archived bundles predate this field and always used PCRE2.
+    backend = profile.get('regex_backend', 'pcre2')
+    require(backend in REGEX_BACKENDS, 'invalid regex backend')
+    return backend
+
+
+def test_suite(profile):
+    names = set(profile['tests'])
+    suite = 'fixed-splitter' if names == set(TESTS) else 'legacy-plugin'
+    require(names in (set(TESTS), set(LEGACY_TESTS))
+            and profile.get('suite', suite) == suite, 'incomplete or mixed test profile')
+    return suite
 
 
 def digest(data):
@@ -70,6 +91,7 @@ def source_matches(root, manifest):
 
 # 仅允许该仓库的 GitHub job 打包；源码、二进制、日志和摘要形成同一证据链。
 def pack(args):
+    backend = regex_backend({'regex_backend': args.regex_backend})
     commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT).decode().strip()
     require(os.environ.get('GITHUB_SHA') == commit and os.environ.get('GITHUB_REPOSITORY') == REPO,
             'pack must run on GitHub for this exact repository/commit')
@@ -91,14 +113,31 @@ def pack(args):
         label, folder = value.split('=', 1)
         require(label in ('native', 'asan', 'static') and label not in profiles, 'invalid profile')
         folder = Path(folder).resolve()
-        profiles[label] = {'application': f'builds/{label}/mosdns-c',
+        profiles[label] = {'suite': 'fixed-splitter', 'regex_backend': backend,
+                           'application': f'builds/{label}/mosdns-c',
                            'tests': {t: f'builds/{label}/tests/{t}' for t in TESTS}}
+        original = folder / 'manifest.json'
+        stamp = folder / 'regex-backend'
+        if stamp.exists() or stamp.is_symlink():
+            require(stamp.is_file() and not stamp.is_symlink()
+                    and stamp.read_bytes() == (backend + '\n').encode(), 'regex backend stamp differs')
+            add(f'builds/{label}/regex-backend', stamp, 0o644)
+        else:
+            # The existing frozen PCRE2 builder has its own verified manifest;
+            # all Make-built profiles must retain their actual backend stamp.
+            require(backend == 'pcre2' and label == 'static' and original.is_file(),
+                    'missing regex backend stamp')
         add(profiles[label]['application'], folder / 'mosdns-c', 0o755)
         for t, name in profiles[label]['tests'].items():
             add(name, folder / 'tests' / t, 0o755)
-        original = folder / 'manifest.json'
+        if backend == 'pcre2':
+            for name in PCRE2_LICENSES:
+                add(f'builds/{label}/licenses/{name}', folder / 'licenses' / name, 0o644)
         if original.exists():
+            require(backend == 'pcre2', 'PCRE2 build manifest cannot describe posix-lite')
             m = json.loads(original.read_text())
+            require(m.get('backend_verification', {}).get('backend', 'pcre2') == backend,
+                    'static regex backend differs')
             require(m['status'] == 'complete' and m['source_unchanged']
                     and all(c['exit_code'] == 0 for c in m['commands']), 'static build incomplete')
             require(digest((folder / 'mosdns-c').read_bytes()) == m['binary']['sha256'], 'linked app differs')
@@ -187,7 +226,21 @@ def read_archive(path, commit, run_id, archive_sha=None):
         require(blob(b) == entry['git_blob'] and m['files']['source/'+name]['mode'] == entry['mode'], 'source Git blob differs')
     require(set(n[7:] for n in contents if n.startswith('source/')) == set(m['git_tree']), 'source membership differs')
     for label, profile in m['profiles'].items():
-        require(label in ('native','asan','static') and set(profile['tests']) == set(TESTS), 'incomplete profile')
+        require(label in ('native','asan','static'), 'invalid profile')
+        suite = test_suite(profile)
+        backend = regex_backend(profile)
+        require(backend == 'pcre2' or suite == 'fixed-splitter', 'legacy suite cannot use posix-lite')
+        stamp = f'builds/{label}/regex-backend'
+        if stamp in contents:
+            require(contents[stamp] == (backend + '\n').encode()
+                    and m['files'][stamp]['mode'] == 0o644, 'regex backend stamp differs')
+        if 'regex_backend' in profile:
+            require(stamp in contents or (backend == 'pcre2' and label == 'static'
+                    and f'builds/{label}/manifest.ci.json' in contents), 'missing regex backend stamp')
+            if backend == 'pcre2':
+                require(all(f'builds/{label}/licenses/{name}' in contents
+                            and m['files'][f'builds/{label}/licenses/{name}']['mode'] == 0o644
+                            for name in PCRE2_LICENSES), 'PCRE2 licenses missing')
         for name in [profile['application'],*profile['tests'].values()]:
             require(name.startswith('builds/'+label+'/') and name in contents and m['files'][name]['mode']==0o755, 'missing executable')
         if label == 'static' and 'size' in profile:
@@ -248,6 +301,7 @@ def extract(args):
 def main():
     p=argparse.ArgumentParser(description=__doc__); sub=p.add_subparsers(dest='command',required=True)
     a=sub.add_parser('pack'); a.add_argument('--profile',action='append',required=True); a.add_argument('--target',required=True)
+    a.add_argument('--regex-backend',choices=REGEX_BACKENDS,default='pcre2')
     a.add_argument('--kind',choices=('native','static'),required=True); a.add_argument('--logs',type=Path,action='append',default=[])
     a.add_argument('--runtime-file',type=Path,action='append',default=[]); a.add_argument('--output',type=Path,required=True); a.set_defaults(func=pack)
     a=sub.add_parser('extract'); a.add_argument('--archive',type=Path,required=True); a.add_argument('--expected-commit',required=True)

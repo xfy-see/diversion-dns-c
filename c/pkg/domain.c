@@ -5,11 +5,19 @@
 #define _POSIX_C_SOURCE 200809L
 #define PCRE2_CODE_UNIT_WIDTH 8
 #include "mosdns.h"
+#ifdef MD_REGEX_POSIX
+#include <locale.h>
+#include <regex.h>
+#else
 #include <pcre2.h>
+#endif
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef MD_REGEX_POSIX
+#include "regex_posix_lite.h"
+#endif
 
 typedef struct domain_entry {
     struct domain_entry *next;
@@ -19,7 +27,11 @@ typedef struct domain_entry {
 typedef struct { domain_entry **buckets; size_t count, size; } domain_table;
 typedef struct domain_regex {
     struct domain_regex *next;
+#ifdef MD_REGEX_POSIX
+    regex_t code;
+#else
     pcre2_code *code;
+#endif
     char text[];
 } domain_regex;
 struct md_domain {
@@ -27,6 +39,10 @@ struct md_domain {
     domain_entry *keywords;
     domain_regex *regexes;
     bool root;
+#ifdef MD_REGEX_POSIX
+    locale_t regex_locale;
+    size_t regex_count;
+#endif
 };
 
 static uint64_t hash_text(const char *s) {
@@ -111,6 +127,31 @@ int md_domain_add(md_domain *d, const char *rule, char *err) {
     if (type == REGEX) {
         for (domain_regex *r = d->regexes; r; r = r->next)
             if (!strcmp(r->text, pattern)) return 0;
+#ifdef MD_REGEX_POSIX
+        lite_parser parser;
+        if (lite_normalize(&parser, pattern, err)) return -1;
+        if (d->regex_count >= LITE_RULE_MAX) {
+            snprintf(err, MD_ERROR_SIZE, "invalid POSIX-lite regexp at 0: rule count exceeds 128"); return -1;
+        }
+        /* The C locale belongs to this rule set, and uselocale affects only
+         * the calling thread. Never call process-global setlocale here. */
+        if (!d->regex_locale) {
+            d->regex_locale = newlocale(LC_ALL_MASK, "C", (locale_t)0);
+            if (!d->regex_locale) goto oom;
+        }
+        domain_regex *r = malloc(sizeof(*r) + strlen(pattern) + 1);
+        if (!r) goto oom;
+        locale_t previous = uselocale(d->regex_locale);
+        if (!previous) { free(r); snprintf(err, MD_ERROR_SIZE, "cannot select POSIX-lite C locale"); return -1; }
+        int code = regcomp(&r->code, parser.output, REG_EXTENDED | REG_NOSUB);
+        (void)uselocale(previous);
+        if (code) {
+            char msg[160]; regerror(code, &r->code, msg, sizeof(msg));
+            snprintf(err, MD_ERROR_SIZE, "invalid POSIX-lite regexp at %zu: %s", parser.pos, msg);
+            free(r); return -1;
+        }
+        ++d->regex_count;
+#else
         /* 使用 PCRE2 的 8 位字节接口，不启用 UTF/UCP；当前构建也关闭
          * Unicode 支持。普通域名仍可使用分组、回溯引用、前后查找等语法。 */
         int code; PCRE2_SIZE offset;
@@ -125,6 +166,10 @@ int md_domain_add(md_domain *d, const char *rule, char *err) {
         domain_regex *r = malloc(sizeof(*r) + strlen(pattern) + 1);
         if (!r) { pcre2_code_free(compiled); goto oom; }
         r->code = compiled; strcpy(r->text, pattern); r->next = d->regexes; d->regexes = r;
+#endif
+#ifdef MD_REGEX_POSIX
+        strcpy(r->text, pattern); r->next = d->regexes; d->regexes = r;
+#endif
         return 0;
     }
     char *s = strdup(pattern);
@@ -192,6 +237,18 @@ bool md_domain_match(const md_domain *d, const char *name) {
             if (strstr(s, k->text)) { result = true; break; }
     }
     if (!result && d->regexes) {
+#ifdef MD_REGEX_POSIX
+        /* The boolean API explicitly treats out-of-contract regex subjects as
+         * no match. Full/domain/keyword remain byte-preserving as before. */
+        if (lite_subject(s)) {
+            locale_t previous = uselocale(d->regex_locale);
+            if (previous) {
+                for (const domain_regex *r = d->regexes; r; r = r->next)
+                    if (!regexec(&r->code, s, 0, NULL, 0)) { result = true; break; }
+                (void)uselocale(previous);
+            }
+        }
+#else
         pcre2_match_data *data = pcre2_match_data_create(1, NULL);
         pcre2_match_context *ctx = pcre2_match_context_create(NULL);
         if (data && ctx) {
@@ -204,6 +261,7 @@ bool md_domain_match(const md_domain *d, const char *name) {
                 if (pcre2_match(r->code, (PCRE2_SPTR)s, strlen(s), 0, 0, data, ctx) >= 0) { result = true; break; }
         }
         pcre2_match_data_free(data); pcre2_match_context_free(ctx);
+#endif
     }
     if (!result) {
         normalize(s, 1);
@@ -229,6 +287,17 @@ void md_domain_free(md_domain *d) {
     domain_entry *k = d->keywords;
     while (k) { domain_entry *next = k->next; free(k); k = next; }
     domain_regex *r = d->regexes;
-    while (r) { domain_regex *next = r->next; pcre2_code_free(r->code); free(r); r = next; }
+    while (r) {
+        domain_regex *next = r->next;
+#ifdef MD_REGEX_POSIX
+        regfree(&r->code);
+#else
+        pcre2_code_free(r->code);
+#endif
+        free(r); r = next;
+    }
+#ifdef MD_REGEX_POSIX
+    if (d->regex_locale) freelocale(d->regex_locale);
+#endif
     free(d);
 }
