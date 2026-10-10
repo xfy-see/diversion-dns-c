@@ -302,6 +302,35 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           persist-credentials: false
+      - name: Prepare pinned v0.1.0 attachment cleanup backup
+        id: cleanup-prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/simplify-v0.1.0.py prepare
+      - name: Archive verified original release attachments before cleanup
+        id: cleanup-backup
+        if: steps.cleanup-prepare.outputs.needed == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-v0.1.0-cleanup-backup-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          path: .build/release-v0.1.0-cleanup/backup/
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+      - name: Recheck archived bytes and remove only the pinned 15 attachments
+        if: steps.cleanup-prepare.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLEANUP_BACKUP_ARTIFACT_ID: ${{ steps.cleanup-backup.outputs.artifact-id }}
+        run: python3 scripts/simplify-v0.1.0.py apply
+      - name: Preserve cleanup result or failure evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-v0.1.0-cleanup-result-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          path: .build/release-v0.1.0-cleanup/result.json
+          if-no-files-found: warn
+          retention-days: 90
       - name: Install official runtime verification tools only
         run: |
           sudo apt-get update
