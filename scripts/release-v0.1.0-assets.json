@@ -1,0 +1,110 @@
+{
+  "release_id": 408852981,
+  "tag": "v0.1.0",
+  "commit": "96f7d7dd11ce4f4eb937d29b7371c10c138825f6",
+  "assets": [
+    {
+      "id": 627587450,
+      "name": "buildinfo-aarch64_cortex-a53.json",
+      "size": 16998,
+      "digest": "sha256:81ddac7db4935a66ba3fdc007c65f84c6b95e27beb1e0bdcf155616c636abdca"
+    },
+    {
+      "id": 627587447,
+      "name": "buildinfo-mipsel_24kc.json",
+      "size": 16777,
+      "digest": "sha256:0f88ac1e0520835b34651d58050b8b3902556fed8368d4d4d293d62f041ba9e1"
+    },
+    {
+      "id": 627587452,
+      "name": "diversion-dns-c-lite-0.1.0-r1_aarch64_cortex-a53.apk",
+      "size": 33570,
+      "digest": "sha256:d5cd4b75a24382f321fe235e95bbfeaa34f4b473ba1de298f731eab1a66789fa"
+    },
+    {
+      "id": 627587466,
+      "name": "diversion-dns-c-lite-0.1.0-r1_mipsel_24kc.apk",
+      "size": 30286,
+      "digest": "sha256:df16c975210e0a2d1c9b8274e3dbe18936a51a02170d020918beb92dfb14737e"
+    },
+    {
+      "id": 627587467,
+      "name": "pcre2-native-linux-amd64-v0.1.0.tar.gz",
+      "size": 6553626,
+      "digest": "sha256:8da46a0ba453865f0b9ddb2d776c962854ed08bd62ed93b66af64243683433bb"
+    },
+    {
+      "id": 627587472,
+      "name": "pcre2-native-macos-arm64-v0.1.0.tar.gz",
+      "size": 3014275,
+      "digest": "sha256:84355e979a3cfa0e84fcad45d344b8d3c019191b212e07fec6b0334bf27184ab"
+    },
+    {
+      "id": 627587471,
+      "name": "pcre2-static-linux-amd64-v0.1.0.tar.gz",
+      "size": 1209565,
+      "digest": "sha256:1f9e304c280d545913e2d9a8c29c29b1be070fbb45886fb714f9753e4ec01ecb"
+    },
+    {
+      "id": 627587473,
+      "name": "pcre2-static-linux-arm64-v0.1.0.tar.gz",
+      "size": 1252571,
+      "digest": "sha256:39688c1fb823b611639f5b013267240b9a281f4ae308c4666660600a5934d112"
+    },
+    {
+      "id": 627587486,
+      "name": "posix-lite-native-linux-amd64-v0.1.0.tar.gz",
+      "size": 6178383,
+      "digest": "sha256:81ddfcb76caf1d6feae0bdd29d03a87cbd4676135d87480fca1b0ad6de5fbdba"
+    },
+    {
+      "id": 627587492,
+      "name": "posix-lite-native-macos-arm64-v0.1.0.tar.gz",
+      "size": 2582219,
+      "digest": "sha256:9dd952c3c45f57d45b62b936c5b47c0853624e2b118bcc53eff34be3818cfd22"
+    },
+    {
+      "id": 627587494,
+      "name": "posix-lite-static-linux-amd64-v0.1.0.tar.gz",
+      "size": 750273,
+      "digest": "sha256:a0c42a741bcfd1d95e8b6450ff05d50ec1e1c99813f8d64d359b89d8de6a6555"
+    },
+    {
+      "id": 627587497,
+      "name": "posix-lite-static-linux-arm64-v0.1.0.tar.gz",
+      "size": 782686,
+      "digest": "sha256:87757bf1820d0525abc3da514e7f2910b7ae13f13a9e522530f9b3cc06197d86"
+    },
+    {
+      "id": 627587449,
+      "name": "RELEASE-NOTES.md",
+      "size": 3451,
+      "digest": "sha256:a5a22bdee84b36b587d29a731cabe2c768fd83b63549d603ac35006feaf64f16"
+    },
+    {
+      "id": 627587496,
+      "name": "release-verification.json",
+      "size": 10578,
+      "digest": "sha256:0dad0b28a382ac900cb4d1f17679ecb436422b24031103c8e93d23bbded9870d"
+    },
+    {
+      "id": 627587453,
+      "name": "SHA256SUMS",
+      "size": 1676,
+      "digest": "sha256:2595bacbbe541e365196626dd07cdacba296862a6489c1b737c396ddbe0e853b"
+    },
+    {
+      "id": 627587514,
+      "name": "verification-aarch64_cortex-a53-v0.1.0.tar.gz",
+      "size": 435862,
+      "digest": "sha256:f549a287186bd8e0b7c8e7866265e7830c3681cd55046c0432afde88f1dbe5b6"
+    },
+    {
+      "id": 627587519,
+      "name": "verification-mipsel_24kc-v0.1.0.tar.gz",
+      "size": 436084,
+      "digest": "sha256:2aa7c91528594ac0b0942c4c102f4f3a5b83a1db47f8de99de466e08d2307780"
+    }
+  ],
+  "original_body_sha256": "9308a06cd4e4bfdbdf301587c055781345300238be2db2fa513ffeee51bf6187"
+}

@@ -98,9 +98,10 @@ class PublishSequenceContracts(unittest.TestCase):
     def invoke(self, *, corrupt=False, main_moved=False, attempt_changed=False):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        asset = Path(tmp.name) / "fixture.apk"
-        asset.write_bytes(b"synthetic release bytes; never executable")
-        commit = "a" * 40
+        assets = [Path(tmp.name) / name for name in pub.APK_ASSETS]
+        for asset in assets:
+            asset.write_bytes(b"synthetic release bytes; never executable")
+        commit = pub.ORIGINAL_COMMIT
         calls = []
         def command(argv, **kwargs):
             calls.append(argv)
@@ -113,7 +114,7 @@ class PublishSequenceContracts(unittest.TestCase):
         def api(path):
             if path.endswith("/assets?per_page=100"):
                 return [{"name": asset.name, "size": asset.stat().st_size,
-                         "digest": "sha256:" + ("0" * 64 if corrupt else pub.a.digest(asset.read_bytes()))}]
+                         "digest": "sha256:" + ("0" * 64 if corrupt else pub.a.digest(asset.read_bytes()))} for asset in assets]
             if path.startswith("git/ref/"):
                 return {"object": {"sha": "b" * 40 if main_moved and path.endswith("main") else commit}}
             if path.startswith("actions/runs/"):
@@ -124,7 +125,7 @@ class PublishSequenceContracts(unittest.TestCase):
                 mock.patch.object(pub, "checked_jobs", return_value=[]):
             error = None
             try:
-                pub.publish_assets([asset], commit, "release notes", 11, 1, 12, 1)
+                pub.publish_assets(assets, commit, "release notes", 11, 1, 12, 1)
             except ValueError as exc:
                 error = str(exc)
         return calls, error

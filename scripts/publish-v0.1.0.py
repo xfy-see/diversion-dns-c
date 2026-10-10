@@ -24,6 +24,9 @@ TAG = "v0.1.0"
 VERSION = "0.1.0"
 REPO = "xfy-see/diversion-dns-c"
 ARCHES = ("aarch64_cortex-a53", "mipsel_24kc")
+PINNED = json.loads((ROOT / "scripts/release-v0.1.0-assets.json").read_text())
+ORIGINAL_COMMIT = PINNED["commit"]
+APK_ASSETS = {row["name"]: row for row in PINNED["assets"] if row["name"].endswith(".apk")}
 BUILD_JOBS = ["Native / macos-arm64", "Native / linux-amd64", "Static / linux-amd64", "Static / linux-arm64"]
 
 
@@ -63,41 +66,32 @@ def existing_release():
     a.require(not release["draft"] and not release["prerelease"] and release["published_at"],
               "v0.1.0 draft or prerelease exists; review without overwriting")
     tag = api(f"git/ref/tags/{TAG}")
-    a.require(tag["object"]["type"] == "commit" and release["target_commitish"] == tag["object"]["sha"],
+    a.require(release["id"] == PINNED["release_id"] and tag["object"]["type"] == "commit"
+              and tag["object"]["sha"] == release["target_commitish"] == ORIGINAL_COMMIT,
               "existing release/tag identity conflict")
     assets = api(f"releases/{release['id']}/assets?per_page=100")
-    expected = {"SHA256SUMS", "RELEASE-NOTES.md", "release-verification.json"}
-    for arch in ARCHES:
-        expected.update({f"diversion-dns-c-lite-0.1.0-r1_{arch}.apk", f"buildinfo-{arch}.json",
-                         f"verification-{arch}-{TAG}.tar.gz"})
-    for backend in ("pcre2", "posix-lite"):
-        for kind, target in (("native", "linux-amd64"), ("native", "macos-arm64"),
-                             ("static", "linux-amd64"), ("static", "linux-arm64")):
-            expected.add(f"{backend}-{kind}-{target}-{TAG}.tar.gz")
-    a.require(len(assets) == len(expected) and {r["name"] for r in assets} == expected
-              and all(r["state"] == "uploaded" and r["size"] > 0
-                      and re.fullmatch(r"sha256:[0-9a-f]{64}", r.get("digest", "")) for r in assets),
-              "existing release assets incomplete; review without overwriting")
-    by_name = {row["name"]: row for row in assets}
-    def read_asset(name):
-        row = by_name[name]
+    validate_original_apks(assets)
+    for row in assets:
         data = run(["gh", "api", f"repos/{REPO}/releases/assets/{row['id']}",
                     "-H", "Accept: application/octet-stream"])
         a.require(len(data) == row["size"] and "sha256:" + a.digest(data) == row["digest"],
-                  "existing release metadata download differs")
-        return data
-    sums = {}
-    for line in read_asset("SHA256SUMS").decode().splitlines():
-        match = re.fullmatch(r"([0-9a-f]{64})  ([^/]+)", line)
-        a.require(match and match[2] not in sums, "existing release checksums malformed")
-        sums[match[2]] = "sha256:" + match[1]
-    a.require(sums == {name: row["digest"] for name, row in by_name.items() if name != "SHA256SUMS"},
-              "existing release checksums disagree with uploaded assets")
-    verification = json.loads(read_asset("release-verification.json"))
-    a.require(verification["release"] == TAG and verification["commit"] == tag["object"]["sha"]
-              and len(verification["jobs"]) == 6 and all(j["conclusion"] == "success" for j in verification["jobs"]),
-              "existing release verification identity differs")
+                  "existing original APK download differs")
     return release
+
+
+def validate_original_apks(assets):
+    """The original two uploaded APKs are the immutable stable-release contract."""
+    a.require(len(assets) == 2 and {row["name"] for row in assets} == set(APK_ASSETS)
+              and all(row.get("state") == "uploaded"
+                      and all(row.get(key) == expected for key, expected in APK_ASSETS[row["name"]].items())
+                      for row in assets), "existing release must contain exactly the two original APKs")
+
+
+def upload_selection(directory):
+    """Keep all verification evidence in Actions, but attach only both APKs."""
+    paths = [directory / name for name in sorted(APK_ASSETS)]
+    a.require(all(path.is_file() for path in paths), "both release APKs are required")
+    return paths
 
 
 def load(name):
@@ -239,6 +233,7 @@ def main():
     if prior:
         print("Complete stable v0.1.0 already exists; no changes: " + prior["html_url"])
         return
+    a.require(commit == ORIGINAL_COMMIT, "v0.1.0 is pinned to its original source; never recreate from newer main")
     a.require(api("git/ref/heads/main")["object"]["sha"] == commit, "main moved; do not publish stale commit")
     own = api(f"actions/runs/{run_id}")
     a.require(own["head_sha"] == commit and own["head_branch"] == "main" and own["event"] == "push"
@@ -294,7 +289,7 @@ def main():
     shutil.copyfile(ROOT / "docs/release-v0.1.0.md", output / "RELEASE-NOTES.md")
     assets = sorted(output.iterdir())
     (output / "SHA256SUMS").write_text("".join(f"{a.digest(p.read_bytes())}  {p.name}\n" for p in assets))
-    assets = sorted(output.iterdir())
+    assets = upload_selection(output)
     # Re-read everything immediately before the only external mutation.
     a.require(api("git/ref/heads/main")["object"]["sha"] == commit, "main moved before publication")
     a.require(existing_release() is None, "v0.1.0 appeared; never overwrite it")
@@ -306,6 +301,9 @@ def main():
 
 
 def publish_assets(assets, commit, notes, run_id, attempt, apk_id, apk_attempt):
+    a.require(commit == ORIGINAL_COMMIT, "new v0.1.0 publication must use the original commit")
+    a.require(len(assets) == 2 and {p.name for p in assets} == set(APK_ASSETS),
+              "only the two architecture APKs may be uploaded")
     # Creating refs never force-updates an existing tag. A partial failure leaves a draft for review.
     run(["gh", "api", f"repos/{REPO}/git/refs", "--method", "POST", "--input", "-"],
         input=json.dumps({"ref": "refs/tags/" + TAG, "sha": commit}).encode())
