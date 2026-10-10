@@ -27,8 +27,9 @@ The application and C-test Git subtree used for these new runs is
 limited to CI, verifier coverage, and documentation; publication checks compare
 the C subtree and package recipe with these tested inputs.
 
-- Python verifier/build/backend/package contracts: all 96 tests passed after
+- Python verifier/build/backend/package contracts: all 98 tests passed after
   the integrated CI/artifact changes, including 20 new lite artifact tests
+  and two workflow argument/portability regression tests
 - GCC 14 native and ASan/UBSan: both PCRE2 and POSIX-lite freshly built and
   passed the complete Make unit/integration suite in distinct output trees
 - Native PCRE2 reused the already verified, unchanged pinned no-Unicode/no-JIT
@@ -98,6 +99,8 @@ and selects the correct domain contract. Historical bundles without backend
 metadata retain their original PCRE2 interpretation. The existing four
 `diversion-*` artifacts and main-only delivery selection remain unchanged.
 The OpenWrt APK is a separate local SDK output, not one of those CI builds.
+
+The first integrated run, [38026329523](https://github.com/xfy-see/diversion-dns-c/actions/runs/38026329523), passed all three Linux jobs, including lite, and the macOS PCRE2 suite. Its new macOS lite step stopped before C compilation because Bash 3.2 treats an empty array as unset under `set -u`. The follow-up uses a scalar sanitizer selection and a nonempty packaging-options array, with two regression tests. No C source or OpenWrt recipe changed; the original failed log/artifacts are retained.
 
 A workflow definition is not evidence of a passed run. Inspect the exact
 published commit's run/attempt and job conclusions before calling CI complete.

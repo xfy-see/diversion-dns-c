@@ -92,28 +92,28 @@ jobs:
           for profile in native asan; do
             test ! -e ".build/lite/$profile"
             folder=../.build/lite/$profile
-            options=()
-            if [[ $profile == asan ]]; then options+=(SANITIZE=1); fi
+            sanitize=0
+            if [[ $profile == asan ]]; then sanitize=1; fi
             targets=(all)
             for t in dns_test cache_domain_test fixed_config_test fixed_engine_test nft_netlink_test domain_driver nft_cli_driver; do
               targets+=("$folder/tests/$t")
             done
-            make -C c -j4 CC="$CC" BUILD="$folder" REGEX_BACKEND=posix-lite "${options[@]}" "${targets[@]}" 2>&1 | tee .build/lite-compile-logs/$profile.log
+            make -C c -j4 CC="$CC" BUILD="$folder" REGEX_BACKEND=posix-lite SANITIZE="$sanitize" "${targets[@]}" 2>&1 | tee .build/lite-compile-logs/$profile.log
           done
       - name: Package, verify and execute opt-in native lite suite
         env:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          runtime=()
+          # Nonempty arrays also work with nounset on macOS Bash 3.2.
+          pack_options=(--profile native=.build/lite/native --profile asan=.build/lite/asan --regex-backend posix-lite --target "$TARGET" --kind native)
           if [[ $(uname) == Darwin ]]; then
-            runtime+=(--runtime-file "$(cc -print-resource-dir)/lib/darwin/libclang_rt.asan_osx_dynamic.dylib")
+            pack_options+=(--runtime-file "$(cc -print-resource-dir)/lib/darwin/libclang_rt.asan_osx_dynamic.dylib")
           fi
-          profiles=(--profile native=.build/lite/native --profile asan=.build/lite/asan)
-          python3 scripts/artifacts.py pack "${profiles[@]}" --regex-backend posix-lite --target "$TARGET" --kind native "${runtime[@]}" --logs .build/lite-compile-logs --output .build/lite-pretest.tar.gz
+          python3 scripts/artifacts.py pack "${pack_options[@]}" --logs .build/lite-compile-logs --output .build/lite-pretest.tar.gz
           python3 scripts/artifacts.py extract --archive .build/lite-pretest.tar.gz --expected-commit "$GITHUB_SHA" --expected-run-id "$GITHUB_RUN_ID" --checkout . --output .build/lite-verified
           python3 scripts/validate.py --bundle .build/lite-verified --checkout . --output .build/lite-ci-validation --ci
-          python3 scripts/artifacts.py pack "${profiles[@]}" --regex-backend posix-lite --target "$TARGET" --kind native "${runtime[@]}" --logs .build/lite-compile-logs --logs .build/lite-ci-validation --output dist/experimental-lite/bundle.tar.gz
+          python3 scripts/artifacts.py pack "${pack_options[@]}" --logs .build/lite-compile-logs --logs .build/lite-ci-validation --output dist/experimental-lite/bundle.tar.gz
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: experimental-lite-native-${{ matrix.target }}-${{ github.sha }}-attempt-${{ github.run_attempt }}
