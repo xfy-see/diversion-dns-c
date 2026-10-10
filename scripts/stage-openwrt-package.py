@@ -32,7 +32,8 @@ def stage(destination, source_ref="HEAD"):
             if not member.isfile():
                 raise ValueError("source archive must contain only regular files")
             files[member.name] = tar.extractfile(member).read()
-    recipe = (ROOT / "packaging/openwrt/Makefile").read_bytes()
+    recipe = subprocess.check_output(
+        ["git", "show", commit + ":packaging/openwrt/Makefile"], cwd=ROOT)
     destination.mkdir(parents=True)
     for name, content in files.items():
         path = destination / "src" / name

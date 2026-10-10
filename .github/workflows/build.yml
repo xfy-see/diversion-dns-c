@@ -11,6 +11,7 @@ defaults:
     shell: bash
 jobs:
   native:
+    name: Native / ${{ matrix.target }}
     strategy:
       fail-fast: false
       matrix:
@@ -135,6 +136,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
   static:
+    name: Static / ${{ matrix.target }}
     strategy:
       fail-fast: false
       matrix:
@@ -283,3 +285,36 @@ jobs:
           python3 scripts/prepare-delivery.py --input .build/delivery --output dist/release
           tag=ci-$GITHUB_SHA-run$GITHUB_RUN_ID-attempt$GITHUB_RUN_ATTEMPT
           gh release create "$tag" dist/release/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "CI $GITHUB_SHA (run $GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT)" --notes "Four cloud build/test jobs passed. Assets retain the exact source tree, binaries, manifests and CI test logs. Verify checksums and commit/run/attempt before local validation."
+
+  release-010:
+    name: Publish v0.1.0 after six verified builds
+    needs: [native, static, delivery]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'xfy-see/diversion-dns-c'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    concurrency:
+      group: stable-release-v0.1.0
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Install official runtime verification tools only
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-user zstd
+      - name: Independently verify exact artifacts and publish this version once
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/publish-v0.1.0.py
+      - name: Preserve release verification or failure evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-v0.1.0-verification-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          path: .build/release-v0.1.0/assets/
+          if-no-files-found: warn
+          retention-days: 90

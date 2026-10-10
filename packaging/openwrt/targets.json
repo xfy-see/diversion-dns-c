@@ -1,0 +1,24 @@
+{
+  "aarch64_cortex-a53": {
+    "openwrt_version": "25.12.5",
+    "target": "qualcommax/ipq60xx",
+    "gcc_version": "14.3.0",
+    "sdk_filename": "openwrt-sdk-25.12.5-qualcommax-ipq60xx_gcc-14.3.0_musl.Linux-x86_64.tar.zst",
+    "sdk_url": "https://downloads.openwrt.org/releases/25.12.5/targets/qualcommax/ipq60xx/openwrt-sdk-25.12.5-qualcommax-ipq60xx_gcc-14.3.0_musl.Linux-x86_64.tar.zst",
+    "sdk_sha256": "5ea07bb08e5a21454b37aaf497c876d5ce8fde1742ac8bfbb62beea84ee4e66b",
+    "checksum_url": "https://downloads.openwrt.org/releases/25.12.5/targets/qualcommax/ipq60xx/sha256sums",
+    "compiler_prefix": "aarch64-openwrt-linux-musl",
+    "qemu": "qemu-aarch64"
+  },
+  "mipsel_24kc": {
+    "openwrt_version": "25.12.5",
+    "target": "ramips/mt7621",
+    "gcc_version": "14.3.0",
+    "sdk_filename": "openwrt-sdk-25.12.5-ramips-mt7621_gcc-14.3.0_musl.Linux-x86_64.tar.zst",
+    "sdk_url": "https://downloads.openwrt.org/releases/25.12.5/targets/ramips/mt7621/openwrt-sdk-25.12.5-ramips-mt7621_gcc-14.3.0_musl.Linux-x86_64.tar.zst",
+    "sdk_sha256": "9962084f4131610e90e48bc864c6ceade0b238f15f335de5f672910532b20e9c",
+    "checksum_url": "https://downloads.openwrt.org/releases/25.12.5/targets/ramips/mt7621/sha256sums",
+    "compiler_prefix": "mipsel-openwrt-linux-musl",
+    "qemu": "qemu-mipsel"
+  }
+}

@@ -4,6 +4,12 @@
 
 原始问题名匹配 CN 规则后，走共享缓存及唯一 CN/foreign 上游组；CN 回答包含缓存命中都经过原有 nft 最终处理。保留数字 UDP/TCP 上游、TCP 持久连接、TTL/LRU/lazy 缓存、Linux mark/接口绑定和 domain/full/keyword/regexp。没有跨组 fallback、热重载、服务安装或系统 DNS 接管。GPL-3.0-or-later；未参与构建的历史 libyaml 源码和原 MIT 许可证保留。
 
+## v0.1.0 正式版本
+
+[下载 v0.1.0](https://github.com/xfy-see/diversion-dns-c/releases/tag/v0.1.0) · [发布说明与迁移边界](docs/release-v0.1.0.md)
+
+包含 `aarch64_cortex-a53` / `mipsel_24kc` 两个架构的 `0.1.0-r1` 动态 POSIX-lite APK，以及 PCRE2/lite 验证包、SHA256、buildinfo 与源码。APK 仍是实验性未签名包，无 init、配置、LuCI 或自启动。相对历史测试包 `0.2.0-r1`，包管理器将本次视为降版本；先备份配置与规则，不要强制覆盖用户配置。本次新版本未做用户实机验收。
+
 ## 配置与运行
 
 从精确提交的 CI 下载并验证产物后，在仓库根目录运行：
@@ -16,10 +22,10 @@
 默认读取 [config.conf](config.conf)。`check` 现在会加载全部 CN 规则文件并编译 regexp，不打开 listener、不查询上游、不写 nft；规则文件缺失也会失败。相对路径基于进程工作目录或 `-d` 指定目录。
 
 - [完整配置与迁移契约](docs/fixed-splitter.md)：全部键、限制、固定路由、缓存/nft 语义及部署前检查
-- [集成优化与验收记录](docs/integrated-validation-20261010.md)：可选 POSIX-lite、`-Os`/LTO、OpenWrt 动态包及各自测试边界
+- [历史集成优化与验收记录](https://github.com/xfy-see/diversion-dns-c/blob/d9c4645109e97395d766a5c4a81223b39caf6249/docs/integrated-validation-20261010.md)：可选 POSIX-lite、`-Os`/LTO、OpenWrt 动态包及各自测试边界
 - [C 运行与验证说明](c/README.md)：依赖、服务限制、CI 和历史验证边界
-- [本次本地验证](docs/specialized-validation-20261009.md) 与 [同机体积对照](docs/specialized-size.md)：通过项、限制和复现依据
-- [构建依赖边界](docs/build-dependencies.md)与[专用实现体积证据](docs/specialized-size.md)：移除的运行时依赖及本次测量范围
+- [历史本地验证](https://github.com/xfy-see/diversion-dns-c/blob/d9c4645109e97395d766a5c4a81223b39caf6249/docs/specialized-validation-20261009.md) 与 [历史同机体积对照](https://github.com/xfy-see/diversion-dns-c/blob/d9c4645109e97395d766a5c4a81223b39caf6249/docs/specialized-size.md)：通过项、限制和复现依据
+- [构建依赖边界](docs/build-dependencies.md)与[历史专用实现体积证据](https://github.com/xfy-see/diversion-dns-c/blob/d9c4645109e97395d766a5c4a81223b39caf6249/docs/specialized-size.md)：移除的运行时依赖及本次测量范围
 - [最小配置](c/examples/minimal.conf) 与 [Linux site-only 配置](c/examples/site-only.conf)
 - [离线迁移工具](scripts/migrate-site-config.py)：仅接受经完整校验的历史 site-only 等价图，拒绝未知/重复字段和其他控制流；可选 PyYAML 不进入运行时
 
@@ -40,7 +46,9 @@ python3 scripts/migrate-site-config.py docs/go-profiles-site-only.yaml -o /tmp/s
 | Linux ARM64 static | 固定 Zig 0.14.1、PCRE2 10.48，静态 musl 程序和全部测试程序 |
 | Linux x86_64 static | 同样固定依赖的静态 musl 程序和全部测试程序 |
 
-同一工作流还显式构建并验证 POSIX-lite：native/sanitizer 覆盖 macOS ARM64 和 Linux x86_64，静态 musl 覆盖 Linux ARM64/x86_64。它们分别保存在 `experimental-lite-*` Actions 产物中，并在 manifest 内记录 backend；默认产物仍为 PCRE2，lite 不进入现有自动 release。OpenWrt APK 另走 [SDK 实验流程](packaging/openwrt/README.md)。
+同一工作流还显式构建并验证 POSIX-lite：native/sanitizer 覆盖 macOS ARM64 和 Linux x86_64，静态 musl 覆盖 Linux ARM64/x86_64。它们分别保存在 `experimental-lite-*` Actions 产物中，并在 manifest 内记录 backend；默认产物仍为 PCRE2，lite 不进入原有 CI 预发布；v0.1.0 正式版本另行收录经过同源验证的 lite 包。OpenWrt APK 另走 [SDK 实验流程](packaging/openwrt/README.md)。
+
+v0.1.0 的一次性正式发布还等待双 APK job，并独立验证下载内容；已有 tag/release 一律不覆盖。
 
 main 分支的四个编译/测试 job 成功后，delivery job 会生成 `ci-<commit>-run<id>-attempt<n>` 预发布版本。四个同源 `.tar.gz` 下载包与 `SHA256SUMS` 可以直接从 GitHub Releases 下载，无需 Actions 登录；它们保留 Actions 包内同一份文件。
 
