@@ -176,7 +176,8 @@ def pack(args):
         add('runtime/' + p.name, p, 0o755)
     manifest = dict(schema=1, repository=REPO, commit=commit, run_id=int(os.environ['GITHUB_RUN_ID']),
                     run_attempt=int(os.environ['GITHUB_RUN_ATTEMPT']), target=args.target, kind=args.kind,
-                    created_utc=datetime.now(timezone.utc).isoformat(), git_tree=tree, profiles=profiles,
+                    created_utc=datetime.now(timezone.utc).isoformat(), application_version=(ROOT / "VERSION").read_text().strip(),
+                    git_tree=tree, profiles=profiles,
                     files={n:dict(bytes=len(b),sha256=digest(b),mode=m) for n,(b,m) in sorted(payload.items())})
     args.output.parent.mkdir(parents=True, exist_ok=True)
     require(not args.output.exists(), 'archive already exists')

@@ -17,7 +17,7 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(argv[1], "version")) {
         if (argc != 2) { fputs("version takes no arguments\n", stderr); return 1; }
-        puts("mosdns-c 0.2.0 fixed-splitter"); return 0;
+        puts("mosdns-c 0.1.0 fixed-splitter"); return 0;
     }
     bool check = !strcmp(argv[1], "check");
     if (!check && strcmp(argv[1], "start")) {

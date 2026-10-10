@@ -27,7 +27,9 @@ class LiteArtifactTests(unittest.TestCase):
         self.source = self.root / 'source'
         self.source.mkdir()
         (self.source / 'input.c').write_bytes(b'source bytes\n')
-        self.tree = {'input.c': {'git_blob': a.blob(b'source bytes\n'), 'mode': 0o644}}
+        (self.source / 'VERSION').write_text('0.1.0\n')
+        self.tree = {'input.c': {'git_blob': a.blob(b'source bytes\n'), 'mode': 0o644},
+                     'VERSION': {'git_blob': a.blob(b'0.1.0\n'), 'mode': 0o644}}
         self.output = self.root / 'bundle.tar.gz'
 
     def build(self, label='native', backend='posix-lite', licenses=False, stamp=True):

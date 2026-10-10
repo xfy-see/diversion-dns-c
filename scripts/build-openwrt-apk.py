@@ -138,9 +138,15 @@ def main():
     # Helpers and recipe must correspond to the same frozen commit as the C code.
     for name in ["scripts/build-openwrt-apk.py", "scripts/check-openwrt-elf.py",
                  "scripts/stage-openwrt-package.py", "packaging/openwrt/Makefile",
-                 "packaging/openwrt/targets.json", "c/Makefile"]:
+                 "packaging/openwrt/targets.json", "c/Makefile", "c/main.c", "VERSION"]:
         expected = subprocess.check_output(["git", "show", commit + ":" + name], cwd=ROOT)
         require((ROOT / name).read_bytes() == expected, "uncommitted build input: " + name)
+    version = (ROOT / "VERSION").read_text().strip()
+    require(re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version), "invalid application version")
+    recipe = (ROOT / "packaging/openwrt/Makefile").read_text()
+    require(f"PKG_VERSION:={version}\n" in recipe and "PKG_RELEASE:=1\n" in recipe,
+            "recipe version differs from application version")
+    package_version = version + "-r1"
     work, out = args.work.resolve(), args.output.resolve()
     require(not work.exists() and not out.exists(), "fresh work and output directories required")
     work.mkdir(parents=True)
@@ -157,6 +163,7 @@ def main():
              "source_commit": commit, "source_tree": subprocess.check_output(["git", "rev-parse", commit + "^{tree}"], cwd=ROOT, text=True).strip(),
              "github": {key: os.environ.get(key) for key in ["GITHUB_REPOSITORY", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_SHA"]},
              "sdk_archive": record(args.sdk_archive), "commands": [],
+             "application_version": version, "package_version": package_version,
              "unsigned": True, "runtime_scope": "official SDK musl runtime under QEMU; not installed firmware or device acceptance",
              "not_tested": ["router installation", "real kernel nftables", "hardware compatibility", "RSS/QPS", "sustained stability", "actual flash increment"]}
     def save():
@@ -245,6 +252,7 @@ def main():
         raw, _ = run("apk-metadata", [apktool, "adbdump", "--format", "json", apk])
         metadata = json.loads(raw)
         write_json(out / "apk-metadata.json", metadata)
+        require(metadata["info"].get("version") == package_version, "APK version mismatch")
         expected_files = package_files(metadata, args.arch)
         empty_keys = work / "empty-trust"
         empty_keys.mkdir()
@@ -283,7 +291,8 @@ def main():
             path = wrappers / name
             path.write_text("#!/bin/sh\nexec " + shlex.join([str(qemu), "-L", str(toolchain), str(executable)]) + ' "$@"\n')
             path.chmod(0o755)
-        run("apk-version", [wrappers / "packaged-app", "version"])
+        version_output, _ = run("apk-version", [wrappers / "packaged-app", "version"])
+        require(version_output.strip() == f"mosdns-c {version} fixed-splitter", "APK CLI version mismatch")
         for name in TESTS[:5]:
             run("qemu-" + name, [wrappers / name])
         run("qemu-domain-fixture", [sys.executable, source / "c/tests/domain_fixture.py", wrappers / "domain_driver", "--backend", "posix-lite"])

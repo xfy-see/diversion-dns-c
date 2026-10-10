@@ -102,8 +102,10 @@ for verified inputs, measured values, and the current limitations.
 ## Dual-architecture GitHub Actions
 
 `.github/workflows/openwrt-apk.yml` runs on branch pushes, pull requests and
-manual dispatch. It does not publish a GitHub Release and does not alter the
-existing PCRE2 build/delivery workflow. Its two independently named artifacts
+manual dispatch. It does not itself publish a GitHub Release. The one-version
+`v0.1.0` main-only release job waits for these two jobs and all four regular
+build/test jobs, independently downloads and verifies their exact artifacts,
+and publishes them together without changing the PCRE2 default. Its two independently named artifacts
 contain an architecture-suffixed APK, SHA256SUMS, the exact Git source archive,
 source manifest, SDK configuration, buildinfo, ABI checks and raw test logs:
 
@@ -180,3 +182,13 @@ python3 scripts/build-openwrt-apk.py --arch mipsel_24kc --source-ref HEAD \
 Both directories must be new. Use `aarch64_cortex-a53` and its SDK for ARM64.
 The wrapper freezes committed build inputs and rejects modified helper/recipe
 files. It only works on build artifacts and never connects to a router.
+
+## v0.1.0 version and migration
+
+The application version is `0.1.0`; this recipe produces `0.1.0-r1`.
+Historical experimental packages used `0.2.0-r1`, so APK version ordering treats
+this release as a downgrade, not an automatic upgrade. Back up configuration
+and rules before arranging a separate installation. Never force-overwrite user
+configuration. The release changes no running device or trust configuration.
+See [the release notes](../../docs/release-v0.1.0.md) for exact verification and
+hardware-acceptance boundaries.
