@@ -38,12 +38,15 @@ def main():
     logs = out / "logs"
     logs.mkdir()
     env = os.environ.copy()
+    flags = profiles.OPTFLAGS.copy()
     commands = []
     # 源目录与工作目录分离，日志和最终库摘要保留在本次输出中。
     commands.append(profiles.command([str(source / "configure")] +
-                    profiles.PCRE2_CONFIGURE_OPTIONS, work, env, logs / "configure.log"))
+                    profiles.PCRE2_CONFIGURE_OPTIONS + ["CFLAGS=" + " ".join(flags)],
+                    work, env, logs / "configure.log"))
     commands.append(profiles.command(["make", "-j" + str(args.jobs), "libpcre2-8.la"],
                                     work, env, logs / "build.log"))
+    profiles.verify_pcre2_config((work / "src/config.h").read_text())
     (out / "include").mkdir()
     (out / "lib").mkdir()
     shutil.copyfile(work / "src/pcre2.h", out / "include/pcre2.h")
@@ -55,6 +58,8 @@ def main():
         shutil.copyfile(source / name, licenses / ("PCRE2-" + name))
     manifest = {"profile": "pcre2-8-no-unicode-no-jit", "version": "10.48",
                 "archive": archive, "configure_options": profiles.PCRE2_CONFIGURE_OPTIONS,
+                "compile_flags": flags, "config_header": profiles.record(work / "src/config.h"),
+                "profile_verified": "8-bit only, Unicode disabled, JIT disabled",
                 "commands": commands, "library": profiles.record(library),
                 "licenses": {p.name: profiles.record(p) for p in sorted(licenses.iterdir())}}
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")

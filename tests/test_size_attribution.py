@@ -21,6 +21,8 @@ class SizeAttributionTests(unittest.TestCase):
     def test_sources_are_distinct(self):
         cases = {
             "/work/objects/main.c.o": "project",
+            "lto.tmp.lto.o": "mixed_lto",
+            "/work/mosdns-c.lto.o": "mixed_lto",
             "/work/libmosdns-c.a(engine.c.o)": "project",
             "/work/libmosdns-c.a(scanner.c.o)": "libyaml",
             "/work/libpcre2-8.a(pcre2_compile.c.o)": "pcre2",

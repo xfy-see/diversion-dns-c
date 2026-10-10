@@ -59,6 +59,9 @@ class FixedBuildTests(unittest.TestCase):
             output = Path(directory)
             builder.copy_standalone_test_files(ROOT, output)
             self.assertTrue((output / 'c/tests/integration.py').is_file())
+            # nft_cli_test records this exact source hash after its 18 checks.
+            self.assertEqual((output / 'c/plugin/nftset.c').read_bytes(),
+                             (ROOT / 'c/plugin/nftset.c').read_bytes())
             runner = output / 'c/tests/fixed_integration.py'
             # --help imports the actual dependencies but never launches DNS.
             # -E/-s exclude inherited PYTHONPATH and user site-packages.

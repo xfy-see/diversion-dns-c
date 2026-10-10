@@ -48,6 +48,9 @@ typedef struct md_domain md_domain;
 md_domain *md_domain_new(void);
 int md_domain_add(md_domain *d, const char *rule, char *err);
 int md_domain_load(md_domain *d, const char *path, char *err);
+/* With the opt-in MD_REGEX_POSIX build, regexes only see printable ASCII
+ * subjects <=253 bytes after one trailing dot; other subjects are regex misses.
+ * Full/domain/keyword behavior is unchanged. See REGEX-POSIX-LITE.md. */
 bool md_domain_match(const md_domain *d, const char *name);
 void md_domain_free(md_domain *d);
 

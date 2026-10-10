@@ -80,10 +80,10 @@ def main():
     compiler = None if args.driver else Path(shutil.which(os.environ.get('CC', 'cc'))).resolve()
     child = out / 'grammar-nft'
     child.write_text(CHILD); child.chmod(0o700)
-    flags = ['-std=c11','-Wall','-Wextra','-Wpedantic','-Werror','-pthread','-D_POSIX_C_SOURCE=200809L','-D_DEFAULT_SOURCE','-I'+str(ROOT/'c/include')]
+    flags = ['-flto','-UNDEBUG','-std=c11','-Wall','-Wextra','-Wpedantic','-Werror','-pthread','-D_POSIX_C_SOURCE=200809L','-D_DEFAULT_SOURCE','-I'+str(ROOT/'c/include')]
     if os.uname().sysname=='Darwin': flags += ['-I'+str(ROOT/'c/tests/nft_uapi')]
     if args.sanitize: flags += ['-O1','-g','-fsanitize=address,undefined','-fno-omit-frame-pointer']
-    else: flags += ['-O2']
+    else: flags += ['-Os']
     env = os.environ.copy()
     if args.sanitize:
         env['ASAN_OPTIONS'] = 'detect_leaks=0:halt_on_error=1'

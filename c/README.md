@@ -98,7 +98,13 @@ make -C c test
 依赖脚本校验源码 SHA-256
 `ebcc25aadf2a51fa1fefa9b8bc9e7a79b3dae86870a0f1152a22e42befd46888`，
 拒绝复用输出目录，保存构建日志及静态库哈希。交叉链接必须使用目标平台同配置的 PCRE2
-库；macOS `.a` 不能用于 Linux。默认本机构建保留调试信息，不能把体积直接和其他语言
+库；macOS `.a` 不能用于 Linux。应用、固定 PCRE2 依赖及独立测试默认使用 `-Os -flto`，
+链接也开启 LTO；静态 Linux 发布仍使用 musl、section GC、strip 和原 1 MiB stack 设置，
+没有关闭 unwind 表。ASan/UBSan profile 保留 `-O1` 和 frame pointer 以便诊断。
+更改编译参数时必须使用全新的输出目录，不能复用旧 `.o`/`.a`。LTO 会把项目、依赖及
+部分 runtime 合并为一个输入，尺寸报告将它们记为 `mixed_lto`，不声称能拆出各自字节。
+原始精确链接重放、完整 ELF 哈希和诊断节布局校验继续保留；PCRE2 配置、输入库与
+最终诊断符号独立验证。默认本机构建保留调试信息，不能把体积直接和其他语言
 剥离后的 release 做公平对照。
 
 ## 验证与历史证据
@@ -127,3 +133,10 @@ matcher 兼容。八条 Loyalsoldier direct-list 固定 regexp、Unicode 功能�
 只解释历史实现和历史证据。原 r12 性能数字在[根 README](../README.md)保留，不是本次
 专用实现的新成绩。真实内核写入、目标设备出口、二进制/RSS/QPS 和持续稳定性仍须
 各自提供独立测量；配置预检、编译成功或 mock 通过都不能代替它们。
+
+## Optional regex experiment
+
+The default remains PCRE2 without Unicode/JIT. An experimental libc ERE
+backend can be selected with `REGEX_BACKEND=posix-lite`; its deliberately
+restricted syntax and printable-ASCII subject contract are documented in
+[REGEX-POSIX-LITE.md](REGEX-POSIX-LITE.md). It is not a drop-in PCRE2 replacement.

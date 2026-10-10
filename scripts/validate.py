@@ -12,6 +12,14 @@ import sys
 import artifacts
 
 
+def domain_fixture_command(source, driver, profile):
+    argv = [sys.executable, source / 'c/tests/domain_fixture.py', driver]
+    # Historical source snapshots do not accept --backend; preserve their CLI.
+    if artifacts.regex_backend(profile) == 'posix-lite':
+        argv.extend(['--backend', 'posix-lite'])
+    return argv
+
+
 # 此入口只运行已验证的同架构产物；编译由 GitHub 工作流完成。
 def main():
     p=argparse.ArgumentParser(description=__doc__)
@@ -22,11 +30,12 @@ def main():
     # 先确认主机/产物架构一致，再创建本轮结果目录；不尝试执行跨架构程序。
     expected={'Darwin':'macos','Linux':'linux'}[platform.system()]+'-'+{'arm64':'arm64','aarch64':'arm64','x86_64':'amd64'}[platform.machine()]
     artifacts.require(m['target']==expected, 'artifact cannot run on this host')
+    backends={label:artifacts.regex_backend(profile) for label,profile in m['profiles'].items()}
     artifacts.require(not out.exists(), 'fresh result directory required'); out.mkdir(parents=True)
     source=bundle/'source'; commands=[]
     suites={label:artifacts.test_suite(profile) for label,profile in m['profiles'].items()}
     result=dict(completed=False,commit=m['commit'],run_id=m['run_id'],target=m['target'],profiles=list(m['profiles']),
-                suites=suites,
+                suites=suites,regex_backends=backends,
                 started_utc=datetime.now(timezone.utc).isoformat(),compilers_invoked=False,commands=commands,
                 scope='Five C suites, shared domain fixture, service integration suite, 18 nft CLI grammar/failure checks and CLI smoke per current profile. Archived legacy bundles retain their 15 nft CLI checks and plan integrations. No real kernel NFT writes or performance/stability proof.')
 
@@ -52,7 +61,7 @@ def main():
             unit_tests=('dns_test','cache_domain_test','fixed_config_test','fixed_engine_test','nft_netlink_test') if fixed else ('dns_test','cache_domain_test','engine_test','plan_regression_test','nft_netlink_test')
             for t in unit_tests:
                 run(label+'-'+t,[tests[t]],env)
-            run(label+'-domain',[sys.executable,source/'c/tests/domain_fixture.py',tests['domain_driver']],env)
+            run(label+'-domain',domain_fixture_command(source,tests['domain_driver'],profile),env)
             integration='fixed_integration.py' if fixed else 'integration.py'
             run(label+'-integration',[sys.executable,source/'c/tests'/integration,app],env)
             if not fixed:

@@ -16,6 +16,7 @@
 默认读取 [config.conf](config.conf)。`check` 现在会加载全部 CN 规则文件并编译 regexp，不打开 listener、不查询上游、不写 nft；规则文件缺失也会失败。相对路径基于进程工作目录或 `-d` 指定目录。
 
 - [完整配置与迁移契约](docs/fixed-splitter.md)：全部键、限制、固定路由、缓存/nft 语义及部署前检查
+- [集成优化与验收记录](docs/integrated-validation-20261010.md)：可选 POSIX-lite、`-Os`/LTO、OpenWrt 动态包及各自测试边界
 - [C 运行与验证说明](c/README.md)：依赖、服务限制、CI 和历史验证边界
 - [本次本地验证](docs/specialized-validation-20261009.md) 与 [同机体积对照](docs/specialized-size.md)：通过项、限制和复现依据
 - [构建依赖边界](docs/build-dependencies.md)与[专用实现体积证据](docs/specialized-size.md)：移除的运行时依赖及本次测量范围
@@ -39,11 +40,13 @@ python3 scripts/migrate-site-config.py docs/go-profiles-site-only.yaml -o /tmp/s
 | Linux ARM64 static | 固定 Zig 0.14.1、PCRE2 10.48，静态 musl 程序和全部测试程序 |
 | Linux x86_64 static | 同样固定依赖的静态 musl 程序和全部测试程序 |
 
+同一工作流还显式构建并验证 POSIX-lite：native/sanitizer 覆盖 macOS ARM64 和 Linux x86_64，静态 musl 覆盖 Linux ARM64/x86_64。它们分别保存在 `experimental-lite-*` Actions 产物中，并在 manifest 内记录 backend；默认产物仍为 PCRE2，lite 不进入现有自动 release。OpenWrt APK 另走 [SDK 实验流程](packaging/openwrt/README.md)。
+
 main 分支的四个编译/测试 job 成功后，delivery job 会生成 `ci-<commit>-run<id>-attempt<n>` 预发布版本。四个同源 `.tar.gz` 下载包与 `SHA256SUMS` 可以直接从 GitHub Releases 下载，无需 Actions 登录；它们保留 Actions 包内同一份文件。
 
 每包绑定 commit、run ID/attempt、完整 Git 源码树及逐文件 SHA256。独立保留 CI 测试日志。默认本地工作流不调用 C 编译器，只有用户明确授权时例外；常规本机测试直接运行下载的程序。
 
-Linux static 包还在 `builds/static/size/` 保存 `mosdns-c.unstripped`、`mosdns-c.map`、`mosdns-c.mapped` 和 `attribution.json`。正常发布的 `builds/static/mosdns-c` 仍按原参数剥离；CI 用同一条 LLD 链接命令额外生成 map，并要求带 map 的已剥离文件与发布文件 SHA256 完全相同。JSON 按真正保留下来的输入节区统计项目代码、PCRE2 和 musl/启动/编译器支持；当前产物不编译或链接 libyaml，历史产物归因仍保留其原分类，并单列合并常量、链接器生成内容及对齐/文件元数据；`bss_bytes` 是内存节区，不计入磁盘文件。未剥离 ELF 另供符号检查，不能假定其代码字节与使用 `-s` 的发布链接完全相同。
+Linux static 包还在 `builds/static/size/` 保存 `mosdns-c.unstripped`、`mosdns-c.map`、`mosdns-c.mapped` 和 `attribution.json`。正常发布的 `builds/static/mosdns-c` 仍按原参数剥离；CI 用同一条 LLD 链接命令额外生成 map，并要求带 map 的已剥离文件与发布文件 SHA256 完全相同。应用、固定 PCRE2 依赖和测试使用 `-Os -flto`，仍保留静态 musl、原 stack 与 unwind 策略。JSON 按真正保留下来的输入节区计数：LTO 合并的项目、PCRE2 及 runtime 输入列为 `mixed_lto`，不硬拆为各自字节；依赖配置、精确链接输入和诊断 ELF 符号另行验证。未合并输入及历史非 LTO 产物继续按项目代码、PCRE2 和 musl/启动/编译器支持归类。当前产物不编译或链接 libyaml，历史产物归因仍保留其原分类，并单列合并常量、链接器生成内容及对齐/文件元数据；`bss_bytes` 是内存节区，不计入磁盘文件。未剥离 ELF 另供符号检查，不能假定其代码字节与使用 `-s` 的发布链接完全相同。
 
 ## 下载后的完整本地校验
 

@@ -1,8 +1,13 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+#ifndef MD_REGEX_POSIX
 #define PCRE2_CODE_UNIT_WIDTH 8
+#endif
 /* 用人为指定的单调秒数验证 TTL，不依赖真实等待；同时覆盖域名和 nft 参数解析。 */
 #include "mosdns.h"
+#ifndef MD_REGEX_POSIX
 #include <pcre2.h>
+#endif
+#include <locale.h>
 #include <assert.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -137,6 +142,8 @@ static void concurrency_tests(void) {
     md_cache_free(c);
 }
 
+/* Keep the complete PCRE2 contract when building the default backend. */
+#ifndef MD_REGEX_POSIX
 /* 检查依赖实际关闭 Unicode/JIT，并验证字节模式和必须失败的 Unicode 指令。 */
 static void regex_profile_tests(void) {
     uint32_t enabled = 1;
@@ -182,6 +189,11 @@ static void regex_profile_tests(void) {
     assert(!md_domain_match(d, "\xe4\xb8\xad.bytes"));
     md_domain_free(d);
 }
+
+#include "regex_budget_profile.h"
+#else
+#include "regex_posix_profile.h"
+#endif
 
 /* 固定八条 cn-site 正则的正例、反例和后缀攻击，保护实际规则的锚定语义。 */
 static void direct_list_regex_tests(void) {
@@ -230,6 +242,8 @@ static void direct_list_regex_tests(void) {
     }
 }
 
+#include "regex_concurrency.h"
+
 static void domain_tests(void) {
     char err[MD_ERROR_SIZE]; md_domain *d = md_domain_new(); assert(d);
     const char *rules[] = {"domain:EXAMPLE.com.", "full:only.test", "keyword:needle", "regexp:^asset-[0-9]+\\.test$", ":default.test"};
@@ -275,6 +289,9 @@ static void nft_tests(void) {
     for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); ++i) assert(!md_nft_new(bad[i], err));
 }
 int main(void) {
-    regex_profile_tests(); direct_list_regex_tests(); domain_tests(); cache_tests(); concurrency_tests(); nft_tests();
+#ifndef MD_REGEX_POSIX
+    regex_budget_tests();
+#endif
+    regex_profile_tests(); direct_list_regex_tests(); regex_concurrency_tests(); domain_tests(); cache_tests(); concurrency_tests(); nft_tests();
     puts("domain/cache/nftset parser tests passed"); return 0;
 }

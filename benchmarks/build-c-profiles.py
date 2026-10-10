@@ -20,6 +20,10 @@ import tarfile
 from datetime import datetime, timezone
 
 
+# Compile and link with LTO together; keep unwind/debug policy unchanged.
+OPTFLAGS = ["-Os", "-flto", "-ffunction-sections", "-fdata-sections"]
+STATIC_LDFLAGS = ["-flto", "-static", "-Wl,--gc-sections", "-Wl,-s", "-Wl,-z,stack-size=1048576"]
+
 # One explicit dependency contract for native CI and static release profiles.
 PCRE2_SHA256 = "ebcc25aadf2a51fa1fefa9b8bc9e7a79b3dae86870a0f1152a22e42befd46888"
 PCRE2_CONFIGURE_OPTIONS = [
@@ -32,7 +36,7 @@ PCRE2_CONFIGURE_OPTIONS = [
 # Copy support modules as well as selected runners so this tree is standalone.
 STANDALONE_TEST_FILES = (
     "c/tests/domain_fixture.py", "c/tests/fixed_integration.py", "c/tests/integration.py",
-    "c/tests/nft_cli_test.py", "tests/fixtures/matcher_domain.json",
+    "c/tests/nft_cli_test.py", "c/plugin/nftset.c", "tests/fixtures/matcher_domain.json",
 )
 
 
@@ -170,6 +174,39 @@ def unstripped_lld_args(release_args, output):
     return args
 
 
+def verify_pcre2_config(config):
+    """Validate the configured dependency, including when LTO hides provenance."""
+    if not re.search(r"^#define SUPPORT_PCRE2_8\b", config, re.M):
+        raise BuildError("PCRE2 8-bit support was not enabled")
+    for feature in ("SUPPORT_JIT", "SUPPORT_UNICODE", "SUPPORT_PCRE2_16", "SUPPORT_PCRE2_32"):
+        if re.search(r"^#define " + feature + r"\b", config, re.M):
+            raise BuildError("unexpected PCRE2 feature: " + feature)
+
+
+def verify_backend_link(lld_args, pcre_lib, symbols, backend):
+    """Check exact dependency inputs and final symbols, never LLVM bitcode via readelf."""
+    if backend not in ("pcre2", "posix-lite"):
+        raise BuildError("unknown regex backend")
+    pcre_inputs = [arg for arg in lld_args if "pcre2" in Path(arg).name]
+    expected = [str(pcre_lib)] if backend == "pcre2" else []
+    if pcre_inputs != expected:
+        raise BuildError("unexpected PCRE2 link inputs: " + repr(pcre_inputs))
+    if any("libyaml" in Path(arg).name for arg in lld_args):
+        raise BuildError("unexpected libyaml link input")
+    names = set(re.findall(r"\b(_?pcre2_[A-Za-z0-9_]+)\b", symbols))
+    if backend == "pcre2":
+        # LTO may inline public entry points, including pcre2_match_8.
+        # Require retained PCRE2 symbols plus the exact verified archive input;
+        # executable domain tests establish compile/match behavior separately.
+        if not names:
+            raise BuildError("PCRE2 implementation absent from diagnostic ELF")
+    elif names:
+        raise BuildError("posix-lite diagnostic ELF unexpectedly contains PCRE2")
+    return {"backend": backend, "pcre2_link_inputs": pcre_inputs,
+            "pcre2_symbols_in_diagnostic": bool(names), "retained_pcre2_symbols": sorted(names),
+            "method": "Exact release LLD inputs and unstripped replay symbols; valid for LTO objects"}
+
+
 # GitHub 静态交叉构建入口；创建新目录并保存成功/失败记录，不运行目标程序。
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -244,9 +281,10 @@ def main():
             wrapper = wrappers / name
             wrapper.write_text("#!/bin/sh\nexec " + " ".join(shlex.quote(str(v)) for v in [args.zig] + suffix) + ' "$@"\n')
             wrapper.chmod(0o755)
-        flags = ["-O2", "-ffunction-sections", "-fdata-sections"]
+        flags = OPTFLAGS.copy()
         manifest["build"] = {"compiler": {"path": str(args.zig), **record(args.zig)},
-                              "flags": flags + ["-UNDEBUG", "-std=c11", "-pthread", "-static", "-Wl,--gc-sections", "-Wl,-s", "-Wl,-z,stack-size=1048576"],
+                              "flags": flags + ["-UNDEBUG", "-std=c11", "-pthread"] + STATIC_LDFLAGS,
+                              "compile_flags": flags, "link_flags": STATIC_LDFLAGS,
                               "pcre2_options": ["8-bit", "Unicode disabled", "JIT disabled", "static"],
                               "application_workers": "runtime --cpu; planned tests use --cpu 2",
                               "stack_size_reason": "1 MiB ELF default thread stack: regression mock threads hold two 65 KiB DNS packets; musl default stack may be too small."}
@@ -260,6 +298,9 @@ def main():
                      "CFLAGS=" + " ".join(flags)]
         manifest["commands"].append(command(configure, pcre_build, env, logs / "pcre2-configure.log"))
         manifest["commands"].append(command(["make", "-j" + str(args.jobs), "libpcre2-8.la"], pcre_build, env, logs / "pcre2-build.log"))
+        verify_pcre2_config((pcre_build / "src/config.h").read_text())
+        manifest["pcre2"]["config_header"] = record(pcre_build / "src/config.h")
+        manifest["pcre2"]["profile_verified"] = "8-bit only, Unicode disabled, JIT disabled"
         pcre_lib = pcre_build / ".libs/libpcre2-8.a"
         manifest["pcre2"]["static_library"] = {"path": str(pcre_lib), **record(pcre_lib)}
         c_root = frozen / "c"
@@ -285,7 +326,7 @@ def main():
                 manifest["commands"].append(item)
         lib = work / "libmosdns-c.a"
         manifest["commands"].append(command([str(args.zig), "ar", "rcs", str(lib)] + [str(objects[v]) for v in libsrc], work, env, logs / "archive.log"))
-        ldflags = ["-static", "-Wl,--gc-sections", "-Wl,-s", "-Wl,-z,stack-size=1048576"]
+        ldflags = STATIC_LDFLAGS.copy()
         app = out / "mosdns-c"
         verbose_env = env.copy()
         verbose_env["ZIG_VERBOSE_LINK"] = "1"
@@ -315,6 +356,10 @@ def main():
         diagnostic_args = unstripped_lld_args(lld_args, diagnostic)
         manifest["commands"].append(command([str(args.zig), "ld.lld"] + diagnostic_args,
                                             work, env, logs / "link-app-diagnostic.log"))
+        symbol_log = logs / "diagnostic-symbols.log"
+        manifest["commands"].append(command(["readelf", "--wide", "--symbols", str(diagnostic)],
+                                            work, env, symbol_log))
+        manifest["backend_verification"] = verify_backend_link(lld_args, pcre_lib, symbol_log.read_text(), "pcre2")
         manifest["commands"].append(command(["python3", str(frozen / "benchmarks/size-attribution.py"),
                                              "--release", str(app), "--diagnostic", str(diagnostic),
                                              "--mapped", str(mapped), "--map", str(link_map),

@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Test the no-Unicode PCRE2 contract and the shared ASCII fixture subset."""
+"""Test the selected regex contract and the shared ASCII fixture subset."""
+import argparse
 import json
 from pathlib import Path
 import subprocess
-import sys
 import tempfile
 
-driver = str(Path(sys.argv[1]).resolve())
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("driver")
+parser.add_argument("--backend", choices=("pcre2", "posix-lite"), default="pcre2")
+args = parser.parse_args()
+driver = str(Path(args.driver).resolve())
+posix = args.backend == "posix-lite"
 fixture = json.loads((Path(__file__).resolve().parents[2] /
                       "tests/fixtures/matcher_domain.json").read_text())
 assert fixture["format_version"] == 1
@@ -75,8 +80,28 @@ ascii_cases = [
     (r"regexp:\bexample\b", [("example.com", True), ("prefixexample.com", False), ("a-example.test", True)]),
     (r"regexp:^..\.bytes$", [("ab.bytes", True), ("a.bytes", False), ("é.bytes", True), ("中.bytes", False)]),
 ]
+# These remain tests, not skips: the lite profile must reject the four PCRE2
+# syntaxes and must fail closed for a non-ASCII subject even when dot would match.
+intentional_lite_rejections = {
+    r"regexp:^\Qliteral[a].quoted\E$": "PCRE2 quoted literals are unsupported",
+    r"regexp:^\141\.octal$": "octal escapes are unsupported",
+    r"regexp:^[\d]+\.class$": "backslash escapes inside bracket classes are unsupported",
+    r"regexp:\bexample\b": "word-boundary assertions are unsupported",
+}
 profile_checks = 0
 for rule, expected in ascii_cases:
+    if posix and rule in intentional_lite_rejections:
+        state, results = run("# explicit lite difference\nfull:before.test\n\n" + rule + "\nfull:after.test\n",
+                             [{"domain": "before.test"}, {"domain": "after.test"}])
+        assert state.startswith("error:") and "line 4:" in state and "invalid POSIX-lite regexp at " in state, (rule, state)
+        assert results == ["1", "0"], (rule, results)
+        profile_checks += 3
+        print(f"EXPECTED LITE REJECTION {rule}: {intentional_lite_rejections[rule]}")
+        continue
+    if posix and rule == r"regexp:^..\.bytes$":
+        expected = [(domain, False if domain == "é.bytes" else matches)
+                    for domain, matches in expected]
+        print("EXPECTED LITE DIFFERENCE ^..\\.bytes$: non-ASCII subjects fail closed")
     state, results = run(rule + "\n", [{"domain": domain} for domain, _ in expected])
     assert state == "ok", (rule, state)
     for (domain, matches), actual in zip(expected, results):
@@ -89,8 +114,8 @@ unsupported = [r"regexp:(*UTF)^example\.test$", r"regexp:(*UCP)^example\.test$",
 for rule in unsupported:
     state, results = run("# profile rejection\nfull:before.test\n\n" + rule + "\nfull:after.test\n",
                          [{"domain": "before.test"}, {"domain": "after.test"}])
-    assert state.startswith("error:") and "line 4:" in state and "invalid PCRE2 regexp at " in state, (rule, state)
+    assert state.startswith("error:") and "line 4:" in state and ("invalid POSIX-lite regexp at " if posix else "invalid PCRE2 regexp at ") in state, (rule, state)
     assert results == ["1", "0"], (rule, results)
     profile_checks += 3
-print(f"no-Unicode PCRE2 profile: {len(ascii_cases)} byte/ASCII cases and "
+print(f"{'POSIX-lite' if posix else 'no-Unicode PCRE2'} profile: {len(ascii_cases)} byte/ASCII cases and "
       f"{len(unsupported)} required Unicode rejections / {profile_checks} assertions passed")

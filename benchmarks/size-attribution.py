@@ -16,7 +16,7 @@ YAML_MEMBERS = {f"{name}.c.o" for name in
                 ("api", "dumper", "emitter", "loader", "parser", "reader", "scanner", "writer")}
 PROJECT_MEMBERS = {f"{name}.c.o" for name in
                    ("engine", "dns", "upstream", "domain", "util", "cache", "nftset")}
-CATEGORIES = ("project", "libyaml", "pcre2", "musl_startup_compiler", "shared_merged_constants", "linker_generated",
+CATEGORIES = ("mixed_lto", "project", "libyaml", "pcre2", "musl_startup_compiler", "shared_merged_constants", "linker_generated",
               "alignment_metadata", "unattributed")
 MAP_ROW = re.compile(r"^\s*([0-9a-fA-F]+)\s+([0-9a-fA-F]+)\s+([0-9a-fA-F]+)\s+(\d+)\s+(\S.*)$")
 INPUT_ROW = re.compile(r"^(.*):\(([^()]*)\)$")
@@ -66,6 +66,8 @@ def elf_sections(path):
 
 # 仅按已知链接输入分类；合并常量和未知输入单列，避免强行归属给项目代码。
 def category(source, input_section=""):
+    if source.endswith(".lto.o"):
+        return "mixed_lto"
     if source.startswith("<internal>"):
         if input_section.startswith((".rodata.str", ".rodata.cst")):
             return "shared_merged_constants"
@@ -170,8 +172,8 @@ def analyze(release_path, debug_path, mapped_path, map_path):
         output_sections.append(dict(name=name, type="bss" if section["type"] == 8 else "file",
                                     bytes=section["size"], categories=per_category,
                                     map_input_rows=len(rows[name])))
-    if disk["project"] == 0 or disk["pcre2"] == 0 or not rows:
-        raise ValueError("LLD map did not identify project and PCRE2 input sections")
+    if not rows or (not disk["mixed_lto"] and (not disk["project"] or not disk["pcre2"])):
+        raise ValueError("LLD map did not identify project/PCRE2 or merged LTO sections")
     loadable_file_bytes = sum(s["size"] for s in release["sections"].values()
                               if s["flags"] & 2 and s["type"] != 8)
     # 磁盘归因覆盖整个 ELF 文件，节表、文件头和对齐余量作为单独开销。
@@ -190,7 +192,7 @@ def analyze(release_path, debug_path, mapped_path, map_path):
                                 map_sha256=sha256(map_path.read_bytes())),
                 methods=dict(disk="retained LLD map input ranges in SHF_ALLOC file-backed ELF sections; gaps and non-section bytes separate",
                              bss="retained LLD map input ranges in SHF_ALLOC SHT_NOBITS sections; not disk bytes",
-                             caveat="map replay is byte-identical to release; unstripped ELF may differ in contents despite equal allocated section shapes; pooled constants, inlining, linker synthesis and padding limit semantic ownership"),
+                             caveat="map replay is byte-identical to release; unstripped ELF may differ in contents despite equal allocated section shapes; LTO inputs combine project, dependencies and runtime under mixed_lto, without claiming separate byte ownership; dependency identity is verified separately by the builder; pooled constants, inlining, linker synthesis and padding limit semantic ownership"),
                 disk_bytes=disk, bss_bytes=bss, loadable_file_section_bytes=loadable_file_bytes,
                 non_section_file_bytes=overhead, sections=output_sections,
                 linked_inputs=[dict(source=source, category=cat, **value)
