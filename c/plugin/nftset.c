@@ -37,16 +37,21 @@ typedef struct {
     bool enabled;
 } nft_target;
 #ifdef __linux__
+typedef struct nft_fast_state nft_fast_state;
+typedef struct nft_fast_waiter nft_fast_waiter;
 typedef struct nft_waiter { struct nft_waiter *next; } nft_waiter;
 #endif
 struct md_nft {
     nft_target v4, v6;
+    bool fast_enabled;
 #ifdef __linux__
     /* This mutex protects only the FIFO and active token, not nft I/O. */
     pthread_mutex_t lock;
     pthread_cond_t ready;
     nft_waiter *head, *tail;
     bool active;
+    nft_fast_state *fast;
+    nft_fast_waiter *fast_head, *fast_tail;
 #endif
 };
 /* 表名、集合名只接受有限 ASCII 标识符，随后可直接作为 nft 的 token。
@@ -465,6 +470,17 @@ static int add_target(const char *binary, const nft_target *t, const md_packet *
 }
 #endif
 
+#ifdef __linux__
+#include "nft_fast.h"
+#endif
+int md_nft_enable_fast(md_nft *n, char *err) {
+    if (!n || (!n->v4.enabled && !n->v6.enabled) ||
+        (n->v4.enabled && n->v4.mask != 32) || (n->v6.enabled && n->v6.mask != 128)) {
+        snprintf(err, MD_ERROR_SIZE, "fast nftset requires full-address /32 and /128 targets"); return -1;
+    }
+    n->fast_enabled = true; return 0;
+}
+
 /* IPv4 后 IPv6 共用排队与 I/O 的 5 秒预算；第一个失败立即返回。
  * 两种地址目标之间没有统一事务，IPv6 失败不会回滚已完成的 IPv4 写入。
  * 无论哪条路径出错，取得的串行令牌都由 leave 释放。 */
@@ -473,6 +489,7 @@ int md_nft_apply(md_nft *n, const md_packet *r, char *err) {
 #ifndef __linux__
     snprintf(err, MD_ERROR_SIZE, "nftset execution is supported only on Linux"); return -1;
 #else
+    if (n->fast_enabled) return nft_fast_apply(n, r, err);
     const char *binary = nft_binary();
     if (!binary) { snprintf(err, MD_ERROR_SIZE, "nftset requires nft in /usr/sbin, /sbin, /usr/bin or /bin"); return -1; }
     uint64_t until = milliseconds() + 5000;
@@ -488,6 +505,7 @@ int md_nft_apply(md_nft *n, const md_packet *r, char *err) {
 void md_nft_free(md_nft *n) {
     if (!n) return;
 #ifdef __linux__
+    nft_fast_free(n->fast);
     pthread_cond_destroy(&n->ready); pthread_mutex_destroy(&n->lock);
 #endif
     free(n);

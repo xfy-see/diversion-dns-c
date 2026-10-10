@@ -60,7 +60,7 @@ static void basic_contract(void) {
     accept_config("cache_size=10000000\ncache_lazy_ttl=4294967295\ncn_mark=0xffffffff\nforeign_mark=4294967295\ncn_concurrent=3\nforeign_concurrent=3\n");
     accept_config("cn_mark=0\nforeign_mark=0x0\ncn_concurrent=1\nforeign_concurrent=1\ntcp_idle_timeout=1\n");
     accept_config("cn_interface=eth0.100\nforeign_interface=wg-test_0\n");
-    accept_config("nftset_ipv4=inet,dns,cn4,ipv4_addr,32\nnftset_ipv6=inet,dns,cn6,ipv6_addr,128\n");
+    accept_config("nftset_fast=1\nnftset_ipv4=inet,dns,cn4,ipv4_addr,32\nnftset_ipv6=inet,dns,cn6,ipv6_addr,128\n");
     accept_config("nftset_ipv4=ip,dns,cn4,ipv4_addr,1\nnftset_ipv6=ip6,dns,cn6,ipv6_addr,1\n");
     accept_config("cn_upstream=tcp://[::1]:5353\nforeign_upstream=udp://127.0.0.1:5353\n");
     /* Final newline is optional and CRLF is accepted. */
@@ -85,6 +85,7 @@ static void malformed_contract(void) {
         "cn_concurrent=0\n", "cn_concurrent=4\n", "foreign_concurrent=-1\n", "foreign_concurrent=4294967296\n",
         "tcp_idle_timeout=0\n", "tcp_idle_timeout=86401\n", "tcp_idle_timeout=-1\n",
         "cn_interface=eth/0\n", "foreign_interface=eth\\0\n", "cn_interface=eth 0\n", "foreign_interface=eth\t0\n", "cn_interface=eth\0010\n",
+        "nftset_fast=1\n", "nftset_fast=2\n", "nftset_fast=1\nnftset_ipv4=inet,t,s,ipv4_addr,24\n",
         "cache_size=10 # inline comments are not supported\n", "cache_size='10'\n", "cache_size=\"10\"\n", "cache_size=${CACHE_SIZE}\n",
         "listen_udp=localhost:53\n", "listen_tcp=127.0.0.1:65536\n", "listen_udp=udp://127.0.0.1:53\n",
         "cn_upstream=https://1.1.1.1/dns-query\n", "foreign_upstream=tls://1.1.1.1\n", "cn_upstream=resolver.test\n", "cn_upstream=127.0.0.1:0\n",

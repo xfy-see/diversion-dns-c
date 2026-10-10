@@ -70,7 +70,7 @@ def main():
             if label=='asan': argv.append('--sanitize')
             run(label+'-nft-cli',argv,env)
             nft=json.loads((out/(label+'-nft/result.json')).read_text())
-            artifacts.require(nft['ok'] and nft['count']==(18 if fixed else 15) and not nft['commands'],
+            artifacts.require(nft['ok'] and nft['count']==((30 if (source/'c/plugin/nft_fast.h').exists() else 18) if fixed else 15) and not nft['commands'],
                               'nft test count differs or unexpectedly compiled')
             run(label+'-version',[app,'version'],env)
             example='minimal.conf' if fixed else 'minimal.yaml'

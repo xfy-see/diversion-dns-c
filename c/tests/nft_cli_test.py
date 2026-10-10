@@ -157,6 +157,18 @@ def main():
     case('update-nonzero-exit',interval=True,expected_rc=4,failure='nonzero-exit')
     case('reject-malformed-metadata',expected_rc=4,failure='malformed-metadata')
     case('update-bounded-timeout',interval=True,expected_rc=4,failure='timeout')
+    # Fast mode uses only fake netlink. Repeated requests verify successful ACK
+    # dedup, expiration renewal, reset recovery and strict metadata/error handling.
+    for mode, expected_batches, expected_rc in [('fast-dedup',1,0),('fast-reset',2,0),('fast-renew',2,0),('fast-existing',1,0),('fast-interval',0,4),('fast-error',1,4)]:
+        for kind in ('ipv4','ipv6'):
+            local_env=env|{'FAKE_MODE':mode,'NFT_TEST_LOG':str(out/(mode+'-'+kind+'.unexpected-cli'))}
+            result=subprocess.run([str(driver),str(child),kind,'diag','learn'],capture_output=True,text=True,timeout=8,env=local_env)
+            (out/(mode+'-'+kind+'.stdout')).write_text(result.stdout);(out/(mode+'-'+kind+'.stderr')).write_text(result.stderr)
+            assert result.returncode==expected_rc,(mode,kind,result.stdout,result.stderr)
+            stats=json.loads(result.stdout.splitlines()[0]);assert stats['batches']==expected_batches,(mode,kind,stats)
+            assert stats['opens']==stats['closes']==1,(mode,kind,stats)
+            assert not Path(local_env['NFT_TEST_LOG']).exists(),'fast path invoked CLI'
+            checks.append({'label':mode+'-'+kind,'exit':expected_rc,'calls':0,'passed':True,'device_or_kernel_evidence':False})
     if args.old_source:
         old = out/'nft-cli-driver-before-fix';compile(old,args.old_source)
         case('observed-quoted-argv-regression',binary=old,expected_rc=4)

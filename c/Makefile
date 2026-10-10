@@ -64,7 +64,7 @@ $(BUILD)/tests/cache_domain_test: tests/regex_posix_profile.h tests/regex_concur
 ifeq ($(shell uname -s),Darwin)
 $(BUILD)/tests/nft_cli_driver: CPPFLAGS += -Itests/nft_uapi
 endif
-$(BUILD)/tests/nft_cli_driver: tests/nft_cli_driver.c pkg/dns.c plugin/nftset.c include/mosdns.h include/nft_netlink.h | check-backend
+$(BUILD)/tests/nft_cli_driver: tests/nft_cli_driver.c pkg/dns.c plugin/nftset.c plugin/nft_fast.h include/mosdns.h include/nft_netlink.h | check-backend
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) tests/nft_cli_driver.c pkg/dns.c -pthread $(EXTRA_LDLIBS) -o $@
 unit: $(addprefix $(BUILD)/tests/,$(TESTS) $(DRIVERS))

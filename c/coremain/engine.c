@@ -19,12 +19,12 @@
 typedef enum {
     LISTEN_UDP, LISTEN_TCP, CN_FILE, CN_UPSTREAM, FOREIGN_UPSTREAM,
     CACHE_SIZE, CACHE_LAZY, CN_MARK, FOREIGN_MARK, CN_INTERFACE, FOREIGN_INTERFACE,
-    CN_CONCURRENT, FOREIGN_CONCURRENT, TCP_IDLE, NFT4, NFT6, KEY_COUNT
+    CN_CONCURRENT, FOREIGN_CONCURRENT, TCP_IDLE, NFT4, NFT6, NFT_FAST, KEY_COUNT
 } config_key;
 static const char *const key_names[KEY_COUNT] = {
     "listen_udp", "listen_tcp", "cn_domain_file", "cn_upstream", "foreign_upstream",
     "cache_size", "cache_lazy_ttl", "cn_mark", "foreign_mark", "cn_interface", "foreign_interface",
-    "cn_concurrent", "foreign_concurrent", "tcp_idle_timeout", "nftset_ipv4", "nftset_ipv6"
+    "cn_concurrent", "foreign_concurrent", "tcp_idle_timeout", "nftset_ipv4", "nftset_ipv6", "nftset_fast"
 };
 typedef struct { char *text; size_t line; } config_value;
 typedef struct { config_value values[CONFIG_LIST_MAX]; size_t count; } config_values;
@@ -241,6 +241,10 @@ static int build_config(md_engine *e, const config *c, const char *path, char *e
         strcat(nft, value(c, k));
     }
     if (*nft && !(e->nft = md_nft_new(nft, err))) return config_error(err, path, key_line(c, NFT4), err);
+    uint32_t fast;
+    if (config_number(c, NFT_FAST, 0, 0, 1, false, &fast, path, err)) return -1;
+    if (fast && (!e->nft || md_nft_enable_fast(e->nft, err)))
+        return config_error(err, path, key_line(c, NFT_FAST), e->nft ? err : "nftset_fast requires a target");
     e->cn = md_domain_new();
     if (!e->cn) return config_error(err, path, key_line(c, CN_FILE), "out of memory");
     /* check reads actual rule files and compiles PCRE2, but never opens a

@@ -140,3 +140,11 @@ The default remains PCRE2 without Unicode/JIT. An experimental libc ERE
 backend can be selected with `REGEX_BACKEND=posix-lite`; its deliberately
 restricted syntax and printable-ASCII subject contract are documented in
 [REGEX-POSIX-LITE.md](REGEX-POSIX-LITE.md). It is not a drop-in PCRE2 replacement.
+
+## Optional plain-set fast path
+
+`nftset_fast=1` requires /32 IPv4 and /128 IPv6 targets in pre-existing **plain timeout sets** (flags timeout only, address types ipv4_addr / ipv6_addr). It makes no subprocess calls and does not create sets or rules. Keep static CN-IP prefixes in separate interval sets. The default remains the compatible interval/CLI implementation.
+
+The fast writer batches queued queries (up to 32), merges duplicate answer addresses, and waits for every kernel ACK before DNS success. Each cohort checks ruleset generation; external reload/flush invalidates metadata and address caches. Misses read existing expiration so a short-lived name does not shorten a shared address's longer-lived mapping. Updates explicitly refresh timeout and expiration; Linux 6.12 is the deployment baseline. TTL plus five seconds is installed, with conservative cache-hit slack. A 2048-slot direct-mapped cache per family is bounded; collisions cause safe kernel readback. State allocation is lazy and below 0.7 MiB per configured instance. Missing/wrong sets, generation races, malformed ACKs and timeouts fail the cohort and reset its socket/cache; there is no CLI fallback or premature successful answer. A firewall change immediately after the final check is inherently outside the transaction; re-query after reload repairs cached answers.
+
+Route lookups must include both static CN-IP and dynamic DNS-learned sets. Do not remove dnsmasq learning until these lookups and C writes have passed real A/AAAA, first-connection, reload and rollback tests.

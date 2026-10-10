@@ -51,9 +51,13 @@ NFT_CASES = {
        "hyphen-first", "quote", "semicolon", "slash", "backslash", "too-long")},
     "update-nonzero-exit": (4, 2), "reject-malformed-metadata": (4, 1),
     "update-bounded-timeout": (4, 2),
+    **{mode + "-" + family: (code, 0) for mode, code in
+       (("fast-dedup", 0), ("fast-reset", 0), ("fast-renew", 0),
+        ("fast-existing", 0), ("fast-interval", 4), ("fast-error", 4))
+       for family in ("ipv4", "ipv6")},
 }
 TEST_COUNTS = {"final_apk_loopback_integration": 12, "netlink_mock_assertions": 157,
-               "nft_cli_checks": 18, "regex_concurrent_matches": 43200,
+               "nft_cli_checks": 30, "regex_concurrent_matches": 43200,
                "portable_regex_comparisons": 81089, "unexpected_regex_differences": 0,
                "known_budget_differences": 2}
 LIMITATIONS = (__doc__.split("The APK container", 1)[1].strip())
@@ -263,10 +267,10 @@ def verify_tests(files, state, source, commands, logs):
             and integration.endswith("\nOK\n") and not re.search(r"(?m)^(?:FAILED|ERROR|FAIL|SKIPPED|OK \()", integration),
             "final APK integration corpus failed, skipped or differs")
     nft = json_value(files["nft-cli/result.json"], "nft-cli/result.json")
-    require(nft["ok"] is True and nft["count"] == 18 and nft["sanitized"] is False
+    require(nft["ok"] is True and nft["count"] == 30 and nft["sanitized"] is False
             and nft["device_or_kernel_evidence"] is False and nft["commands"] == []
             and nft["source_sha256"] == sha256(source["c/plugin/nftset.c"]), "nft CLI source/scope differs")
-    require(len(nft["checks"]) == 18 and {row["label"] for row in nft["checks"]} == set(NFT_CASES), "nft CLI cases differ")
+    require(len(nft["checks"]) == 30 and {row["label"] for row in nft["checks"]} == set(NFT_CASES), "nft CLI cases differ")
     for row in nft["checks"]:
         name = row["label"]
         require(row["passed"] is True and (row["exit"], row["calls"]) == NFT_CASES[name], "failed nft CLI check: " + name)
@@ -274,7 +278,7 @@ def verify_tests(files, state, source, commands, logs):
             calls = files["nft-cli/" + name + ".calls.jsonl"].splitlines()
             require(len(calls) == row["calls"] and all(isinstance(json_value(line, name), dict) for line in calls),
                     "nft CLI raw call count differs: " + name)
-    require(json_value(logs["qemu-nft-cli"], "nft CLI log") == {"ok": True, "checks": 18, "sanitized": False, "device_or_kernel_evidence": False},
+    require(json_value(logs["qemu-nft-cli"], "nft CLI log") == {"ok": True, "checks": 30, "sanitized": False, "device_or_kernel_evidence": False},
             "nft CLI log summary differs")
     differential = json_value(files["regex-differential.json"], "regex-differential.json")
     wanted = {"format_version": 1, "production_rules": 8, "production_assertions_per_backend": 72,

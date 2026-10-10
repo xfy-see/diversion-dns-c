@@ -91,6 +91,7 @@ void md_forward_worker_cleanup(void);
  * apply 调用及等待者已经结束。 */
 typedef struct md_nft md_nft;
 md_nft *md_nft_new(const char *args, char *err);
+int md_nft_enable_fast(md_nft *n, char *err);
 int md_nft_apply(md_nft *n, const md_packet *r, char *err);
 void md_nft_free(md_nft *n);
 

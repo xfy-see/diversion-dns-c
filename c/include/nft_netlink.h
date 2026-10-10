@@ -74,17 +74,28 @@ static inline bool md_nl_identifier(const char *s) {
 /* 一个原子 nft 批次包含 begin、分块的 NEWSETELEM 和 end；begin
  * 携带 generation，防止将按旧元数据构建的元素写入已变化的规则集。
  * 参数和缓冲区失败只表示编码失败，调用方不可发送未完成的缓冲区。 */
-static inline int md_nft_nl_batch_encode(uint8_t *out,size_t cap,md_nl_requests *r,uint32_t port,uint32_t seq,uint8_t family,const char *table,const char *set,const uint8_t (*keys)[16],size_t count,unsigned key_bytes,uint32_t generation) {
+static inline int md_nft_nl_batch_timed_encode(uint8_t *out,size_t cap,md_nl_requests *r,uint32_t port,uint32_t seq,uint8_t family,const char *table,const char *set,const uint8_t (*keys)[16],size_t count,unsigned key_bytes,uint32_t generation,const uint64_t *timeouts) {
     if(!out||!r||!port||!seq||seq>UINT32_MAX-MD_NL_MAX_REQUESTS||!generation||!keys||!count||count>MD_NL_MAX_KEYS||(key_bytes!=4&&key_bytes!=16)||(family!=1&&family!=2&&family!=10)||!md_nl_identifier(table)||!md_nl_identifier(set))return -1;
     memset(r,0,sizeof(*r));r->wire=out;r->port=port;md_nl_writer w={out,cap,0};size_t at;uint8_t gen[4];md_nl_be32(gen,generation);
     if(md_nl_message_start(&w,r,16,1,seq++,0,10,&at)||md_nl_attr(&w,1,gen,4))return -1;md_nl_message_end(&w,at);
     for(size_t first=0;first<count;first+=MD_NL_CHUNK_KEYS){
         size_t elements;if(md_nl_message_start(&w,r,0xA0C,0x405,seq++,family,0,&at)||md_nl_attr(&w,1,table,strlen(table)+1)||md_nl_attr(&w,2,set,strlen(set)+1)||md_nl_nested_start(&w,3,&elements))return -1;
         size_t end=first+MD_NL_CHUNK_KEYS;if(end>count)end=count;
-        for(size_t i=first;i<end;++i){size_t elem,key;if(md_nl_nested_start(&w,1,&elem)||md_nl_nested_start(&w,1,&key)||md_nl_attr(&w,1,keys[i],key_bytes)||md_nl_nested_end(&w,key)||md_nl_nested_end(&w,elem))return -1;}
+        for(size_t i=first;i<end;++i){size_t elem,key;if(md_nl_nested_start(&w,1,&elem)||md_nl_nested_start(&w,1,&key)||md_nl_attr(&w,1,keys[i],key_bytes)||md_nl_nested_end(&w,key))return -1;
+            if(timeouts){uint8_t ttl[8];if(!timeouts[i])return -1;md_nl_be32(ttl,(uint32_t)(timeouts[i]>>32));md_nl_be32(ttl+4,(uint32_t)timeouts[i]);if(md_nl_attr(&w,4,ttl,8)||md_nl_attr(&w,5,ttl,8))return -1;}
+            if(md_nl_nested_end(&w,elem))return -1;}
         if(md_nl_nested_end(&w,elements))return -1;md_nl_message_end(&w,at);
     }
     if(md_nl_message_start(&w,r,17,1,seq,0,10,&at))return -1;md_nl_message_end(&w,at);r->length=w.length;return 0;
+}
+static inline int md_nft_nl_batch_encode(uint8_t *out,size_t cap,md_nl_requests *r,uint32_t port,uint32_t seq,uint8_t family,const char *table,const char *set,const uint8_t (*keys)[16],size_t count,unsigned key_bytes,uint32_t generation) {
+    return md_nft_nl_batch_timed_encode(out,cap,r,port,seq,family,table,set,keys,count,key_bytes,generation,NULL);
+}
+static inline int md_nft_nl_getset_encode(uint8_t *out,size_t cap,md_nl_requests *r,uint32_t port,uint32_t seq,uint8_t family,const char *table,const char *set) {
+    if(!out||!r||!port||!seq||!md_nl_identifier(table)||!md_nl_identifier(set)||(family!=1&&family!=2&&family!=10))return -1;
+    memset(r,0,sizeof(*r));r->wire=out;r->port=port;md_nl_writer w={out,cap,0};size_t at;
+    if(md_nl_message_start(&w,r,0xA0A,1,seq,family,0,&at)||md_nl_attr(&w,1,table,strlen(table)+1)||md_nl_attr(&w,2,set,strlen(set)+1))return -1;
+    md_nl_message_end(&w,at);r->length=w.length;return 0;
 }
 /* GETGEN requests a reply, not an additional success ACK. */
 static inline int md_nft_nl_getgen_encode(uint8_t *out,size_t cap,md_nl_requests *r,uint32_t port,uint32_t seq) {
@@ -155,5 +166,25 @@ static inline int md_nft_nl_gen_consume(md_nl_requests *r,const uint8_t *p,size_
         p+=md_nl_align(a);len-=md_nl_align(a);
     }
     if(!(seen&2)||!gen)return -1;r->seen[0]=true;*generation=gen;return 0;
+}
+/* GETSET metadata only: never dump elements. Require an ordinary timeout
+ * address set, rejecting interval/map/constant/concatenated sets before writing.
+ * Optional future attributes are length-checked, not interpreted. */
+static inline int md_nft_nl_set_consume(md_nl_requests *r,const uint8_t *p,size_t n,uint8_t family,const char *table,const char *set,unsigned bytes,int *kernel_errno) {
+    if(!r||r->count!=1||!p||n<20||n>MD_NL_BUFFER_SIZE||!kernel_errno||r->seen[0])return -1;
+    *kernel_errno=0;size_t len=md_nl_u32(p);
+    if(len!=n||md_nl_align(len)!=n||md_nl_u32(p+8)!=md_nl_u32(r->wire+8)||md_nl_u32(p+12)!=r->port)return -1;
+    if(md_nl_u16(p+4)==2)return md_nl_ack_one(r,p,len,kernel_errno);
+    if(md_nl_u16(p+4)!=0xA09||md_nl_u16(p+6)||p[16]!=family||p[17])return -1;
+    p+=20;len-=20;unsigned seen=0;
+    while(len){if(len<4)return -1;size_t a=md_nl_u16(p);unsigned t=md_nl_u16(p+2),kind=t&0x3fff;
+        if(a<4||md_nl_align(a)>len||!kind)return -1;
+        if(kind<=5){if(t!=kind||(seen&(1u<<kind)))return -1;seen|=1u<<kind;
+            if(kind<=2){const char *want=kind==1?table:set;size_t z=strlen(want)+1;if(a!=4+z||memcmp(p+4,want,z))return -1;}
+            else {if(a!=8)return -1;uint32_t v=md_nl_read_be32(p+4);if((kind==3&&v!=16)||(kind==4&&v!=(bytes==4?7u:8u))||(kind==5&&v!=bytes))return -1;}
+        }
+        p+=md_nl_align(a);len-=md_nl_align(a);
+    }
+    if(seen!=62)return -1;r->seen[0]=true;return 0;
 }
 #endif

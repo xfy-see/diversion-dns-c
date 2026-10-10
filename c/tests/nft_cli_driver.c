@@ -43,6 +43,8 @@ static int __attribute__((unused)) cli_cond_timedwait(pthread_cond_t *cond, pthr
 #include <linux/netlink.h>
 #include "nft_netlink.h"
 /* 仅替换 netlink 传输和时钟；CLI 子进程仍接收真实参数，便于核验接口边界。 */
+static unsigned fast_gen=7,metadata_reads,element_reads;
+static bool fast_mode(void){const char *m=getenv("FAKE_MODE");return m&&!strncmp(m,"fast-",5);}
 static const int fake_fd=2147483646;
 static uint8_t fake_reply[MD_NL_BUFFER_SIZE];static size_t fake_length;
 static unsigned opens,closes,sends,generations,batches,key_count,post_receive_clocks;static uint64_t late_ms;static bool batch_received;
@@ -58,16 +60,36 @@ static ssize_t __attribute__((unused)) fake_send(int fd,const void *data,size_t 
     assert(fd==fake_fd&&!flags&&size==sizeof(struct sockaddr_nl));const struct sockaddr_nl *k=(const struct sockaddr_nl *)peer;assert(k->nl_family==16&&!k->nl_pid&&!k->nl_groups);++sends;fake_length=0;const uint8_t *p=data;
     if(md_nl_u16(p+4)==0xA10){++generations;assert(n==20&&md_nl_u16(p+6)==1&&md_nl_u32(p+12)==41771);
         if(!strcmp(fake_mode(),"gen-error")){fake_length=fake_ack(p,fake_reply,-EPERM);return (ssize_t)n;}
-        uint32_t gen=!strcmp(fake_mode(),"zero-gen")?0:(!strcmp(fake_mode(),"changed-gen")&&generations==2)?8:7;
+        if(fast_mode()&&!strcmp(fake_mode(),"fast-reset")&&generations==5)++fast_gen;
+        uint32_t gen=fast_mode()?fast_gen:!strcmp(fake_mode(),"zero-gen")?0:(!strcmp(fake_mode(),"changed-gen")&&generations==2)?8:7;
         memset(fake_reply,0,28);md_nl_put32(fake_reply,28);md_nl_put16(fake_reply+4,0xA0F);md_nl_put32(fake_reply+8,md_nl_u32(p+8));md_nl_put32(fake_reply+12,41771);fake_reply[19]=(uint8_t)gen;md_nl_put16(fake_reply+20,8);md_nl_put16(fake_reply+22,1);md_nl_be32(fake_reply+24,gen);fake_length=28;return (ssize_t)n;
+    }
+    if(fast_mode()&&md_nl_u16(p+4)==0xA0A){
+        ++metadata_reads;md_nl_requests q={0};q.port=41771;md_nl_writer w={fake_reply,sizeof(fake_reply),0};size_t at;
+        assert(!md_nl_message_start(&w,&q,0xA09,0,md_nl_u32(p+8),p[16],0,&at));
+        size_t a=20;for(unsigned i=1;i<=2;i++){size_t z=md_nl_u16(p+a);assert(!md_nl_attr(&w,(uint16_t)i,p+a+4,z-4));a+=md_nl_align(z);}
+        uint8_t val[4];md_nl_be32(val,!strcmp(fake_mode(),"fast-interval")?20:16);assert(!md_nl_attr(&w,3,val,4));
+        bool v6=getenv("FAST_V6")!=NULL;md_nl_be32(val,v6?8:7);assert(!md_nl_attr(&w,4,val,4));md_nl_be32(val,v6?16:4);assert(!md_nl_attr(&w,5,val,4));
+        md_nl_message_end(&w,at);fake_length=w.length;return (ssize_t)n;
+    }
+    if(fast_mode()&&md_nl_u16(p+4)==0xA0D){
+        ++element_reads;
+        if(strcmp(fake_mode(),"fast-existing")){fake_length=fake_ack(p,fake_reply,-ENOENT);return (ssize_t)n;}
+        md_nl_requests q={0};q.port=41771;md_nl_writer w={fake_reply,sizeof(fake_reply),0};size_t at,es,el,key;
+        assert(!md_nl_message_start(&w,&q,0xA0C,0,md_nl_u32(p+8),p[16],0,&at));size_t a=20;
+        for(unsigned i=1;i<=2;i++){size_t z=md_nl_u16(p+a);assert(!md_nl_attr(&w,(uint16_t)i,p+a+4,z-4));a+=md_nl_align(z);}
+        unsigned bytes=getenv("FAST_V6")?16:4;const uint8_t *address=p+a+16;
+        assert(!md_nl_nested_start(&w,3,&es)&&!md_nl_nested_start(&w,1,&el)&&!md_nl_nested_start(&w,1,&key)&&!md_nl_attr(&w,1,address,bytes)&&!md_nl_nested_end(&w,key));
+        uint8_t ttl[8]={0};md_nl_be32(ttl+4,300000);assert(!md_nl_attr(&w,5,ttl,8)&&!md_nl_nested_end(&w,el)&&!md_nl_nested_end(&w,es));md_nl_message_end(&w,at);fake_length=w.length;return (ssize_t)n;
     }
     ++batches;size_t off=0;unsigned frames=0;
     while(off<n){const uint8_t *m=p+off;size_t len=md_nl_u32(m);assert(len<=n-off&&len>=20&&md_nl_u32(m+12)==41771);++frames;
-        if(md_nl_u16(m+4)==16){assert(frames==1&&len==28&&md_nl_u16(m+6)==1&&md_nl_read_be32(m+24)==7);}
-        else if(md_nl_u16(m+4)==0xA0C){assert(md_nl_u16(m+6)==0x405);size_t a=20;a+=md_nl_align(md_nl_u16(m+a));a+=md_nl_align(md_nl_u16(m+a));assert(md_nl_u16(m+a+2)==(3|0x8000));size_t end=a+md_nl_u16(m+a);a+=4;while(a<end){++key_count;assert(md_nl_u16(m+a+2)==(1|0x8000)&&md_nl_u16(m+a+6)==(1|0x8000)&&md_nl_u16(m+a+10)==1);a+=md_nl_align(md_nl_u16(m+a));}assert(a==end);fake_length+=fake_ack(m,fake_reply+fake_length,!strcmp(fake_mode(),"ack-error")?-EEXIST:0);}
+        if(md_nl_u16(m+4)==16){assert(frames==1&&len==28&&md_nl_u16(m+6)==1&&md_nl_read_be32(m+24)==(fast_mode()?fast_gen:7u));}
+        else if(md_nl_u16(m+4)==0xA0C){assert(md_nl_u16(m+6)==0x405);size_t a=20;a+=md_nl_align(md_nl_u16(m+a));a+=md_nl_align(md_nl_u16(m+a));assert(md_nl_u16(m+a+2)==(3|0x8000));size_t end=a+md_nl_u16(m+a);a+=4;while(a<end){++key_count;assert(md_nl_u16(m+a+2)==(1|0x8000)&&md_nl_u16(m+a+6)==(1|0x8000)&&md_nl_u16(m+a+10)==1);a+=md_nl_align(md_nl_u16(m+a));}assert(a==end);fake_length+=fake_ack(m,fake_reply+fake_length,(!strcmp(fake_mode(),"ack-error")||!strcmp(fake_mode(),"fast-error"))?-EEXIST:0);}
         else assert(md_nl_u16(m+4)==17&&off+len==n);
         off+=md_nl_align(len);
     }assert(off==n&&frames>=3);
+    if(fast_mode())++fast_gen;
     if(!strcmp(fake_mode(),"wrong-pid"))md_nl_put32(fake_reply+12,1);
     if(!strcmp(fake_mode(),"wrong-seq"))md_nl_put32(fake_reply+8,1);
     if(!strcmp(fake_mode(),"duplicate-ack")){memcpy(fake_reply+fake_length,fake_reply,fake_length);fake_length*=2;}
@@ -109,7 +131,7 @@ int main(int argc, char **argv) {
     if (argc != 5) return 2;
     bool v6 = !strcmp(argv[2], "ipv6"), no_answer = !strcmp(argv[2], "nodata");
     char args[512], error[MD_ERROR_SIZE] = {0};
-    snprintf(args, sizeof(args), "inet,%s,%s,%s,%u", argv[3], argv[4], v6 ? "ipv6_addr" : "ipv4_addr", v6 ? 48u : 24u);
+    snprintf(args, sizeof(args), "inet,%s,%s,%s,%u", argv[3], argv[4], v6 ? "ipv6_addr" : "ipv4_addr", v6 ? (fast_mode()?128u:48u) : (fast_mode()?32u:24u));
     md_nft *n = md_nft_new(args, error);
     if (!n) { fprintf(stderr, "%s\n", error); return 3; }
     md_packet response = {0};
@@ -128,7 +150,13 @@ int main(int argc, char **argv) {
     }
     record(&response, v6 ? 28 : 1, 1, unwanted); /* Authority must not learn. */
     record(&response, v6 ? 28 : 1, 1, unwanted); /* Additional must not learn. */
-    int rc = add_target(argv[1], v6 ? &n->v6 : &n->v4, &response, milliseconds() + 5000, error);
+    int rc;
+    if(fast_mode()){
+        if(v6)setenv("FAST_V6","1",1);
+        assert(!md_nft_enable_fast(n,error));
+        rc=md_nft_apply(n,&response,error);
+        if(!rc){if(!strcmp(fake_mode(),"fast-renew"))md_write32(response.data+19+6,120);rc=md_nft_apply(n,&response,error);}
+    }else rc = add_target(argv[1], v6 ? &n->v6 : &n->v4, &response, milliseconds() + 5000, error);
     md_nft_free(n);
     printf("{\"opens\":%u,\"closes\":%u,\"sends\":%u,\"generations\":%u,\"batches\":%u,\"keys\":%u,\"rc\":%d}\n",opens,closes,sends,generations,batches,key_count,rc);
     if (rc) { fprintf(stderr, "%s\n", error); return 4; }

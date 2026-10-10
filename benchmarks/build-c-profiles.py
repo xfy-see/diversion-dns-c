@@ -36,7 +36,7 @@ PCRE2_CONFIGURE_OPTIONS = [
 # Copy support modules as well as selected runners so this tree is standalone.
 STANDALONE_TEST_FILES = (
     "c/tests/domain_fixture.py", "c/tests/fixed_integration.py", "c/tests/integration.py",
-    "c/tests/nft_cli_test.py", "c/plugin/nftset.c", "tests/fixtures/matcher_domain.json",
+    "c/tests/nft_cli_test.py", "c/plugin/nftset.c", "c/plugin/nft_fast.h", "tests/fixtures/matcher_domain.json",
 )
 
 

@@ -83,7 +83,7 @@ class Evidence:
             "qemu-nft_netlink_test": '{"passed":true,"assertions":157,"sockets_used":false}\n',
             "qemu-domain-fixture": "shared domain fixture: 11 cases / 70 assertions passed; 4 Unicode/RE2-specific cases explicitly skipped with reasons\nPOSIX-lite profile: 7 byte/ASCII cases and 5 required Unicode rejections / 37 assertions passed\n",
             "native-reference-budget-unit": "PCRE2 operational budget: 2 direct MATCHLIMIT(-47) errors verified; bool API returns false\n",
-            "qemu-nft-cli": '{"ok":true,"checks":18,"sanitized":false,"device_or_kernel_evidence":false}\n',
+            "qemu-nft-cli": '{"ok":true,"checks":30,"sanitized":false,"device_or_kernel_evidence":false}\n',
         })
         test_names = verify.re.findall(rb"(?m)^    def (test_[a-z0-9_]+)\(self\):", self.source["c/tests/fixed_integration.py"])
         self.outputs["qemu-final-apk-integration"] = "".join(name.decode() + " (__main__.FixedIntegration." + name.decode() + ") ... ok\n" for name in test_names) + "\nRan 12 tests in 1.234s\n\nOK\n"
@@ -115,7 +115,7 @@ class Evidence:
                       "not_tested": ["router installation", "real kernel nftables", "hardware compatibility", "RSS/QPS", "sustained stability", "actual flash increment"]}
         self.manifest = {"source_commit": self.commit, "recipe_sha256": record(self.source["packaging/openwrt/Makefile"])["sha256"],
                          "source_files_sha256": {n: record(d)["sha256"] for n, d in self.source.items() if n == "LICENSE" or n.startswith("c/")}}
-        self.nft = {"ok": True, "count": 18, "sanitized": False, "device_or_kernel_evidence": False, "commands": [],
+        self.nft = {"ok": True, "count": 30, "sanitized": False, "device_or_kernel_evidence": False, "commands": [],
                     "source_sha256": record(self.source["c/plugin/nftset.c"])["sha256"], "checks": []}
         for name, (code, calls) in verify.NFT_CASES.items():
             self.nft["checks"].append({"label": name, "exit": code, "calls": calls, "passed": True})
