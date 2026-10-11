@@ -19,12 +19,14 @@
 typedef enum {
     LISTEN_UDP, LISTEN_TCP, CN_FILE, CN_UPSTREAM, FOREIGN_UPSTREAM,
     CACHE_SIZE, CACHE_LAZY, CN_MARK, FOREIGN_MARK, CN_INTERFACE, FOREIGN_INTERFACE,
-    CN_CONCURRENT, FOREIGN_CONCURRENT, TCP_IDLE, NFT4, NFT6, NFT_FAST, KEY_COUNT
+    CN_CONCURRENT, FOREIGN_CONCURRENT, TCP_IDLE, NFT4, NFT6, NFT_FAST,
+    QUEUE_TIMEOUT, TCP_READ, TCP_WRITE, TCP_MAX, TCP_MAX_IP, KEY_COUNT
 } config_key;
 static const char *const key_names[KEY_COUNT] = {
     "listen_udp", "listen_tcp", "cn_domain_file", "cn_upstream", "foreign_upstream",
     "cache_size", "cache_lazy_ttl", "cn_mark", "foreign_mark", "cn_interface", "foreign_interface",
-    "cn_concurrent", "foreign_concurrent", "tcp_idle_timeout", "nftset_ipv4", "nftset_ipv6", "nftset_fast"
+    "cn_concurrent", "foreign_concurrent", "tcp_idle_timeout", "nftset_ipv4", "nftset_ipv6", "nftset_fast",
+    "queue_timeout_ms", "tcp_read_timeout", "tcp_write_timeout", "tcp_max_connections", "tcp_max_connections_per_ip"
 };
 typedef struct { char *text; size_t line; } config_value;
 typedef struct { config_value values[CONFIG_LIST_MAX]; size_t count; } config_values;
@@ -37,6 +39,7 @@ struct md_engine {
     md_nft *nft;
     upstream_group upstreams[2]; /* 0 CN, 1 foreign */
     md_listener *listeners; size_t listener_count;
+    md_server_limits limits;
     bool check, stopping;
     pthread_mutex_t lock;
     refresh_job *jobs;
@@ -199,6 +202,15 @@ static int build_listeners(md_engine *e, const config *c, const char *path, char
             e->listeners[n++].entry = 0;
         }
     }
+    /* 排队超过 queue_timeout_ms 的任务不再访问上游；TCP 一帧须在读期限内收完，
+     * 一个回复须在写期限内写完；连接数超限时淘汰最久无活动的空闲连接。 */
+    uint32_t queue, read, write, total, per_ip;
+    if (config_number(c, QUEUE_TIMEOUT, 2000, 0, 60000, false, &queue, path, err) ||
+        config_number(c, TCP_READ, 5, 1, 300, false, &read, path, err) ||
+        config_number(c, TCP_WRITE, 10, 1, 300, false, &write, path, err) ||
+        config_number(c, TCP_MAX, 128, 1, 1024, false, &total, path, err) ||
+        config_number(c, TCP_MAX_IP, 32, 1, 1024, false, &per_ip, path, err)) return -1;
+    e->limits = (md_server_limits){queue, read, write, total, per_ip};
     return 0;
 }
 /* Validate one address family per key rather than permitting the generic nft
@@ -319,6 +331,7 @@ md_engine *md_engine_load(const char *path, bool check, char *err) {
 }
 size_t md_engine_listener_count(const md_engine *e) { return e ? e->listener_count : 0; }
 const md_listener *md_engine_listener(const md_engine *e, size_t i) { return e && i < e->listener_count ? &e->listeners[i] : NULL; }
+const md_server_limits *md_engine_server_limits(const md_engine *e) { return e ? &e->limits : NULL; }
 /* 只有国外组的新鲜缓存命中在事件循环直接回复：它不写 nft、不触发刷新，
  * finalize 只做 TTL 规范化，与 worker 路径结果相同。CN 命中仍须经 nft，
  * stale 命中须启动刷新，二者都进入不访问上游的缓存 lane；其余按上游组分 lane，

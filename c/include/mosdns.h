@@ -111,6 +111,13 @@ typedef struct { char listen[256]; bool tcp; size_t entry; unsigned idle_timeout
 md_engine *md_engine_load(const char *path, bool check, char *err);
 size_t md_engine_listener_count(const md_engine *e);
 const md_listener *md_engine_listener(const md_engine *e, size_t i);
+/* 服务端过载保护，配置加载时已校验范围。queue_timeout_ms=0 表示排队任务不过期；
+ * TCP 读/写期限单位为秒，连接数上限对所有 TCP listener 合计。 */
+typedef struct {
+    unsigned queue_timeout_ms, tcp_read_timeout, tcp_write_timeout;
+    unsigned tcp_max_connections, tcp_max_connections_per_ip;
+} md_server_limits;
+const md_server_limits *md_engine_server_limits(const md_engine *e);
 int md_engine_query(md_engine *e, size_t entry, const md_packet *q, md_packet *r, char *err);
 /* Event-loop dispatch. Only a fresh foreign cache hit (no nft, no refresh) is
  * answered here: MD_LANE_REPLY with r holding the final response. Otherwise
@@ -126,6 +133,8 @@ bool md_engine_cached_query(md_engine *e, size_t entry, const md_packet *q, md_p
 void md_engine_free(md_engine *e);
 /* 单调时钟秒数，用于 TTL 和到期判断，不是 Unix 时间戳。 */
 uint64_t md_now(void);
+/* 单调时钟毫秒数，供服务端排队期限和 TCP 读写期限使用。 */
+uint64_t md_now_ms(void);
 /* pthread_create with at least MD_THREAD_STACK bytes of stack. musl defaults to
  * 128 KiB and a small RLIMIT_STACK shrinks glibc's default; larger platform
  * defaults are kept. Returns pthread_create's error number. */

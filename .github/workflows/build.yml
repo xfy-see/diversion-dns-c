@@ -290,11 +290,12 @@ jobs:
             export DIVERSION_OWNED_NETNS=1
             python3 c/tests/nft_kernel_test.py --application .build/gcc-review/mosdns-c --output .build/kernel-evidence/regression
           '
-      - name: Default CLI path, worker lanes and small thread stack in an owned namespace
+      - name: Default CLI path, worker lanes, small thread stack and TCP limits in an owned namespace
         run: |
           set -euo pipefail
           # glibc build: concurrent external nft writers (H3), dead foreign upstream (H1),
-          # RLIMIT_STACK=128 KiB thread stacks (M3).
+          # RLIMIT_STACK=128 KiB thread stacks (M3), stale-job drop and coalescing (R1),
+          # TCP slow readers vs UDP CN cache hits (R2), TCP connection limits/deadlines (M5).
           sudo --preserve-env=GITHUB_SHA,GITHUB_RUN_ID unshare --net sh -c '
             ip link set lo up
             export DIVERSION_OWNED_NETNS=1
