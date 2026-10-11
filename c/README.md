@@ -64,12 +64,30 @@ argv/stdin CLI，不启动 shell。不创建表/集合，不发送元素 TTL，�
 环境检查：CN 负回答仍可能因非 Linux 或没有标准路径的 `nft` 失败。
 
 UDP 接收缓冲单独请求 256 KiB 并读回实际值，受内核限制；Linux 读回值含双倍
-bookkeeping，不等于 RSS。UDP/TCP listener 合计最多 64 个，TCP 连接最多 128 个，
-每条 lane 未完成请求最多 64 个，异步 lazy 刷新最多 64 个。国外组的新鲜缓存命中在事件循环
-直接回复；CN 缓存命中（仍须写 nft）和 stale 命中进入不访问上游的缓存 lane，一个上游组
-全部超时不会拖慢另一组或缓存命中。TCP 每连接串行处理，可处理已排队的
-连续帧；某条 lane 满时 UDP 返回 SERVFAIL、TCP 关闭连接。无 UDP packet-info 源地址选择、
-Unix listener、HTTP API、指标、磁盘 cache dump、加密 DNS、SOCKS 或 bootstrap。
+bookkeeping，不等于 RSS。UDP/TCP listener 合计最多 64 个，TCP 连接默认最多 128 个
+（`tcp_max_connections`），每条 lane 未完成请求最多 64 个，异步 lazy 刷新最多 64 个。
+国外组的新鲜缓存命中在事件循环直接回复；CN 缓存命中（仍须写 nft）和 stale 命中进入不访问
+上游的缓存 lane。一个上游组全部超时不会占用另一组或缓存 lane 的 worker 与排队配额。
+TCP 每连接串行处理，可处理已排队的连续帧；某条 lane 满时 UDP 返回 SERVFAIL、TCP 关闭连接。
+
+同一上游组内仍会互相影响，但有界：该组 worker 被不回答的上游占住时，每次交换最长 5 秒；
+排队超过 `queue_timeout_ms`（默认 2000 ms）的请求不再访问上游，直接回 SERVFAIL（与 lane 满时
+相同，仍在等待的客户端可以立即重试，已放弃的客户端忽略它）。因此一批黑洞查询会让该组
+停摆约一个上游期限（约 5 秒），而不是按队列长度累加。除 DNS ID 外完全相同的查询（问题
+大小写、标志、EDNS 全同）共享正在进行的那一次上游交换，不另占 worker；跟随者仍计入
+该 lane 的 64 个配额，所以超过 64 个的同名重试风暴仍会让该组在这次交换结束前返回 SERVFAIL。
+
+TCP 待写回复不计入任何 lane 配额，慢读客户端不能让 UDP 的 CN 缓存命中失败。每个 TCP
+连接最多持有一个待写回复：一帧须在 `tcp_read_timeout`（默认 5 秒）内收完，一个回复须在
+`tcp_write_timeout`（默认 10 秒）内写完，否则关闭连接；空闲连接仍按 `tcp_idle_timeout`
+关闭。同一来源地址最多 `tcp_max_connections_per_ip`（默认 32）个连接（IPv6 按完整
+/128 计算）。达到每 IP 或总数上限时，先淘汰最久无进展的空闲连接，其次淘汰回复写不出去的
+连接；正在等待 worker 的连接不淘汰，都不可淘汰时才拒绝新连接。最坏情况下的报文对象内存约为
+（3×64 + `tcp_max_connections`）× 128 KiB，默认约 40 MiB，按需分配；内存紧张的路由器可以
+调低 `tcp_max_connections`。TCP 53 仍建议只对可信 LAN 开放。
+
+无 UDP packet-info 源地址选择、Unix listener、HTTP API、指标、磁盘 cache dump、加密 DNS、
+SOCKS 或 bootstrap。
 
 ## 正则依赖与构建约定
 
@@ -166,7 +184,28 @@ accepted: the external writer may have flushed the just-written mappings.
 
 Permanent existing elements are preserved, including after restart. A sufficiently
 long existing lease is reused; short leases are refreshed without shortening a
-longer shared mapping. No migration flush is required solely for permanent entries.
+longer shared mapping.
+
+**Migrating from `nftset_fast=0` to `nftset_fast=1`:** the CLI path adds elements
+without a per-element timeout, so in a `flags timeout` set without a default
+`timeout` every address it learned is permanent. The fast path deliberately keeps
+permanent elements, so those addresses would never expire after the switch. Flush
+the DNS-learned sets once while switching (stop the service, flush, start with
+`nftset_fast=1`):
+
+```sh
+nft flush set inet mosdns_cn cn_site4
+nft flush set inet mosdns_cn cn_site6
+```
+
+Use the table/set names from `nftset_ipv4`/`nftset_ipv6`. Only flush sets that
+contain nothing but DNS-learned addresses; static CN-IP prefixes belong in
+separate sets. Until clients re-query, new connections to those destinations take
+the non-CN route; existing connections keep their route only if conntrack pinning
+is in place. To keep the current mappings instead, re-add each element with an
+explicit `timeout` (e.g. `nft add element inet mosdns_cn cn_site4 { 192.0.2.1
+timeout 10m }` after deleting the permanent one); the fast path then refreshes it
+normally.
 The DNS response and cache normalize TTL high-bit values to zero (RFC 2181) and
 cap ordinary RR TTLs at 86400 seconds. OPT fields are exempt. nft installs that TTL
 plus 15 seconds, overriding the set's default timeout deliberately. No configurable

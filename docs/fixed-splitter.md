@@ -83,6 +83,11 @@ cache_size=1024 # explanation
 | `cn_interface` / `foreign_interface` | 各一个，1–63 可打印 ASCII 字节，不含空白或斜杠 | 不绑定接口 |
 | `cn_concurrent` / `foreign_concurrent` | 各一个，1–3 | 1 |
 | `tcp_idle_timeout` | 单值，所有 TCP listener 共用，1–86400 秒 | 30 |
+| `tcp_read_timeout` | 单值，一个 TCP 帧从首字节到收完的期限，1–300 秒 | 5 |
+| `tcp_write_timeout` | 单值，一个 TCP 回复从开始写到写完的期限，1–300 秒 | 10 |
+| `tcp_max_connections` | 单值，所有 TCP listener 合计的连接上限，1–1024 | 128 |
+| `tcp_max_connections_per_ip` | 单值，同一来源地址的 TCP 连接上限，1–1024 | 32 |
+| `queue_timeout_ms` | 单值，请求在 lane 中排队的最长时间，0–60000 毫秒；0 表示不过期 | 2000 |
 | `nftset_ipv4` | 单值，五段逗号格式，IPv4 mask 1–32 | 不学习 IPv4 |
 | `nftset_ipv6` | 单值，五段逗号格式，IPv6 mask 1–128 | 不学习 IPv6 |
 | `nftset_fast` | 单值，0/1；1 要求 Linux ≥6.12、/32 或 /128 和预建普通 timeout set | 0 |
@@ -120,6 +125,18 @@ nft 执行模块保留原语义：只学习 Answer 中 IN A/AAAA，不读取 CNA
 因此 CN 的空回答、NXDOMAIN 或没有 A/AAAA 的回答并不保证绕过这项环境要求；
 非 Linux 上配置 nft 的 CN 请求仍会失败。FIFO 等待、元数据检查和写入共用原 5 秒预算。
 不明确的提交结果不会自动重放，查询路径会报告失败。
+
+## 过载保护
+
+- 每条 lane（缓存/CN/国外）各有 `--cpu` 个 worker 和 64 个未完成请求配额，lane 满时 UDP 回 SERVFAIL、TCP 关闭连接
+- worker 取出排队超过 `queue_timeout_ms` 的请求时直接回 SERVFAIL，不访问上游；默认 2000 ms，小于常见客户端 2–5 秒的超时。
+  选择回 SERVFAIL 而不是静默丢弃：与 lane 满时行为一致，TCP 连接必须得到回复才能继续，仍在等待的客户端可以立即重试其他服务器
+- 除 DNS ID 外字节完全相同的 CN/国外查询共享正在进行的上游交换，回复只改写 ID；跟随者计入 lane 配额
+- TCP 待写回复不计入 lane 配额；`tcp_read_timeout`/`tcp_write_timeout` 限制单帧读取和单个回复写出的总时长，
+  `tcp_idle_timeout` 限制两次进展之间的空闲时间
+- 达到 `tcp_max_connections_per_ip` 或 `tcp_max_connections` 时，先淘汰最久无进展的空闲连接，其次淘汰回复写不出去的连接；
+  等待 worker 的连接不淘汰，都不可淘汰时拒绝新连接。IPv6 按完整地址计数
+- 最坏情况报文对象内存约（3×64 + `tcp_max_connections`）× 128 KiB，按需分配
 
 ## 缓存与 lazy 刷新
 
@@ -198,6 +215,9 @@ mock 功能回归、真实 Linux nft/出口验证、文件大小/RSS/QPS 和持�
 普通 RR 的 TTL 最高位为 1 时按 0 处理，其余最多 86400 秒；返回报文、缓存、
 nft 学习使用同一规则，EDNS OPT 不改写。需要改写 TTL 的 TSIG/SIG(0) 报文会失败。
 fast 路径写入 TTL+15 秒，不继承 set 默认 timeout；已有永久元素不会被改短。
+从 `nftset_fast=0` 切换到 `1` 时，CLI 路径学到的元素在没有默认 timeout 的集合中是永久的，
+fast 路径不会让它们过期：切换时对只含 DNS 学习地址的集合执行一次 `nft flush set`（见
+[c/README.md](../c/README.md) 的迁移说明）。
 目标必须 flags timeout（不含 dynamic/interval/map）；静态 CN-IP 保留独立集合。
 
 每个响应最多 256 条 Answer IN A/AAAA（重复也计数），超限只拒绝该请求；队列批次
