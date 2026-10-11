@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* 一个 poll 事件循环管理监听器和 TCP 帧，worker 执行可能阻塞的查询图。
- * job 经待执行/完成队列转移所有权，最终统一由事件循环回收。 */
+ * job 经待执行/完成队列转移所有权，最终统一由事件循环回收。
+ * 待执行队列按 lane（缓存命中/CN 上游/国外上游）拆分，每条 lane 有自己的
+ * worker 和 MAX_JOBS 配额：一个上游组全部超时也不会拖住另一组或缓存命中。 */
 #include "mosdns.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -22,26 +24,34 @@
 typedef struct job {
     struct job *next;
     int socket, slot;
+    unsigned lane;
     uint64_t generation;
     struct sockaddr_storage peer;
     socklen_t peer_len;
     size_t entry;
     md_packet query, response;
 } job;
-/* lock 保护两条跨线程队列和 outstanding；后者包含排队、执行、完成及待写回复，
- * 因此慢 TCP 客户端也受 MAX_JOBS 限制。wake 管道只是通知，完成队列才是结果来源。 */
+/* 每条 lane 的待执行队列与 outstanding；后者包含排队、执行、完成及待写回复，
+ * 因此慢 TCP 客户端也受 MAX_JOBS 限制。 */
+typedef struct {
+    pthread_cond_t ready;
+    job *head, *tail;
+    size_t outstanding;
+} lane;
+/* lock 保护各 lane 队列、完成队列和 outstanding。wake 管道只是通知，
+ * 完成队列才是结果来源。 */
 typedef struct {
     md_engine *engine;
     pthread_mutex_t lock;
-    pthread_cond_t ready;
-    job *head, *tail, *done_head, *done_tail;
+    lane lanes[MD_LANE_COUNT];
+    job *done_head, *done_tail;
     /* Only the event-loop thread owns idle jobs. Workers never recycle them. */
     job *idle;
     size_t idle_count;
-    size_t outstanding;
     bool stopping;
     int wake[2];
 } pool;
+typedef struct { pool *p; unsigned lane; } worker;
 /* TCP 每条连接至多有一个处理中的查询，读完消息体后 busy 置位，
  * 完整回复写出后才继续读取下一帧；header/sent 保存非阻塞 I/O 的进度。 */
 typedef struct {
@@ -82,43 +92,47 @@ static void recycle_job(pool *p, job *j) {
 /* 只能由事件循环调用：先释放 outstanding 配额，再放回线程私有空闲链表。 */
 static void release_job(pool *p, job *j) {
     pthread_mutex_lock(&p->lock);
-    p->outstanding--;
+    p->lanes[j->lane].outstanding--;
     pthread_mutex_unlock(&p->lock);
     recycle_job(p, j);
 }
 /* 成功入队后 job 交给 worker；失败时调用方仍负责发送错误或释放 job。 */
 static bool enqueue(pool *p, job *j) {
+    lane *l = &p->lanes[j->lane];
     pthread_mutex_lock(&p->lock);
-    if (p->stopping || p->outstanding >= MAX_JOBS) {
+    if (p->stopping || l->outstanding >= MAX_JOBS) {
         pthread_mutex_unlock(&p->lock); return false;
     }
     j->next = NULL;
-    if (p->tail) p->tail->next = j; else p->head = j;
-    p->tail = j; p->outstanding++;
-    pthread_cond_signal(&p->ready);
+    if (l->tail) l->tail->next = j; else l->head = j;
+    l->tail = j; l->outstanding++;
+    pthread_cond_signal(&l->ready);
     pthread_mutex_unlock(&p->lock);
     return true;
 }
-/* 缓存命中的 TCP 回复跳过 worker，但未写完之前仍占用一个 job 配额。 */
-static bool retain_output(pool *p) {
+/* 缓存命中的 TCP 回复跳过 worker，但未写完之前仍占用缓存 lane 的一个 job 配额。 */
+static bool retain_output(pool *p, job *j) {
+    j->lane = MD_LANE_CACHED;
     pthread_mutex_lock(&p->lock);
-    bool ok = !p->stopping && p->outstanding < MAX_JOBS;
-    if (ok) p->outstanding++;
+    lane *l = &p->lanes[j->lane];
+    bool ok = !p->stopping && l->outstanding < MAX_JOBS;
+    if (ok) l->outstanding++;
     pthread_mutex_unlock(&p->lock);
     return ok;
 }
 /* 每个 worker 建立自己的上游连接池，退出时释放；执行期间独占取出的 job。
  * UDP 可直接发回完整数据报，TCP 写操作必须交还事件循环保持帧进度一致。 */
 static void *work(void *arg) {
-    pool *p = arg;
+    pool *p = ((worker *)arg)->p;
+    lane *l = &p->lanes[((worker *)arg)->lane];
     md_forward_worker_enable();
     for (;;) {
         pthread_mutex_lock(&p->lock);
-        while (!p->head && !p->stopping) pthread_cond_wait(&p->ready, &p->lock);
+        while (!l->head && !p->stopping) pthread_cond_wait(&l->ready, &p->lock);
         if (p->stopping) { pthread_mutex_unlock(&p->lock); break; }
-        job *j = p->head;
-        p->head = j->next;
-        if (!p->head) p->tail = NULL;
+        job *j = l->head;
+        l->head = j->next;
+        if (!l->head) l->tail = NULL;
         pthread_mutex_unlock(&p->lock);
         char err[MD_ERROR_SIZE] = {0};
         if (md_engine_query(p->engine, j->entry, &j->query, &j->response, err)) {
@@ -213,9 +227,10 @@ static void tcp_read(pool *p, connection *c, int slot) {
                 if (md_dns_question(&j->query, &q, err) || (q.flags & 0x8000)) {
                     recycle_job(p, j); close_connection(p, c); return;
                 }
-                /* 快路径只处理引擎确认可直接返回的鲜缓存，其他查询仍执行完整查询图。 */
-                if (md_engine_cached_query(p->engine, j->entry, &j->query, &j->response)) {
-                    if (!retain_output(p)) { recycle_job(p, j); close_connection(p, c); return; }
+                /* 快路径只处理引擎确认可直接返回的鲜缓存，其他查询按 lane 执行完整查询图。 */
+                j->lane = md_engine_dispatch(p->engine, j->entry, &j->query, &j->response);
+                if (j->lane == MD_LANE_REPLY) {
+                    if (!retain_output(p, j)) { recycle_job(p, j); close_connection(p, c); return; }
                     c->output = j; c->sent = 0;
                     md_write16(c->header, (uint16_t)j->response.len);
                 } else if (!enqueue(p, j)) {
@@ -260,7 +275,8 @@ static void udp_read(pool *p, int fd, size_t entry) {
         j->query.len = (size_t)n; j->socket = fd; j->entry = entry; j->slot = -1;
         md_question q; char err[MD_ERROR_SIZE];
         if (md_dns_question(&j->query, &q, err) || (q.flags & 0x8000)) { recycle_job(p, j); continue; }
-        if (md_engine_cached_query(p->engine, entry, &j->query, &j->response)) {
+        j->lane = md_engine_dispatch(p->engine, entry, &j->query, &j->response);
+        if (j->lane == MD_LANE_REPLY) {
             md_dns_limit_udp(&j->query, &j->response);
             ssize_t ignored = sendto(fd, j->response.data, j->response.len, 0,
                                     (struct sockaddr *)&j->peer, j->peer_len);
@@ -283,18 +299,21 @@ int md_server_run(md_engine *e, unsigned workers, char *err) {
     if (!count || count > 64 || workers < 1 || workers > 64) {
         snprintf(err, MD_ERROR_SIZE, "requires 1..64 listeners and 1..64 workers"); return -1;
     }
+    unsigned total = workers * MD_LANE_COUNT;
     int result = -1, *fds = calloc(count, sizeof(*fds));
     connection *cs = calloc(MAX_CONNECTIONS, sizeof(*cs));
-    pthread_t *threads = calloc(workers, sizeof(*threads));
+    pthread_t *threads = calloc(total, sizeof(*threads));
+    worker *roles = calloc(total, sizeof(*roles));
     pool p = {.engine = e, .wake = {-1, -1}};
     int udp_rcvbuf[64] = {0};
     unsigned started = 0;
-    if (!fds || !cs || !threads) {
-        snprintf(err, MD_ERROR_SIZE, "out of memory"); free(fds); free(cs); free(threads); return -1;
+    if (!fds || !cs || !threads || !roles) {
+        snprintf(err, MD_ERROR_SIZE, "out of memory"); free(fds); free(cs); free(threads); free(roles); return -1;
     }
     for (size_t i = 0; i < count; i++) fds[i] = -1;
     for (size_t i = 0; i < MAX_CONNECTIONS; i++) cs[i].fd = -1;
-    pthread_mutex_init(&p.lock, NULL); pthread_cond_init(&p.ready, NULL);
+    pthread_mutex_init(&p.lock, NULL);
+    for (unsigned i = 0; i < MD_LANE_COUNT; i++) pthread_cond_init(&p.lanes[i].ready, NULL);
     if (pipe(p.wake) || nonblock(p.wake[0]) || nonblock(p.wake[1])) {
         snprintf(err, MD_ERROR_SIZE, "completion pipe: %s", strerror(errno)); goto cleanup;
     }
@@ -325,8 +344,9 @@ int md_server_run(md_engine *e, unsigned workers, char *err) {
             snprintf(err, MD_ERROR_SIZE, "listen %s: %s", l->listen, strerror(errno)); goto cleanup;
         }
     }
-    for (; started < workers; started++) {
-        int rc = pthread_create(&threads[started], NULL, work, &p);
+    for (; started < total; started++) {
+        roles[started] = (worker){&p, started % MD_LANE_COUNT};
+        int rc = md_thread_create(&threads[started], work, &roles[started]);
         if (rc) { snprintf(err, MD_ERROR_SIZE, "worker: %s", strerror(rc)); goto cleanup; }
     }
     struct sigaction handler, old_int, old_term;
@@ -398,11 +418,15 @@ cleanup:
     /* 先禁止新任务并等待所有 worker，再释放 job 和监听器；保证 worker 发 UDP 时
      * socket 仍有效，且不会访问已释放的队列或引擎引用。 */
     pthread_mutex_lock(&p.lock); p.stopping = true;
-    pthread_cond_broadcast(&p.ready); pthread_mutex_unlock(&p.lock);
+    for (unsigned i = 0; i < MD_LANE_COUNT; i++) pthread_cond_broadcast(&p.lanes[i].ready);
+    pthread_mutex_unlock(&p.lock);
     for (unsigned i = 0; i < started; i++) pthread_join(threads[i], NULL);
     for (int i = 0; i < MAX_CONNECTIONS; i++) close_connection(&p, &cs[i]);
-    job *j = p.head;
-    while (j) { job *next = j->next; free(j); j = next; }
+    job *j;
+    for (unsigned i = 0; i < MD_LANE_COUNT; i++) {
+        j = p.lanes[i].head;
+        while (j) { job *next = j->next; free(j); j = next; }
+    }
     j = p.done_head;
     while (j) { job *next = j->next; free(j); j = next; }
     j = p.idle;
@@ -410,7 +434,8 @@ cleanup:
     for (size_t i = 0; i < count; i++) if (fds[i] >= 0) close(fds[i]);
     if (p.wake[0] >= 0) close(p.wake[0]);
     if (p.wake[1] >= 0) close(p.wake[1]);
-    pthread_cond_destroy(&p.ready); pthread_mutex_destroy(&p.lock);
-    free(threads); free(cs); free(fds);
+    for (unsigned i = 0; i < MD_LANE_COUNT; i++) pthread_cond_destroy(&p.lanes[i].ready);
+    pthread_mutex_destroy(&p.lock);
+    free(roles); free(threads); free(cs); free(fds);
     return result;
 }
