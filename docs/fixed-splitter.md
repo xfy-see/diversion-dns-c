@@ -29,8 +29,8 @@ cache key，命中时改为当前请求 ID。nft 学习失败会使查询失败�
 ./mosdns-c check -d /etc/mosdns -c config.conf
 ```
 
-默认配置文件名是 `config.conf`。`start/check/version/help` 保留；`--cpu` 是工作线程数，
-范围 1–64，默认 4，只用于 `start`。
+默认配置文件名是 `config.conf`。`start/check/version/help` 保留；`--cpu` 是每条 worker lane
+（缓存命中 / CN 上游 / 国外上游）的线程数，范围 1–64，默认 4（共 12 个线程），只用于 `start`。
 
 `-d/--dir` 先改变进程工作目录，然后读取配置。相对配置路径和每个 `cn_domain_file`
 都相对于这个工作目录，而非配置文件所在目录。没有 `include`，也不展开 `~` 或环境变量。
@@ -111,7 +111,7 @@ IPv4 key 要求 `family=inet|ip` 且 `address_type=ipv4_addr`；IPv6 key 要求
 
 nft 执行模块保留原语义：只学习 Answer 中 IN A/AAAA，不读取 CNAME 目标来改变路由，
 不学习 Authority/Additional。普通地址集合使用原 Linux Netlink generation 检查、事务和
-完整成功回执；interval 集合保留原 argv/stdin CLI 与前缀行为。mask 对 interval 集合生效，
+完整成功回执（generation 窗口内用 Netlink GETSET 校验元数据，冲突时有界重试 3 次）；interval 集合保留原 argv/stdin CLI 与前缀行为。mask 对 interval 集合生效，
 普通集合写入具体地址。集合必须预先存在，程序不会创建表或集合，不发送元素 TTL，
 继续使用集合默认 timeout，也没有用户态 membership 缓存或维护线程。
 
