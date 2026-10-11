@@ -1,4 +1,8 @@
-"""The one-version publisher has no network or executable side effects in tests."""
+"""The one-version publishers have no network or executable side effects in tests.
+
+Shared publisher contracts run against both the archived v0.1.0 publisher and
+the v0.1.1 publisher, which must keep the same checks.
+"""
 import importlib.util
 import io
 import zipfile
@@ -14,9 +18,17 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
-spec = importlib.util.spec_from_file_location("publish_010", ROOT / "scripts/publish-v0.1.0.py")
-pub = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(pub)
+
+
+def load_publisher(name, version):
+    spec = importlib.util.spec_from_file_location(name, ROOT / f"scripts/publish-v{version}.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+pub = load_publisher("publish_010", "0.1.0")
+pub011 = load_publisher("publish_011", "0.1.1")
 
 
 class VersionContracts(unittest.TestCase):
@@ -46,55 +58,59 @@ class VersionContracts(unittest.TestCase):
         self.assertIn('"draft": False, "prerelease": False', text)
 
 
-class GitHubReadContracts(unittest.TestCase):
+class GitHubReadContractsMixin:
+    pub = None
+
     def test_absent_accepts_only_verified_404(self):
         for code, stderr, expected in ((0, b"", False), (1, b"gh: Not Found (HTTP 404)", True)):
-            with mock.patch.object(pub.subprocess, "run", return_value=subprocess.CompletedProcess([], code, b"{}", stderr)):
-                self.assertEqual(pub.absent("releases/tags/v0.1.0"), expected)
+            with mock.patch.object(self.pub.subprocess, "run", return_value=subprocess.CompletedProcess([], code, b"{}", stderr)):
+                self.assertEqual(self.pub.absent(f"releases/tags/{self.pub.TAG}"), expected)
         for text in (b"HTTP 403", b"connection timed out", b"HTTP 500"):
-            with mock.patch.object(pub.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, b"", text)):
+            with mock.patch.object(self.pub.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, b"", text)):
                 with self.assertRaisesRegex(ValueError, "absence is unconfirmed"):
-                    pub.absent("releases/tags/v0.1.0")
+                    self.pub.absent(f"releases/tags/{self.pub.TAG}")
 
     def test_required_jobs_all_pass_exactly_once(self):
         rows = [{"id": i, "name": name, "status": "completed", "conclusion": "success", "html_url": "https://github.com/"}
                 for i, name in enumerate(["A", "B"])]
-        with mock.patch.object(pub, "api", return_value={"total_count": 2, "jobs": rows}):
-            self.assertEqual(len(pub.checked_jobs(1, ["A", "B"])), 2)
+        with mock.patch.object(self.pub, "api", return_value={"total_count": 2, "jobs": rows}):
+            self.assertEqual(len(self.pub.checked_jobs(1, ["A", "B"])), 2)
         for changed in (rows[:1], rows + [rows[0]], [dict(rows[0], conclusion="failure"), rows[1]],
                         [dict(rows[0], status="in_progress"), rows[1]]):
-            with mock.patch.object(pub, "api", return_value={"total_count": len(changed), "jobs": changed}):
+            with mock.patch.object(self.pub, "api", return_value={"total_count": len(changed), "jobs": changed}):
                 with self.assertRaisesRegex(ValueError, "not all successful"):
-                    pub.checked_jobs(1, ["A", "B"])
+                    self.pub.checked_jobs(1, ["A", "B"])
 
     def test_pr_fork_or_other_repo_cannot_publish(self):
         for override in ({"GITHUB_EVENT_NAME": "pull_request"}, {"GITHUB_REF": "refs/heads/feature"},
                          {"GITHUB_REPOSITORY": "someone/fork"}):
             env = {"GITHUB_SHA": "a" * 40, "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "1",
-                   "GITHUB_REPOSITORY": pub.REPO, "GITHUB_REF": "refs/heads/main", "GITHUB_EVENT_NAME": "push", **override}
-            with mock.patch.dict(os.environ, env), mock.patch.object(pub, "api") as api:
+                   "GITHUB_REPOSITORY": self.pub.REPO, "GITHUB_REF": "refs/heads/main", "GITHUB_EVENT_NAME": "push", **override}
+            with mock.patch.dict(os.environ, env), mock.patch.object(self.pub, "api") as api:
                 with self.assertRaisesRegex(ValueError, "only this repository"):
-                    pub.main()
+                    self.pub.main()
                 api.assert_not_called()
 
     def test_existing_complete_release_never_calls_mutating_api(self):
         env = {"GITHUB_SHA": "a" * 40, "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "1",
-               "GITHUB_REPOSITORY": pub.REPO, "GITHUB_REF": "refs/heads/main", "GITHUB_EVENT_NAME": "push"}
-        with mock.patch.dict(os.environ, env), mock.patch.object(pub, "run", return_value=("a" * 40).encode()) as run, \
-                mock.patch.object(pub, "existing_release", return_value={"html_url": "https://github.com/"}), mock.patch.object(pub, "api") as api:
-            pub.main()
+               "GITHUB_REPOSITORY": self.pub.REPO, "GITHUB_REF": "refs/heads/main", "GITHUB_EVENT_NAME": "push"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(self.pub, "run", return_value=("a" * 40).encode()) as run, \
+                mock.patch.object(self.pub, "existing_release", return_value={"html_url": "https://github.com/"}), mock.patch.object(self.pub, "api") as api:
+            self.pub.main()
             api.assert_not_called()
             self.assertEqual(run.call_count, 1)
 
     def test_partial_release_state_fails_closed(self):
-        for rows, tag_missing in (([], False), ([{"tag_name": pub.TAG}], True),
-                                  ([{"tag_name": pub.TAG, "draft": True}], False)):
-            with mock.patch.object(pub, "api", return_value=rows), mock.patch.object(pub, "absent", return_value=tag_missing):
+        for rows, tag_missing in (([], False), ([{"tag_name": self.pub.TAG}], True),
+                                  ([{"tag_name": self.pub.TAG, "draft": True}], False)):
+            with mock.patch.object(self.pub, "api", return_value=rows), mock.patch.object(self.pub, "absent", return_value=tag_missing):
                 with self.assertRaisesRegex(ValueError, "exists; review"):
-                    pub.existing_release()
+                    self.pub.existing_release()
 
 
-class PublishSequenceContracts(unittest.TestCase):
+class PublishSequenceContractsMixin:
+    pub = None
+
     def invoke(self, *, corrupt=False, main_moved=False, attempt_changed=False):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -113,18 +129,18 @@ class PublishSequenceContracts(unittest.TestCase):
         def api(path):
             if path.endswith("/assets?per_page=100"):
                 return [{"name": asset.name, "size": asset.stat().st_size,
-                         "digest": "sha256:" + ("0" * 64 if corrupt else pub.a.digest(asset.read_bytes()))}]
+                         "digest": "sha256:" + ("0" * 64 if corrupt else self.pub.a.digest(asset.read_bytes()))}]
             if path.startswith("git/ref/"):
                 return {"object": {"sha": "b" * 40 if main_moved and path.endswith("main") else commit}}
             if path.startswith("actions/runs/"):
                 return {"head_sha": commit, "run_attempt": 2 if attempt_changed else 1,
                         "status": "completed", "conclusion": "success"}
             raise AssertionError(path)
-        with mock.patch.object(pub, "run", side_effect=command), mock.patch.object(pub, "api", side_effect=api), \
-                mock.patch.object(pub, "checked_jobs", return_value=[]):
+        with mock.patch.object(self.pub, "run", side_effect=command), mock.patch.object(self.pub, "api", side_effect=api), \
+                mock.patch.object(self.pub, "checked_jobs", return_value=[]):
             error = None
             try:
-                pub.publish_assets([asset], commit, "release notes", 11, 1, 12, 1)
+                self.pub.publish_assets([asset], commit, "release notes", 11, 1, 12, 1)
             except ValueError as exc:
                 error = str(exc)
         return calls, error
@@ -146,14 +162,16 @@ class PublishSequenceContracts(unittest.TestCase):
                 self.assertFalse(any("PATCH" in command for command in calls))
 
 
-class ArtifactDownloadContracts(unittest.TestCase):
+class ArtifactDownloadContractsMixin:
+    pub = None
+
     def test_digest_identity_and_safe_membership_gate_download(self):
         raw = io.BytesIO()
         with zipfile.ZipFile(raw, "w") as z:
             z.writestr("bundle.tar.gz", b"fixture bytes, never executable")
         data = raw.getvalue()
         row = {"id": 1, "name": "expected", "expired": False, "size_in_bytes": len(data),
-               "digest": "sha256:" + pub.a.digest(data), "workflow_run": {"id": 2, "head_sha": "a" * 40}}
+               "digest": "sha256:" + self.pub.a.digest(data), "workflow_run": {"id": 2, "head_sha": "a" * 40}}
         for change in (None, "sha", "run", "digest", "expired", "bytes"):
             with self.subTest(change=change), tempfile.TemporaryDirectory() as temporary:
                 current = copy.deepcopy(row)
@@ -165,14 +183,14 @@ class ArtifactDownloadContracts(unittest.TestCase):
                 def download(command, **kwargs):
                     kwargs["stdout"].write(data)
                     return subprocess.CompletedProcess(command, 0)
-                with mock.patch.object(pub, "api", return_value={"total_count": 1, "artifacts": [current]}), \
-                        mock.patch.object(pub.subprocess, "run", side_effect=download):
+                with mock.patch.object(self.pub, "api", return_value={"total_count": 1, "artifacts": [current]}), \
+                        mock.patch.object(self.pub.subprocess, "run", side_effect=download):
                     if change:
                         with self.assertRaises(ValueError):
-                            pub.fetch_artifacts(2, 1, "a" * 40, Path(temporary), {"expected"})
+                            self.pub.fetch_artifacts(2, 1, "a" * 40, Path(temporary), {"expected"})
                         self.assertFalse((Path(temporary) / "expected/bundle.tar.gz").exists())
                     else:
-                        receipts = pub.fetch_artifacts(2, 1, "a" * 40, Path(temporary), {"expected"})
+                        receipts = self.pub.fetch_artifacts(2, 1, "a" * 40, Path(temporary), {"expected"})
                         self.assertEqual(receipts[0]["digest"], row["digest"])
                         self.assertEqual((Path(temporary) / "expected/bundle.tar.gz").read_bytes(), b"fixture bytes, never executable")
 
@@ -182,15 +200,188 @@ class ArtifactDownloadContracts(unittest.TestCase):
             z.writestr("../outside", b"not allowed")
         data = raw.getvalue()
         row = {"id": 1, "name": "expected", "expired": False, "size_in_bytes": len(data),
-               "digest": "sha256:" + pub.a.digest(data), "workflow_run": {"id": 2, "head_sha": "a" * 40}}
+               "digest": "sha256:" + self.pub.a.digest(data), "workflow_run": {"id": 2, "head_sha": "a" * 40}}
         def download(command, **kwargs):
             kwargs["stdout"].write(data)
             return subprocess.CompletedProcess(command, 0)
-        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(pub, "api", return_value={"total_count": 1, "artifacts": [row]}), \
-                mock.patch.object(pub.subprocess, "run", side_effect=download):
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(self.pub, "api", return_value={"total_count": 1, "artifacts": [row]}), \
+                mock.patch.object(self.pub.subprocess, "run", side_effect=download):
             with self.assertRaisesRegex(ValueError, "unsafe path"):
-                pub.fetch_artifacts(2, 1, "a" * 40, Path(temporary), {"expected"})
+                self.pub.fetch_artifacts(2, 1, "a" * 40, Path(temporary), {"expected"})
             self.assertFalse((Path(temporary) / "outside").exists())
+
+
+
+class GitHubReadContracts(GitHubReadContractsMixin, unittest.TestCase):
+    pub = pub
+
+
+class PublishSequenceContracts(PublishSequenceContractsMixin, unittest.TestCase):
+    pub = pub
+
+
+class ArtifactDownloadContracts(ArtifactDownloadContractsMixin, unittest.TestCase):
+    pub = pub
+
+
+class GitHubReadContracts011(GitHubReadContractsMixin, unittest.TestCase):
+    pub = pub011
+
+
+class PublishSequenceContracts011(PublishSequenceContractsMixin, unittest.TestCase):
+    pub = pub011
+
+
+class ArtifactDownloadContracts011(ArtifactDownloadContractsMixin, unittest.TestCase):
+    pub = pub011
+
+
+def main_env(**override):
+    return {"GITHUB_SHA": "a" * 40, "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "1",
+            "GITHUB_REPOSITORY": "xfy-see/diversion-dns-c", "GITHUB_REF": "refs/heads/main",
+            "GITHUB_EVENT_NAME": "push", **override}
+
+
+class Release011Contracts(unittest.TestCase):
+    """v0.1.1-only contracts: names, workflow job, version gate and fail-closed paths."""
+
+    def test_version_derived_names_match_source(self):
+        self.assertEqual((pub011.VERSION, pub011.TAG, pub011.PACKAGE_VERSION), ("0.1.1", "v0.1.1", "0.1.1-r1"))
+        self.assertEqual((ROOT / "VERSION").read_text().strip(), pub011.VERSION)
+        self.assertEqual(pub011.CLI_VERSION, "mosdns-c 0.1.1 fixed-splitter")
+        self.assertIn(f'puts("{pub011.CLI_VERSION}")', (ROOT / "c/main.c").read_text())
+        self.assertEqual(pub011.NOTES.as_posix(), "docs/release-v0.1.1.md")
+        self.assertEqual(pub011.WORK.as_posix(), ".build/release-v0.1.1")
+        self.assertEqual((pub.TAG, pub.VERSION), ("v0.1.0", "0.1.0"))
+
+    def test_release_notes_exist_and_list_every_asset(self):
+        notes = (ROOT / pub011.NOTES).read_text()
+        self.assertTrue(notes.startswith("# diversion-dns-c v0.1.1\n"))
+        self.assertIn(pub011.CLI_VERSION, notes)
+        self.assertNotIn("/workspace/", notes)
+        names = pub011.expected_asset_names()
+        self.assertEqual(len(names), 17)
+        for name in names:
+            self.assertIn(name, notes)
+        self.assertFalse(any("0.1.0" in name for name in names))
+        self.assertIn("diversion-dns-c-lite-0.1.1-r1_mipsel_24kc.apk", names)
+        self.assertIn("posix-lite-static-linux-arm64-v0.1.1.tar.gz", names)
+        self.assertIn("verification-aarch64_cortex-a53-v0.1.1.tar.gz", names)
+
+    def test_publisher_mirrors_every_archived_check(self):
+        old = (ROOT / "scripts/publish-v0.1.0.py").read_text().splitlines()
+        new = (ROOT / "scripts/publish-v0.1.1.py").read_text()
+        lines = set(new.splitlines())
+        allowed = {  # rewritten only to derive names from VERSION
+            '"""One-version, main-only release. Verify exact CI bytes; never overwrite a tag.',
+            '    a.require(metadata["info"]["version"] == VERSION + "-r1", "downloaded APK version differs")',
+            '    # This publisher is an immutable historical release tool, not the current',
+        }
+        missing = [line for line in old if "0.1.0" not in line and line not in lines and line not in allowed]
+        self.assertEqual(missing, [])
+        self.assertNotIn("0.1.0", new.replace("archived v0.1.0 publisher", ""))
+        self.assertEqual(new.count("a.require("), "\n".join(old).count("a.require(") + 2)
+        for text in ('"--clobber"', '"force": True', '"--prerelease"'):
+            self.assertNotIn(text, new)
+        self.assertIn('"draft": True, "prerelease": False', new)
+        self.assertIn('"draft": False, "prerelease": False, "make_latest": "true"', new)
+
+    def test_release_011_job_mirrors_release_010(self):
+        workflow = (ROOT / ".github/workflows/build.yml").read_text()
+        release010 = workflow.split("  release-010:\n", 1)[1].split("  release-011:\n", 1)[0]
+        release011 = workflow.split("  release-011:\n", 1)[1]
+        self.assertIn("run: python3 scripts/publish-v0.1.0.py", release010)
+        self.assertIn("group: stable-release-v0.1.0", release010)
+        self.assertIn("run: python3 scripts/publish-v0.1.1.py", release011)
+        self.assertIn("group: stable-release-v0.1.1", release011)
+        self.assertIn("name: release-v0.1.1-verification-${{ github.sha }}", release011)
+        self.assertIn("path: .build/release-v0.1.1/assets/", release011)
+        self.assertEqual(release010.replace("0.1.0", "0.1.1").strip(), release011.strip())
+        self.assertEqual(workflow.count("contents: write"), 3)  # delivery, release-010, release-011
+
+    def test_other_source_version_skips_before_any_github_read(self):
+        for version in ("0.1.0", "0.1.2", "0.2.0"):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "VERSION").write_text(version + "\n")
+                with mock.patch.dict(os.environ, main_env()), mock.patch.object(pub011, "ROOT", root), \
+                        mock.patch.object(pub011, "run", return_value=("a" * 40).encode()) as run, \
+                        mock.patch.object(pub011, "api") as api, mock.patch.object(pub011, "absent") as absent, \
+                        mock.patch("builtins.print") as printed:
+                    pub011.main()
+                api.assert_not_called()
+                absent.assert_not_called()
+                self.assertEqual(run.call_count, 1)
+                printed.assert_called_once_with("v0.1.1 publisher skipped for a different source version")
+
+    def test_missing_release_notes_fail_before_any_github_read(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "VERSION").write_text("0.1.1\n")
+            with mock.patch.dict(os.environ, main_env()), mock.patch.object(pub011, "ROOT", root), \
+                    mock.patch.object(pub011, "run", return_value=("a" * 40).encode()), \
+                    mock.patch.object(pub011, "api") as api, mock.patch.object(pub011, "absent") as absent:
+                with self.assertRaisesRegex(ValueError, "release notes"):
+                    pub011.main()
+            api.assert_not_called()
+            absent.assert_not_called()
+
+    def test_existing_tag_without_release_is_refused(self):
+        def api(path):
+            if path.startswith("releases?"):
+                return []
+            raise AssertionError(path)
+        with mock.patch.object(pub011, "api", side_effect=api), mock.patch.object(pub011, "absent", return_value=False):
+            with self.assertRaisesRegex(ValueError, "partial/conflicting v0.1.1 tag/release exists"):
+                pub011.existing_release()
+        env = main_env()
+        with mock.patch.dict(os.environ, env), mock.patch.object(pub011, "run", return_value=("a" * 40).encode()) as run, \
+                mock.patch.object(pub011, "api", side_effect=api), mock.patch.object(pub011, "absent", return_value=False):
+            with self.assertRaisesRegex(ValueError, "review without overwriting"):
+                pub011.main()
+            self.assertEqual(run.call_count, 1)  # only `git rev-parse HEAD`; no tag/release POST
+
+    def existing(self, names, published=True):
+        commit = "c" * 40
+        release = {"id": 7, "tag_name": "v0.1.1", "draft": not published, "prerelease": False,
+                   "published_at": "2026-10-11T00:00:00Z" if published else None, "target_commitish": commit,
+                   "html_url": "https://github.com/release"}
+        assets = [{"id": i, "name": name, "state": "uploaded", "size": 1, "digest": "sha256:" + "1" * 64}
+                  for i, name in enumerate(sorted(names))]
+        def api(path):
+            if path.startswith("releases?"):
+                return [release, dict(release, id=8, tag_name="v0.1.0")]
+            if path == "git/ref/tags/v0.1.1":
+                return {"object": {"type": "commit", "sha": commit}}
+            if path == "releases/7/assets?per_page=100":
+                return assets
+            raise AssertionError(path)
+        return api
+
+    def test_existing_release_with_wrong_asset_names_is_refused(self):
+        names = pub011.expected_asset_names()
+        for changed in ({n.replace("0.1.1", "0.1.0") for n in names},
+                        names - {"SHA256SUMS"}, names | {"extra.bin"}):
+            with self.subTest(size=len(changed)), mock.patch.object(pub011, "api", side_effect=self.existing(changed)), \
+                    mock.patch.object(pub011, "absent", return_value=False), mock.patch.object(pub011, "run") as run:
+                with self.assertRaisesRegex(ValueError, "assets incomplete"):
+                    pub011.existing_release()
+                run.assert_not_called()
+        with mock.patch.object(pub011, "api", side_effect=self.existing(names, published=False)), \
+                mock.patch.object(pub011, "absent", return_value=False):
+            with self.assertRaisesRegex(ValueError, "draft or prerelease exists"):
+                pub011.existing_release()
+
+    def test_main_moved_before_any_download_fails_closed(self):
+        def api(path):
+            if path == "git/ref/heads/main":
+                return {"object": {"sha": "b" * 40}}
+            raise AssertionError(path)
+        with mock.patch.dict(os.environ, main_env()), mock.patch.object(pub011, "run", return_value=("a" * 40).encode()) as run, \
+                mock.patch.object(pub011, "existing_release", return_value=None), mock.patch.object(pub011, "api", side_effect=api):
+            with self.assertRaisesRegex(ValueError, "main moved"):
+                pub011.main()
+            self.assertEqual(run.call_count, 1)
 
 
 if __name__ == "__main__":
