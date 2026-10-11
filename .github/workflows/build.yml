@@ -273,7 +273,7 @@ jobs:
       - name: Install kernel test and strict GCC build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-14 nftables
+          sudo apt-get install -y gcc-14 nftables musl-tools
       - name: GCC default Werror build and portable tests
         run: |
           set -euo pipefail
@@ -289,6 +289,25 @@ jobs:
             ip link set lo up
             export DIVERSION_OWNED_NETNS=1
             python3 c/tests/nft_kernel_test.py --application .build/gcc-review/mosdns-c --output .build/kernel-evidence/regression
+          '
+      - name: Default CLI path, worker lanes and small thread stack in an owned namespace
+        run: |
+          set -euo pipefail
+          # glibc build: concurrent external nft writers (H3), dead foreign upstream (H1),
+          # RLIMIT_STACK=128 KiB thread stacks (M3).
+          sudo --preserve-env=GITHUB_SHA,GITHUB_RUN_ID unshare --net sh -c '
+            ip link set lo up
+            export DIVERSION_OWNED_NETNS=1
+            python3 c/tests/nft_kernel_cli_test.py --application .build/gcc-review/mosdns-c --output .build/kernel-evidence/cli-lanes --max-servfail 3
+          '
+          # Plain musl static build without -z stack-size: musl's 128 KiB default
+          # thread stack must still serve a CLI-path CN write (M3).
+          make -C c -j4 CC=musl-gcc REGEX_BACKEND=posix-lite BUILD=../.build/musl-nostack \
+            CFLAGS="-Os -g -idirafter /usr/include -idirafter /usr/include/x86_64-linux-gnu" LDFLAGS="-static" all 2>&1 | tee .build/kernel-evidence/musl-nostack.log
+          sudo --preserve-env=GITHUB_SHA,GITHUB_RUN_ID unshare --net sh -c '
+            ip link set lo up
+            export DIVERSION_OWNED_NETNS=1
+            python3 c/tests/nft_kernel_cli_test.py --only small-thread-stack --application .build/musl-nostack/mosdns-c --output .build/kernel-evidence/musl-small-stack
           '
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()

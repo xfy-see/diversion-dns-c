@@ -18,7 +18,8 @@ CN nft 最终处理 → 返回”的请求链。运行时配置已替换为有�
 /path/to/mosdns-c start -c c/examples/minimal.conf --cpu 4
 ```
 
-默认读取 `config.conf`，默认工作线程 4 个（`--cpu` 范围 1–64）。`-d/--dir` 在读取配置前
+默认读取 `config.conf`，`--cpu`（范围 1–64，默认 4）是**每条 worker lane** 的线程数：缓存命中、
+CN 上游、国外上游三条 lane 各自排队，默认共 12 个工作线程，线程栈显式不小于 1 MiB。`-d/--dir` 在读取配置前
 切换工作目录；配置和规则文件的相对路径都基于该目录。演示规则在
 [c/examples/cn-site.txt](examples/cn-site.txt)，请先替换为实际规则与上游。
 
@@ -54,7 +55,9 @@ NXDOMAIN 缓存 30 秒、SERVFAIL 5 秒；无 Answer 的 NOERROR 受记录最小
 没有 pipeline。UDP 每秒用同一 connected socket 和原 ID 重发，共享原 5 秒交换预算；
 TC 转 TCP 后停止 UDP 重发。
 
-nft 普通集合仍有 generation 前后校验和完整 Netlink 成功回执；interval 集合仍走
+nft 普通集合仍有 generation 前后校验和完整 Netlink 成功回执；窗口内的集合元数据用 Netlink
+GETSET 读取（每次写入只调用一次 `nft list set` 判断 interval），generation 冲突或批次
+ERESTART 时新开 socket、退避 1–4 ms 后最多尝试 3 次；序列号在 32 位范围内回绕，不会耗尽。interval 集合仍走
 argv/stdin CLI，不启动 shell。不创建表/集合，不发送元素 TTL，使用集合默认 timeout。
 配置 mask 作用于 interval 前缀，普通集合使用具体地址。FIFO 等待、检查和写入共享
 原有 5 秒预算；不明确的提交结果不自动重放。没有 Answer 地址不代表完全跳过 nft
@@ -62,8 +65,10 @@ argv/stdin CLI，不启动 shell。不创建表/集合，不发送元素 TTL，�
 
 UDP 接收缓冲单独请求 256 KiB 并读回实际值，受内核限制；Linux 读回值含双倍
 bookkeeping，不等于 RSS。UDP/TCP listener 合计最多 64 个，TCP 连接最多 128 个，
-未完成请求最多 64 个，异步 lazy 刷新最多 64 个。TCP 每连接串行处理，可处理已排队的
-连续帧；队列满时 UDP 返回 SERVFAIL、TCP 关闭连接。无 UDP packet-info 源地址选择、
+每条 lane 未完成请求最多 64 个，异步 lazy 刷新最多 64 个。国外组的新鲜缓存命中在事件循环
+直接回复；CN 缓存命中（仍须写 nft）和 stale 命中进入不访问上游的缓存 lane，一个上游组
+全部超时不会拖慢另一组或缓存命中。TCP 每连接串行处理，可处理已排队的
+连续帧；某条 lane 满时 UDP 返回 SERVFAIL、TCP 关闭连接。无 UDP packet-info 源地址选择、
 Unix listener、HTTP API、指标、磁盘 cache dump、加密 DNS、SOCKS 或 bootstrap。
 
 ## 正则依赖与构建约定

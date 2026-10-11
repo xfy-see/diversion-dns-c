@@ -274,14 +274,7 @@ static bool token_equal(const char *start, size_t len, const char *token) {
 }
 /* 每笔写入前读取实际集合类型和 interval 标志，不缓存可能过期的
  * 元数据。CLI 文本只解析所需 token，类型缺失或不符立即拒绝写入。 */
-static int inspect_set(const char *binary, const nft_target *target, bool *interval, uint64_t until, char *err) {
-    char output[65536];
-    /* These are validated identifier tokens, not shell words. Literal quote
-     * characters in argv become quoted-string tokens rejected by nft 1.1.6
-     * in this command position. posix_spawn performs no shell expansion. */
-    char *argv[] = {(char *)binary, "-t", "-nn", "list", "set", (char *)target->family,
-                    (char *)target->table, (char *)target->set, NULL};
-    if (run_nft(binary, argv, -1, output, sizeof(output), until, err)) return -1;
+static int inspect_set_text(const nft_target *target, bool *interval, const char *output, char *err) {
     bool type_seen = false, want_type = false, in_flags = false; *interval = false;
     const char *p = output;
     while (*p) {
@@ -300,6 +293,20 @@ static int inspect_set(const char *binary, const nft_target *target, bool *inter
     }
     if (!type_seen) { snprintf(err, MD_ERROR_SIZE, "nftset metadata missing address type"); return -1; }
     return 0;
+}
+/* 64 KiB 输出缓冲放在堆上：musl 默认线程栈只有 128 KiB。 */
+#define NFT_OUTPUT_SIZE 65536u
+static int inspect_set(const char *binary, const nft_target *target, bool *interval, uint64_t until, char *err) {
+    char *output = malloc(NFT_OUTPUT_SIZE);
+    if (!output) { snprintf(err, MD_ERROR_SIZE, "allocate nft output buffer"); return -1; }
+    /* These are validated identifier tokens, not shell words. Literal quote
+     * characters in argv become quoted-string tokens rejected by nft 1.1.6
+     * in this command position. posix_spawn performs no shell expansion. */
+    char *argv[] = {(char *)binary, "-t", "-nn", "list", "set", (char *)target->family,
+                    (char *)target->table, (char *)target->set, NULL};
+    int rc = run_nft(binary, argv, -1, output, NFT_OUTPUT_SIZE, until, err);
+    if (!rc) rc = inspect_set_text(target, interval, output, err);
+    free(output); return rc;
 }
 /* Wire helper constants are portable for memory tests; bind them to Linux UAPI. */
 _Static_assert(sizeof(struct nlmsghdr) == 16 && sizeof(struct nfgenmsg) == 4 && sizeof(struct nlattr) == 4, "netlink ABI layout");
@@ -379,34 +386,68 @@ static int nft_nl_generation(int fd, uint32_t port, uint32_t seq, uint8_t *recei
     if (milliseconds() >= until) { snprintf(err, MD_ERROR_SIZE, "nftset query exceeded its 5 second deadline validating generation"); return -1; }
     return 0;
 }
+/* 每次写入都新开私有 netlink socket，序列号只需在该 socket 内唯一。
+ * 进程级计数按 16 个序列号一组分配，在 32 位范围内回绕并跳过 0，长期运行
+ * 不会耗尽；每组覆盖 GETGEN、GETSET、GETGEN 及最多 10 条批次请求。 */
+#define NFT_SEQ_BLOCKS ((UINT32_MAX - 16u) / 16u)
+static atomic_uint_fast64_t nft_sequence = ATOMIC_VAR_INIT(0);
+static uint32_t nft_sequence_ticket(void) {
+    uint64_t block = atomic_fetch_add_explicit(&nft_sequence, 1, memory_order_relaxed);
+    return (uint32_t)(block % NFT_SEQ_BLOCKS) * 16u + 1u;
+}
+/* 其他 nft 写者（dnsmasq、fw4、另一实例）提交会让 generation 检查失败；
+ * 重试前短暂退避 1-4 ms 并加抖动，避免与对方同步碰撞，且不超过截止时间。 */
+#define NFT_RETRY 1
+#define NFT_PLAIN_ATTEMPTS 3u
+static void nft_retry_backoff(unsigned attempt, uint64_t until) {
+    static atomic_uint jitter = ATOMIC_VAR_INIT(0);
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    unsigned x = (unsigned)now.tv_nsec ^ atomic_fetch_add_explicit(&jitter, 0x9e3779b9u, memory_order_relaxed);
+    x ^= x >> 15; x *= 0x2c1b3c6du; x ^= x >> 12;
+    uint64_t delay = (1u << (attempt < 2 ? attempt : 2)) + x % 3u;
+    if (milliseconds() + delay >= until) return;
+    struct timespec pause = {0, (long)delay * 1000000L};
+    nanosleep(&pause, NULL);
+}
+/* 用 netlink GETSET 读取集合元数据，代替 generation 窗口内的第二次 nft CLI：
+ * 窗口从一次 fork/exec（毫秒级）缩短到两次往返（微秒级），并发写者下
+ * 不再几乎必然冲突。只接受键类型/长度匹配、非 interval/map 的普通集合。 */
+static int nft_nl_plain_metadata(int fd, uint32_t port, uint32_t seq, const nft_target *t,
+                                 uint8_t *receive, uint64_t until, char *err) {
+    uint8_t request[320]; md_nl_requests requests; size_t length; int kernel_errno = 0;
+    uint8_t family = !strcmp(t->family, "inet") ? 1 : !strcmp(t->family, "ip") ? 2 : 10;
+    if (md_nft_nl_getset_encode(request, sizeof(request), &requests, port, seq, family, t->table, t->set)) {
+        snprintf(err, MD_ERROR_SIZE, "encode nft set metadata query"); return -1;
+    }
+    if (nft_nl_send(fd, request, requests.length, until, err) || nft_nl_receive(fd, receive, MD_NL_BUFFER_SIZE, &length, until, err)) return -1;
+    if (md_nft_nl_plain_set_consume(&requests, receive, length, family, t->table, t->set, t->bytes, &kernel_errno)) {
+        snprintf(err, MD_ERROR_SIZE, "nftset %s/%s/%s is not a plain %s set (changed during metadata check?)", t->family, t->table, t->set, t->bytes == 4 ? "ipv4_addr" : "ipv6_addr"); return -1;
+    }
+    if (kernel_errno) { snprintf(err, MD_ERROR_SIZE, "nft set metadata: %s", strerror(kernel_errno)); return -1; }
+    return 0;
+}
 /* 使用独立 netlink socket 和序列号范围，避免混入其他事务的 ACK。
  * 先查询 generation，再读集合元数据并复查 generation；批次携带该值，
  * 让内核拒绝元数据检查后发生的规则变更。发送后的失败不转用 CLI，
- * 因为写入结果可能已经生效，重放会掩盖不确定的状态。 */
-static int add_plain_target(const char *binary, const nft_target *t, const md_packet *r, uint64_t until, char *err) {
-    /* No fallback after send. Interval targets never enter this function. */
-    int fd = -1, rc = -1; uint8_t (*keys)[16] = calloc(MD_NL_MAX_KEYS, sizeof(*keys));
-    uint8_t *wire = malloc(MD_NL_BUFFER_SIZE), *receive = malloc(MD_NL_BUFFER_SIZE);
-    if (!keys || !wire || !receive) { snprintf(err, MD_ERROR_SIZE, "allocate bounded nft netlink transaction"); goto done; }
-    nft_keys values = {t, keys, 0, until};
-    if (md_dns_records(r, collect_plain_key, &values, err)) goto done;
-    if (!values.count) { snprintf(err, MD_ERROR_SIZE, "nft plain address collection failed"); goto done; }
-    static atomic_uint_fast64_t sequence = ATOMIC_VAR_INIT(1);
-    uint64_t ticket = atomic_fetch_add_explicit(&sequence, 16, memory_order_relaxed);
-    if (!ticket || ticket > UINT32_MAX - 16u) { snprintf(err, MD_ERROR_SIZE, "nft netlink sequence exhausted"); goto done; }
+ * 因为写入结果可能已经生效，重放会掩盖不确定的状态。只有确定未提交的
+ * 冲突（generation 变化、批次 ERESTART）返回 NFT_RETRY，由调用方新开 socket 重试。 */
+static int add_plain_attempt(const nft_target *t, const nft_keys *values, uint8_t *wire, uint8_t *receive, uint64_t until, char *err) {
+    int fd = -1, rc = -1;
+    uint32_t ticket = nft_sequence_ticket();
     fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, NETLINK_NETFILTER);
     if (fd < 0) { snprintf(err, MD_ERROR_SIZE, "open nft netlink: %s", strerror(errno)); goto done; }
     struct sockaddr_nl local = {.nl_family = AF_NETLINK}; socklen_t size = sizeof(local);
     if (bind(fd, (struct sockaddr *)&local, sizeof(local)) || getsockname(fd, (struct sockaddr *)&local, &size) || size != sizeof(local) || local.nl_family != AF_NETLINK || !local.nl_pid || local.nl_groups) {
         snprintf(err, MD_ERROR_SIZE, "bind private nft netlink port: %s", strerror(errno)); goto done;
     }
-    uint32_t before, after; bool interval;
-    if (nft_nl_generation(fd, local.nl_pid, (uint32_t)ticket, receive, until, &before, err) || inspect_set(binary, t, &interval, until, err)) goto done;
-    if (interval) { snprintf(err, MD_ERROR_SIZE, "nftset changed from plain to interval during metadata check"); goto done; }
-    if (nft_nl_generation(fd, local.nl_pid, (uint32_t)ticket + 1, receive, until, &after, err)) goto done;
-    if (before != after) { snprintf(err, MD_ERROR_SIZE, "nft ruleset generation changed during metadata check"); goto done; }
+    uint32_t before, after;
+    if (nft_nl_generation(fd, local.nl_pid, ticket, receive, until, &before, err) ||
+        nft_nl_plain_metadata(fd, local.nl_pid, ticket + 1, t, receive, until, err) ||
+        nft_nl_generation(fd, local.nl_pid, ticket + 2, receive, until, &after, err)) goto done;
+    if (before != after) { snprintf(err, MD_ERROR_SIZE, "nft ruleset generation changed during metadata check"); rc = NFT_RETRY; goto done; }
     md_nl_requests requests; uint8_t family = !strcmp(t->family, "inet") ? 1 : !strcmp(t->family, "ip") ? 2 : 10;
-    if (md_nft_nl_batch_encode(wire, MD_NL_BUFFER_SIZE, &requests, local.nl_pid, (uint32_t)ticket + 2, family, t->table, t->set, (const uint8_t (*)[16])keys, values.count, t->bytes, after)) { snprintf(err, MD_ERROR_SIZE, "encode bounded nft add batch"); goto done; }
+    if (md_nft_nl_batch_encode(wire, MD_NL_BUFFER_SIZE, &requests, local.nl_pid, ticket + 3, family, t->table, t->set, (const uint8_t (*)[16])values->keys, values->count, t->bytes, after)) { snprintf(err, MD_ERROR_SIZE, "encode bounded nft add batch"); goto done; }
     if (nft_nl_send(fd, wire, requests.length, until, err)) goto done;
     /* 一个 recvmsg 可以包含多个 ACK；必须检查整包中的边界错误，
      * 收齐所有要求 ACK 的添加请求后，才报告本批次成功。 */
@@ -414,13 +455,35 @@ static int add_plain_target(const char *binary, const nft_target *t, const md_pa
         size_t length; int kernel_errno = 0;
         if (nft_nl_receive(fd, receive, MD_NL_BUFFER_SIZE, &length, until, err)) goto done;
         if (md_nft_nl_ack_consume(&requests, receive, length, &kernel_errno)) { snprintf(err, MD_ERROR_SIZE, "invalid nft add ACK cohort; mutation state unknown"); goto done; }
-        if (kernel_errno) { snprintf(err, MD_ERROR_SIZE, "nft add transaction: %s", strerror(kernel_errno)); goto done; }
+        if (kernel_errno) {
+            snprintf(err, MD_ERROR_SIZE, "nft add transaction: %s", strerror(kernel_errno));
+            /* GENID 拒绝不提交任何修改（MIPS 与 asm-generic 的 errno 值不同）。 */
+            if (kernel_errno == ERESTART) rc = NFT_RETRY;
+            goto done;
+        }
     } while (!md_nft_nl_ack_complete(&requests));
     if (milliseconds() >= until) { snprintf(err, MD_ERROR_SIZE, "nftset query exceeded its 5 second deadline validating add ACKs"); goto done; }
     rc = 0;
 done:
     if (fd >= 0) close(fd);
-    free(keys); free(wire); free(receive); return rc;
+    return rc;
+}
+static int add_plain_target(const nft_target *t, const md_packet *r, uint64_t until, char *err) {
+    /* No fallback after send. Interval targets never enter this function. */
+    int rc = -1; uint8_t (*keys)[16] = calloc(MD_NL_MAX_KEYS, sizeof(*keys));
+    uint8_t *wire = malloc(MD_NL_BUFFER_SIZE), *receive = malloc(MD_NL_BUFFER_SIZE);
+    if (!keys || !wire || !receive) { snprintf(err, MD_ERROR_SIZE, "allocate bounded nft netlink transaction"); goto done; }
+    nft_keys values = {t, keys, 0, until};
+    if (md_dns_records(r, collect_plain_key, &values, err)) goto done;
+    if (!values.count) { snprintf(err, MD_ERROR_SIZE, "nft plain address collection failed"); goto done; }
+    for (unsigned attempt = 0; ; attempt++) {
+        rc = add_plain_attempt(t, &values, wire, receive, until, err);
+        if (rc != NFT_RETRY) break;
+        if (attempt + 1 >= NFT_PLAIN_ATTEMPTS || milliseconds() >= until) { rc = -1; break; }
+        nft_retry_backoff(attempt, until);
+    }
+done:
+    free(keys); free(wire); free(receive); return rc ? -1 : 0;
 }
 typedef struct { const nft_target *target; FILE *file; bool interval; unsigned count; } nft_write;
 /* DNS RDATA 本身是网络序地址字节。interval 模式将主机位清零后
@@ -457,7 +520,7 @@ static int add_target(const char *binary, const nft_target *t, const md_packet *
     if (!v.count) { fclose(file); return 0; }
     bool interval;
     if (inspect_set(binary, t, &interval, until, err)) { fclose(file); return -1; }
-    if (!interval) { fclose(file); return add_plain_target(binary, t, r, until, err); }
+    if (!interval) { fclose(file); return add_plain_target(t, r, until, err); }
     rewind(file);
     if (ftruncate(fileno(file), 0)) { snprintf(err, MD_ERROR_SIZE, "truncate nft input: %s", strerror(errno)); fclose(file); return -1; }
     fprintf(file, "add element %s %s %s { ", t->family, t->table, t->set);
@@ -466,9 +529,10 @@ static int add_target(const char *binary, const nft_target *t, const md_packet *
     fputs(" }\n", file);
     if (fflush(file) || ferror(file)) { snprintf(err, MD_ERROR_SIZE, "write nft input: %s", strerror(errno)); fclose(file); return -1; }
     rewind(file);
-    char output[65536], *argv[] = {(char *)binary, "-f", "-", NULL};
-    int rc = run_nft(binary, argv, fileno(file), output, sizeof(output), until, err);
-    fclose(file); return rc;
+    char *output = malloc(NFT_OUTPUT_SIZE), *argv[] = {(char *)binary, "-f", "-", NULL};
+    if (!output) { snprintf(err, MD_ERROR_SIZE, "allocate nft output buffer"); fclose(file); return -1; }
+    int rc = run_nft(binary, argv, fileno(file), output, NFT_OUTPUT_SIZE, until, err);
+    free(output); fclose(file); return rc;
 }
 #endif
 

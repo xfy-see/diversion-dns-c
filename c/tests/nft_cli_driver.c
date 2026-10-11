@@ -49,6 +49,9 @@ static int __attribute__((unused)) cli_cond_timedwait(pthread_cond_t *cond, pthr
 /* 仅替换 netlink 传输和时钟；CLI 子进程仍接收真实参数，便于核验接口边界。 */
 static unsigned fast_gen=7,metadata_reads,element_reads;
 static bool fast_mode(void){const char *m=getenv("FAKE_MODE");return m&&!strncmp(m,"fast-",5);}
+/* plain-* modes drive the compatible netlink path directly (no CLI child). */
+static bool plain_mode(void){const char *m=getenv("FAKE_MODE");return m&&!strncmp(m,"plain-",6);}
+static bool seq_high,seq_wrapped;
 static const int fake_fd=2147483646;
 static uint8_t fake_reply[MD_NL_BUFFER_SIZE];static size_t fake_length;
 static unsigned opens,closes,sends,generations,batches,key_count,post_receive_clocks;static uint64_t late_ms;static bool batch_received;
@@ -73,20 +76,21 @@ static size_t __attribute__((unused)) fake_ack(const uint8_t *q,uint8_t *out,int
 static ssize_t __attribute__((unused)) fake_send(int fd,const void *data,size_t n,int flags,const struct sockaddr *peer,socklen_t size){
     assert(fd==fake_fd&&!flags&&size==sizeof(struct sockaddr_nl));const struct sockaddr_nl *k=(const struct sockaddr_nl *)peer;assert(k->nl_family==16&&!k->nl_pid&&!k->nl_groups);++sends;fake_length=0;const uint8_t *p=data;
     if(md_nl_u16(p+4)==0xA10){++generations;assert(n==20&&md_nl_u16(p+6)==1&&md_nl_u32(p+12)==41771);
+        uint32_t seq=md_nl_u32(p+8);assert(seq);if(seq>UINT32_MAX-64u)seq_high=true;else if(seq_high&&seq<64u)seq_wrapped=true;
         if(!strcmp(fake_mode(),"gen-error")){fake_length=fake_ack(p,fake_reply,-EPERM);return (ssize_t)n;}
         if (fast_mode() && ((!strcmp(fake_mode(), "fast-reset") && generations == 5) ||
             (!strcmp(fake_mode(), "fast-permanent-reset") && generations == 4) ||
             (!strcmp(fake_mode(), "fast-race-before") && generations == 3) ||
             ((!strcmp(fake_mode(), "fast-race-after") || !strcmp(fake_mode(), "fast-race-flush")) && generations == 4) ||
             !strcmp(fake_mode(), "fast-race-forever"))) ++fast_gen;
-        uint32_t gen=fast_mode()?fast_gen:!strcmp(fake_mode(),"zero-gen")?0:(!strcmp(fake_mode(),"changed-gen")&&generations==2)?8:7;
+        uint32_t gen=fast_mode()?fast_gen:!strcmp(fake_mode(),"zero-gen")?0:((!strcmp(fake_mode(),"changed-gen")||!strcmp(fake_mode(),"plain-race-retry"))&&generations==2)?8:!strcmp(fake_mode(),"plain-race-forever")?generations:7;
         memset(fake_reply,0,28);md_nl_put32(fake_reply,28);md_nl_put16(fake_reply+4,0xA0F);md_nl_put32(fake_reply+8,md_nl_u32(p+8));md_nl_put32(fake_reply+12,41771);fake_reply[19]=(uint8_t)gen;md_nl_put16(fake_reply+20,8);md_nl_put16(fake_reply+22,1);md_nl_be32(fake_reply+24,gen);fake_length=28;return (ssize_t)n;
     }
-    if(fast_mode()&&md_nl_u16(p+4)==0xA0A){
+    if(md_nl_u16(p+4)==0xA0A){
         ++metadata_reads;md_nl_requests q={0};q.port=41771;md_nl_writer w={fake_reply,sizeof(fake_reply),0};size_t at;
         assert(!md_nl_message_start(&w,&q,0xA09,0,md_nl_u32(p+8),p[16],0,&at));
         size_t a=20;for(unsigned i=1;i<=2;i++){size_t z=md_nl_u16(p+a);assert(!md_nl_attr(&w,(uint16_t)i,p+a+4,z-4));a+=md_nl_align(z);}
-        uint8_t val[4];md_nl_be32(val,!strcmp(fake_mode(),"fast-interval")?20:16);assert(!md_nl_attr(&w,3,val,4));
+        uint8_t val[4];md_nl_be32(val,!strcmp(fake_mode(),"fast-interval")?20:!strcmp(fake_mode(),"plain-interval-metadata")?4:16);assert(!md_nl_attr(&w,3,val,4));
         bool v6=getenv("FAST_V6")!=NULL;md_nl_be32(val,v6?8:7);assert(!md_nl_attr(&w,4,val,4));md_nl_be32(val,v6?16:4);assert(!md_nl_attr(&w,5,val,4));
         md_nl_message_end(&w,at);fake_length=w.length;return (ssize_t)n;
     }
@@ -117,7 +121,7 @@ static ssize_t __attribute__((unused)) fake_send(int fd,const void *data,size_t 
                 uint64_t want = !strcmp(fake_mode(), "fast-ttl-highbit") ? 15000 : !strcmp(fake_mode(), "fast-ttl-cap") ? 86415000 : 75000;
                 if (!strcmp(fake_mode(), "fast-ttl-highbit") || !strcmp(fake_mode(), "fast-ttl-cap")) assert(timeout == want);
             }
-            a+=md_nl_align(md_nl_u16(m+a));}assert(a==end);fake_length+=fake_ack(m,fake_reply+fake_length,poison ? -EACCES : (!strcmp(fake_mode(),"fast-restart") && batches==1)?-ERESTART:(!strcmp(fake_mode(),"ack-error")||!strcmp(fake_mode(),"fast-error"))?-EEXIST:0);}
+            a+=md_nl_align(md_nl_u16(m+a));}assert(a==end);fake_length+=fake_ack(m,fake_reply+fake_length,poison ? -EACCES : ((!strcmp(fake_mode(),"fast-restart")||!strcmp(fake_mode(),"plain-restart")) && batches==1)?-ERESTART:(!strcmp(fake_mode(),"ack-error")||!strcmp(fake_mode(),"fast-error"))?-EEXIST:0);}
         else assert(md_nl_u16(m+4)==17&&off+len==n);
         off+=md_nl_align(len);
     }assert(off==n&&frames>=3);
@@ -226,8 +230,19 @@ int main(int argc, char **argv) {
     record(&response, v6 ? 28 : 1, 1, unwanted); /* Authority must not learn. */
     record(&response, v6 ? 28 : 1, 1, unwanted); /* Additional must not learn. */
     int rc;
-    if(fast_mode()){
-        if(v6)setenv("FAST_V6","1",1);
+    if(v6)setenv("FAST_V6","1",1);
+    if(plain_mode()){
+        /* H4: start just below the 32-bit sequence boundary, then force the
+         * 64-bit block counter to wrap; every write must keep succeeding. */
+        bool wrap=!strcmp(fake_mode(),"plain-sequence-wrap");
+        if(wrap) atomic_store(&nft_sequence,(uint64_t)NFT_SEQ_BLOCKS-2);
+        rc=add_plain_target(v6?&n->v6:&n->v4,&response,milliseconds()+5000,error);
+        for(unsigned i=0;wrap&&!rc&&i<4;i++){
+            if(i==2) atomic_store(&nft_sequence,UINT64_MAX);
+            rc=add_plain_target(v6?&n->v6:&n->v4,&response,milliseconds()+5000,error);
+        }
+        if(wrap&&!rc) assert(seq_high&&seq_wrapped);
+    }else if(fast_mode()){
         rc = md_nft_enable_fast(n, error);
         if (!strcmp(fake_mode(), "fast-ttl-highbit")) md_write32(response.data+25, UINT32_MAX);
         if (!strcmp(fake_mode(), "fast-ttl-cap")) md_write32(response.data+25, 0x7fffffff);

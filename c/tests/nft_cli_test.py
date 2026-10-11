@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Exercise actual add_target with a grammar child and test-only netlink transport.
 
-Plain sets perform two real CLI inspections plus fake GETGEN/batch ACK; interval
+Plain sets perform one real CLI inspection plus fake GETGEN/GETSET/GETGEN/batch ACK; interval
 sets retain the exact real subprocess argv/stdin path and never open a socket.
 
 This catches the observed nft 1.1.6 quoted-identifier failure. It is not kernel
@@ -122,8 +122,8 @@ def main():
             wanted=('2001:db8:abcd::/48' if interval else '2001:db8:abcd:1234::9') if mode=='ipv6' else ('192.0.2.0/24' if interval else '192.0.2.9')
             assert calls[1]['stdin']==f'add element inet {table} {name} {{ {wanted} }}\n',calls
         if expected_rc==0 and mode!='nodata' and not interval:
-            assert len(calls)==2 and all(x['argv'][4:]==['inet',table,name] and x['stdin']=='' for x in calls),calls
-            stats=json.loads(result.stdout.splitlines()[0]);assert stats=={'opens':1,'closes':1,'sends':3,'generations':2,'batches':1,'keys':1,'rc':0},stats
+            assert len(calls)==1 and all(x['argv'][4:]==['inet',table,name] and x['stdin']=='' for x in calls),calls
+            stats=json.loads(result.stdout.splitlines()[0]);assert stats=={'opens':1,'closes':1,'sends':4,'generations':2,'batches':1,'keys':1,'rc':0},stats
         if expected_rc==0 and interval:
             stats=json.loads(result.stdout.splitlines()[0]);assert stats['opens']==stats['sends']==0,stats
         if expected_rc==3 or mode=='nodata':assert calls==[],calls
@@ -169,6 +169,22 @@ def main():
             assert stats['opens']==stats['closes'],(mode,kind,stats)
             assert stats['opens'] <= 3,(mode,kind,stats)
             assert not Path(local_env['NFT_TEST_LOG']).exists(),'fast path invoked CLI'
+            checks.append({'label':mode+'-'+kind,'exit':expected_rc,'calls':0,'passed':True,'device_or_kernel_evidence':False})
+    # Compatible plain path driven directly over fake netlink: sequence wrap
+    # (H4) and bounded generation/ERESTART retries (H3). No CLI child runs.
+    for mode, expected_rc, expected in [('plain-sequence-wrap', 0, {'opens':5,'generations':10,'batches':5}),
+                                        ('plain-race-retry', 0, {'opens':2,'generations':4,'batches':1}),
+                                        ('plain-race-forever', 4, {'opens':3,'generations':6,'batches':0}),
+                                        ('plain-restart', 0, {'opens':2,'generations':4,'batches':2}),
+                                        ('plain-interval-metadata', 4, {'opens':1,'generations':1,'batches':0})]:
+        for kind in ('ipv4','ipv6'):
+            local_env=env|{'FAKE_MODE':mode,'NFT_TEST_LOG':str(out/(mode+'-'+kind+'.unexpected-cli'))}
+            result=subprocess.run([str(driver),str(child),kind,'diag','learn'],capture_output=True,text=True,timeout=8,env=local_env)
+            (out/(mode+'-'+kind+'.stdout')).write_text(result.stdout);(out/(mode+'-'+kind+'.stderr')).write_text(result.stderr)
+            assert result.returncode==expected_rc,(mode,kind,result.stdout,result.stderr)
+            stats=json.loads(result.stdout.splitlines()[0])
+            assert {k:stats[k] for k in expected}==expected and stats['opens']==stats['closes'],(mode,kind,stats)
+            assert not Path(local_env['NFT_TEST_LOG']).exists(),'plain netlink path invoked CLI'
             checks.append({'label':mode+'-'+kind,'exit':expected_rc,'calls':0,'passed':True,'device_or_kernel_evidence':False})
     if args.old_source:
         old = out/'nft-cli-driver-before-fix';compile(old,args.old_source)

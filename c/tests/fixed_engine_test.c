@@ -177,7 +177,20 @@ static void test_cache_keeps_nft(void) {
     }
     assert(test_nft_v4 == 2 && test_nft_v6 == 2);
     md_packet foreign = test_question("foreign.cache.test", 1, 0x0100); (void)test_resolve(e, &foreign); (void)test_resolve(e, &foreign);
-    assert(test_calls[1] == 1 && test_nft_calls == 4); md_engine_free(e);
+    assert(test_calls[1] == 1 && test_nft_calls == 4);
+    /* H1 dispatch: only a fresh foreign hit is answered by the event loop;
+     * CN hits keep nft in the cached lane and misses go to their group's lane. */
+    md_packet *d = calloc(1, sizeof(*d)); assert(d);
+    md_write16(foreign.data, 777);
+    assert(md_engine_dispatch(e, 0, &foreign, d) == MD_LANE_REPLY && md_read16(d->data) == 777);
+    assert(md_dns_response_matches(&foreign, d) && md_engine_cached_query(e, 0, &foreign, d) && d->len);
+    md_packet q = test_question("cache-v4.cn", 1, 0x0100);
+    assert(md_engine_dispatch(e, 0, &q, d) == MD_LANE_CACHED && !d->len && !md_engine_cached_query(e, 0, &q, d));
+    q = test_question("lane-miss.cn", 1, 0x0100); assert(md_engine_dispatch(e, 0, &q, d) == MD_LANE_CN && !d->len);
+    q = test_question("lane-miss.test", 1, 0x0100); assert(md_engine_dispatch(e, 0, &q, d) == MD_LANE_FOREIGN && !d->len);
+    assert(md_engine_dispatch(e, 1, &q, d) == MD_LANE_CACHED && !d->len);
+    assert(test_calls[0] == 2 && test_calls[1] == 1 && test_nft_calls == 4);
+    free(d); md_engine_free(e);
 }
 static void test_negative_and_isolation(void) {
     test_reset(); md_engine *e = test_engine("", true);

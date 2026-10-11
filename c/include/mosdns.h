@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <pthread.h>
 #include <sys/socket.h>
 
 /* len 是 data 中有效的 DNS 字节数，不包含 TCP 的两字节长度前缀。 */
@@ -111,13 +112,26 @@ md_engine *md_engine_load(const char *path, bool check, char *err);
 size_t md_engine_listener_count(const md_engine *e);
 const md_listener *md_engine_listener(const md_engine *e, size_t i);
 int md_engine_query(md_engine *e, size_t entry, const md_packet *q, md_packet *r, char *err);
-/* Always returns false: cached responses use normal workers for mandatory nft
- * finalization and lazy refresh. Leaves r->len=0 when r is non-NULL. */
+/* Event-loop dispatch. Only a fresh foreign cache hit (no nft, no refresh) is
+ * answered here: MD_LANE_REPLY with r holding the final response. Otherwise
+ * r->len=0 and the result names the worker lane so a dead upstream group
+ * cannot delay the other group or cached answers: CACHED (CN cache hits that
+ * still need nft, stale hits, invalid input), CN or FOREIGN upstream misses. */
+enum { MD_LANE_CACHED, MD_LANE_CN, MD_LANE_FOREIGN, MD_LANE_COUNT, MD_LANE_REPLY = MD_LANE_COUNT };
+unsigned md_engine_dispatch(md_engine *e, size_t entry, const md_packet *q, md_packet *r);
+/* True only for MD_LANE_REPLY; CN cache hits still use workers for mandatory
+ * nft finalization and lazy refresh. Leaves r->len=0 otherwise. */
 bool md_engine_cached_query(md_engine *e, size_t entry, const md_packet *q, md_packet *r);
 /* 销毁等待后台刷新结束；调用方先停服务/查询，避免访问已释放插件。 */
 void md_engine_free(md_engine *e);
 /* 单调时钟秒数，用于 TTL 和到期判断，不是 Unix 时间戳。 */
 uint64_t md_now(void);
-/* 阻塞运行监听器与 worker；SIGINT/SIGTERM 触发回收，返回后可释放 engine。 */
+/* pthread_create with at least MD_THREAD_STACK bytes of stack. musl defaults to
+ * 128 KiB and a small RLIMIT_STACK shrinks glibc's default; larger platform
+ * defaults are kept. Returns pthread_create's error number. */
+#define MD_THREAD_STACK (1024u * 1024u)
+int md_thread_create(pthread_t *thread, void *(*fn)(void *), void *arg);
+/* 阻塞运行监听器与 worker；SIGINT/SIGTERM 触发回收，返回后可释放 engine。
+ * workers 是每条 lane（缓存/CN/国外）各自的线程数，各 lane 独立排队和限额。 */
 int md_server_run(md_engine *e, unsigned workers, char *err);
 #endif

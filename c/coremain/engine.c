@@ -298,7 +298,7 @@ static void refresh_start(md_engine *e, bool cn, const md_packet *query) {
     refresh_job *job = calloc(1, sizeof(*job));
     if (!job) { md_cache_refresh_end(e->cache, query); pthread_mutex_unlock(&e->lock); return; }
     job->engine = e; job->query = *query; job->cn = cn; job->next = e->jobs;
-    if (pthread_create(&job->thread, NULL, refresh_thread, job)) { md_cache_refresh_end(e->cache, query); free(job); }
+    if (md_thread_create(&job->thread, refresh_thread, job)) { md_cache_refresh_end(e->cache, query); free(job); }
     else e->jobs = job;
     pthread_mutex_unlock(&e->lock);
 }
@@ -319,12 +319,25 @@ md_engine *md_engine_load(const char *path, bool check, char *err) {
 }
 size_t md_engine_listener_count(const md_engine *e) { return e ? e->listener_count : 0; }
 const md_listener *md_engine_listener(const md_engine *e, size_t i) { return e && i < e->listener_count ? &e->listeners[i] : NULL; }
-/* Cached replies always use the worker path: an event-loop shortcut must never
- * bypass nft, lazy refresh, or errors. The server retains its existing API. */
-bool md_engine_cached_query(md_engine *e, size_t entry, const md_packet *q, md_packet *r) {
-    (void)e; (void)entry; (void)q;
+/* 只有国外组的新鲜缓存命中在事件循环直接回复：它不写 nft、不触发刷新，
+ * finalize 只做 TTL 规范化，与 worker 路径结果相同。CN 命中仍须经 nft，
+ * stale 命中须启动刷新，二者都进入不访问上游的缓存 lane；其余按上游组分 lane，
+ * 一个上游组卡住不会占满另一组或缓存命中的 worker 与排队配额。 */
+unsigned md_engine_dispatch(md_engine *e, size_t entry, const md_packet *q, md_packet *r) {
     if (r) r->len = 0;
-    return false;
+    /* Invalid input fails fast in md_engine_query without upstream I/O. */
+    if (!e || !q || !r || entry || e->check) return MD_LANE_CACHED;
+    md_question question; char err[MD_ERROR_SIZE];
+    if (md_dns_question(q, &question, err)) return MD_LANE_CACHED;
+    bool cn = md_domain_match(e->cn, question.name);
+    int hit = md_cache_get(e->cache, q, r, md_now());
+    if (hit == 1 && !cn && !finalize(e, false, r, md_now() + 5, err)) return MD_LANE_REPLY;
+    r->len = 0;
+    if (hit) return MD_LANE_CACHED;
+    return cn ? MD_LANE_CN : MD_LANE_FOREIGN;
+}
+bool md_engine_cached_query(md_engine *e, size_t entry, const md_packet *q, md_packet *r) {
+    return md_engine_dispatch(e, entry, q, r) == MD_LANE_REPLY;
 }
 int md_engine_query(md_engine *e, size_t entry, const md_packet *q, md_packet *r, char *err) {
     char scratch_error[MD_ERROR_SIZE] = {0};
