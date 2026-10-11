@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only v0.1.0 APK evidence verifier; never compiles or executes payloads.
+"""Read-only versioned APK evidence verifier; never compiles or executes payloads.
 
 Precondition: the caller has authenticated the workflow head/run/attempt and
 verified the downloaded Actions ZIP against GitHub's artifact SHA256 before
@@ -144,6 +144,22 @@ def read_files(folder):
     return files
 
 
+def nft_cases(source):
+    manifest = source.get("c/tests/nft_cli_contract.json")
+    if manifest is not None:
+        cases = json_value(manifest, "nft CLI source contract")
+        require(isinstance(cases, dict) and 18 <= len(cases) <= 256, "invalid nft CLI contract")
+        require(all(isinstance(name, str) and re.fullmatch("[a-z0-9-]+", name)
+                    and isinstance(row, list) and len(row) == 2
+                    and all(type(v) is int for v in row) and row[0] in (0, 3, 4)
+                    and 0 <= row[1] <= 2 for name, row in cases.items()), "invalid nft CLI contract row")
+        return {name: tuple(row) for name, row in cases.items()}
+    require(source.get("VERSION", b"0.1.0").strip() == b"0.1.0", "new source requires nft CLI contract")
+    # Historical v0.1.0 evidence remains verifiable using its actual source.
+    return dict(NFT_CASES) if "c/plugin/nft_fast.h" in source else {
+        name: row for name, row in NFT_CASES.items() if not name.startswith("fast-")}
+
+
 def verify_source(files, commit, checkout, state):
     def git(*args):
         return subprocess.check_output(["git", *args], cwd=checkout)
@@ -173,8 +189,8 @@ def verify_source(files, commit, checkout, state):
     require(manifest["source_files_sha256"] == expected and bool(expected), "staged C/source hashes differ")
     recipe = source["packaging/openwrt/Makefile"]
     require(manifest["recipe_sha256"] == sha256(recipe), "staged package recipe hash differs")
-    require(source["VERSION"].strip() == VERSION.encode(), "source VERSION differs")
-    require(re.findall(rb"(?m)^PKG_VERSION:=(.+)$", recipe) == [VERSION.encode()]
+    require(source["VERSION"].strip() == state["application_version"].encode(), "source VERSION differs")
+    require(re.findall(rb"(?m)^PKG_VERSION:=(.+)$", recipe) == [state["application_version"].encode()]
             and re.findall(rb"(?m)^PKG_RELEASE:=(.+)$", recipe) == [b"1"], "source package version differs")
     require(files["LICENSE"] == source["LICENSE"], "release LICENSE differs from source")
     targets = json_value(source["packaging/openwrt/targets.json"], "source targets")
@@ -236,13 +252,15 @@ def verify_commands(files, state, apk_name):
             "domain fixture does not test lite driver")
     require(commands["qemu-nft-cli"][2:] == ["--driver", wrappers + "/nft_cli_driver", "--output", str(PurePosixPath(apkpath).parent / "nft-cli")],
             "nft CLI driver/output differs")
-    require(logs["apk-version"] == "mosdns-c " + VERSION + " fixed-splitter\n", "APK CLI version differs")
+    require(logs["apk-version"] == "mosdns-c " + state["application_version"] + " fixed-splitter\n", "APK CLI version differs")
     return commands, logs
 
 
 def verify_tests(files, state, source, commands, logs):
+    cases = nft_cases(source)
+    test_counts = dict(TEST_COUNTS, nft_cli_checks=len(cases))
     require(all(type(state["tests"].get(key)) is int and state["tests"][key] == value
-                for key, value in TEST_COUNTS.items()), "test summary counts differ")
+                for key, value in test_counts.items()), "test summary counts differ")
     endings = {"qemu-dns_test": "dns/upstream tests passed",
                "qemu-cache_domain_test": "domain/cache/nftset parser tests passed",
                "qemu-fixed_config_test": "fixed config: strict keys, bounds, lists, diagnostics and rules preflight passed",
@@ -267,18 +285,18 @@ def verify_tests(files, state, source, commands, logs):
             and integration.endswith("\nOK\n") and not re.search(r"(?m)^(?:FAILED|ERROR|FAIL|SKIPPED|OK \()", integration),
             "final APK integration corpus failed, skipped or differs")
     nft = json_value(files["nft-cli/result.json"], "nft-cli/result.json")
-    require(nft["ok"] is True and nft["count"] == 30 and nft["sanitized"] is False
+    require(nft["ok"] is True and nft["count"] == len(cases) and nft["sanitized"] is False
             and nft["device_or_kernel_evidence"] is False and nft["commands"] == []
             and nft["source_sha256"] == sha256(source["c/plugin/nftset.c"]), "nft CLI source/scope differs")
-    require(len(nft["checks"]) == 30 and {row["label"] for row in nft["checks"]} == set(NFT_CASES), "nft CLI cases differ")
+    require(len(nft["checks"]) == len(cases) and {row["label"] for row in nft["checks"]} == set(cases), "nft CLI cases differ")
     for row in nft["checks"]:
         name = row["label"]
-        require(row["passed"] is True and (row["exit"], row["calls"]) == NFT_CASES[name], "failed nft CLI check: " + name)
+        require(row["passed"] is True and (row["exit"], row["calls"]) == cases[name], "failed nft CLI check: " + name)
         if row["calls"]:
             calls = files["nft-cli/" + name + ".calls.jsonl"].splitlines()
             require(len(calls) == row["calls"] and all(isinstance(json_value(line, name), dict) for line in calls),
                     "nft CLI raw call count differs: " + name)
-    require(json_value(logs["qemu-nft-cli"], "nft CLI log") == {"ok": True, "checks": 30, "sanitized": False, "device_or_kernel_evidence": False},
+    require(json_value(logs["qemu-nft-cli"], "nft CLI log") == {"ok": True, "checks": len(cases), "sanitized": False, "device_or_kernel_evidence": False},
             "nft CLI log summary differs")
     differential = json_value(files["regex-differential.json"], "regex-differential.json")
     wanted = {"format_version": 1, "production_rules": 8, "production_assertions_per_backend": 72,
@@ -303,7 +321,7 @@ def verify_tests(files, state, source, commands, logs):
 
 def verify_elf(files, state, metadata, arch):
     payload = builder.package_files(metadata, arch)
-    require(metadata["info"]["version"] == PACKAGE_VERSION, "APK package version differs")
+    require(metadata["info"]["version"] == state["package_version"], "APK package version differs")
     require(metadata["info"].get("license") == "GPL-3.0-or-later", "APK license differs")
     elf = json_value(files["elf-sdk-runtime.json"], "elf-sdk-runtime.json")
     require(elf == state["elf"], "ELF evidence copies differ")
@@ -339,23 +357,24 @@ def _verify_apk(folder, commit, run_id, attempt, arch, checkout):
     require(state["status"] == "passed" and "error" not in state and state["unsigned"] is True
             and state["signing_keys_created"] is False and state["same_sdk_application_matches_apk"] is True,
             "APK build failed, signed, created keys or mismatched tested application")
-    require(state["application_version"] == VERSION and state["package_version"] == PACKAGE_VERSION,
+    require(state["application_version"] in ("0.1.0", "0.1.1") and state["package_version"] == state["application_version"] + "-r1",
             "buildinfo release version differs")
-    apk_name = "diversion-dns-c-lite-" + PACKAGE_VERSION + "_" + arch + "_" + commit[:12] + ".apk"
+    apk_name = "diversion-dns-c-lite-" + state["package_version"] + "_" + arch + "_" + commit[:12] + ".apk"
     require(state["apk"]["filename"] == apk_name, "release APK filename differs")
+    source = verify_source(files, commit, Path(checkout), state)
+    cases = nft_cases(source)
     required = {"SHA256SUMS", apk_name, "source-" + commit + ".tar.gz", "LICENSE", "README.txt",
                 "buildinfo.json", "apk-metadata.json", "source-manifest.json", "elf-sdk-runtime.json",
                 "sdk.config", "regex-differential.json", "pcre2-reference-build.json",
                 "logs/sdk-no-unused-signing-keys.patch", "nft-cli/result.json", "nft-cli/grammar-nft"}
     required.update("logs/" + name + ".log" for name in COMMANDS)
-    for name, (_, calls) in NFT_CASES.items():
+    for name, (_, calls) in cases.items():
         required.update("nft-cli/" + name + suffix for suffix in (".stdout", ".stderr"))
         if calls:
             required.add("nft-cli/" + name + ".calls.jsonl")
     require(set(files) == required, "unexpected/missing release artifact files: " + repr(sorted(set(files) ^ required)))
     record_valid(state["apk"], "APK")
     require(state["apk"]["bytes"] == len(files[apk_name]) and state["apk"]["sha256"] == sha256(files[apk_name]), "APK file hash/size differs")
-    source = verify_source(files, commit, Path(checkout), state)
     for name in ("sdk_archive", "sdk_libc", "compiler_binary", "qemu"):
         record_valid(state[name], name)
     require(state["sdk_archive"]["sha256"] == state["target"]["sdk_sha256"], "SDK archive digest differs")

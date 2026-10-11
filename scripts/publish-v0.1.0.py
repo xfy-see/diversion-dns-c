@@ -233,8 +233,13 @@ def main():
     attempt = int(os.environ["GITHUB_RUN_ATTEMPT"])
     a.require(os.environ.get("GITHUB_REPOSITORY") == REPO and os.environ.get("GITHUB_REF") == "refs/heads/main"
               and os.environ.get("GITHUB_EVENT_NAME") == "push", "only this repository's main push may release")
-    a.require(run(["git", "rev-parse", "HEAD"]).decode().strip() == commit
-              and (ROOT / "VERSION").read_text().strip() == VERSION, "release checkout/version differs")
+    a.require(run(["git", "rev-parse", "HEAD"]).decode().strip() == commit, "release checkout differs")
+    # This publisher is an immutable historical release tool, not the current
+    # version publisher. Never label a later source tree as v0.1.0.
+    if (ROOT / "VERSION").read_text().strip() != VERSION:
+        print("Archived v0.1.0 publisher skipped for a newer source version")
+        return
+
     prior = existing_release()
     if prior:
         print("Complete stable v0.1.0 already exists; no changes: " + prior["html_url"])

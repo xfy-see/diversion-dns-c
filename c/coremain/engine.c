@@ -261,6 +261,7 @@ static int build_config(md_engine *e, const config *c, const char *path, char *e
 
 static int finalize(md_engine *e, bool cn, md_packet *response, uint64_t deadline, char *err) {
     if (md_now() >= deadline) return fail(err, "query execution deadline exceeded");
+    if (response->len && md_dns_normalize_ttl(response, err)) return -1;
     int rc = cn && e->nft && response->len ? md_nft_apply(e->nft, response, err) : 0;
     if (!rc && md_now() >= deadline) rc = fail(err, "query execution deadline exceeded");
     return rc;

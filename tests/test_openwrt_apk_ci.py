@@ -44,7 +44,7 @@ def load(name):
 
 def metadata(arch="aarch64_cortex-a53"):
     return {
-        "info": {"name": "diversion-dns-c-lite", "arch": arch, "version": "0.1.0-r1",
+        "info": {"name": "diversion-dns-c-lite", "arch": arch, "version": "0.1.1-r1",
                  "depends": ["libc", "libpthread"],
                  "installed-size": sum(map(len, CONTENTS.values()))},
         "paths": [{"name": str(Path(name).parent), "acl": {"mode": 0o755}, "files": [
@@ -345,7 +345,7 @@ class SyntheticBuild:
             for name in self.module.TESTS:
                 self.write(self.build / "tests" / name)
             if not self.omit_apk:
-                self.write(self.sdk / "bin/packages" / self.arch / "local/diversion-dns-c-lite-0.1.0-r1.apk", b"fake APK container")
+                self.write(self.sdk / "bin/packages" / self.arch / "local/diversion-dns-c-lite-0.1.1-r1.apk", b"fake APK container")
         elif command[0] == "make" and "defconfig" in command:
             label = "sdk-defconfig"
         elif command[0] == "make" and "package/diversion-dns-c-lite/compile" in command:
@@ -386,7 +386,7 @@ class SyntheticBuild:
         elif command[0].endswith("/sstrip"):
             label = "sstrip-rebuilt"
         elif command[0].endswith("/wrappers/packaged-app"):
-            label, text = "apk-version", "mosdns-c 0.1.0 fixed-splitter\n"
+            label, text = "apk-version", "mosdns-c 0.1.1 fixed-splitter\n"
         elif "/wrappers/" in command[0]:
             name = Path(command[0]).name
             label = "qemu-" + name
@@ -395,7 +395,7 @@ class SyntheticBuild:
             label = "qemu-domain-fixture"
         elif len(command) > 1 and command[1].endswith("nft_cli_test.py"):
             label = "qemu-nft-cli"
-            self.write(self.out / "nft-cli/result.json", json.dumps({"ok": True, "checks": [{"passed": True}] * 30}).encode())
+            self.write(self.out / "nft-cli/result.json", json.dumps({"ok": True, "checks": [{"passed": True}] * len(json.loads((ROOT / "c/tests/nft_cli_contract.json").read_text()))}).encode())
         elif len(command) > 1 and command[1].endswith("fixed_integration.py"):
             label, text = "qemu-final-apk-integration", "Ran 12 tests\n\nOK\n"
         elif len(command) > 1 and command[1].endswith("build-native-pcre2.py"):

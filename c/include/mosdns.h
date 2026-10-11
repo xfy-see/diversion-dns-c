@@ -33,6 +33,12 @@ void md_write32(uint8_t *p, uint32_t n);
  * records 可传 NULL 回调仅校验；回调非零会使遍历返回失败。 */
 int md_dns_question(const md_packet *p, md_question *q, char *err);
 int md_dns_records(const md_packet *p, md_rr_fn fn, void *arg, char *err);
+/* RFC 2181 high-bit handling and one-day policy cap, shared by wire/cache/nft.
+ * OPT's apparent TTL carries EDNS flags and must never pass through this. */
+static inline uint32_t md_dns_ttl(uint32_t ttl) {
+    return ttl > UINT32_C(0x7fffffff) ? 0 : ttl > 86400u ? 86400u : ttl;
+}
+int md_dns_normalize_ttl(md_packet *p, char *err);
 /* 校验请求/响应身份和完整结构，避免接收错误 ID、问题或损坏响应。 */
 bool md_dns_response_matches(const md_packet *q, const md_packet *r);
 /* 可解析时保留原问题区生成错误响应，否则生成无问题的最小头。

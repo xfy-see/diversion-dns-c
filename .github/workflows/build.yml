@@ -262,8 +262,44 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+  kernel:
+    name: Real kernel / GCC 14
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Install kernel test and strict GCC build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-14 nftables
+      - name: GCC default Werror build and portable tests
+        run: |
+          set -euo pipefail
+          mkdir -p .build/kernel-evidence
+          uname -a > .build/kernel-evidence/host.txt
+          gcc-14 --version > .build/kernel-evidence/compiler.txt
+          make -C c -j4 CC=gcc-14 REGEX_BACKEND=posix-lite BUILD=../.build/gcc-review all unit 2>&1 | tee .build/kernel-evidence/gcc.log
+          sha256sum .build/gcc-review/mosdns-c > .build/kernel-evidence/application.sha256
+      - name: Exercise real kernel transactions in an owned namespace
+        run: |
+          set -euo pipefail
+          sudo --preserve-env=GITHUB_SHA,GITHUB_RUN_ID unshare --net sh -c '
+            ip link set lo up
+            export DIVERSION_OWNED_NETNS=1
+            python3 c/tests/nft_kernel_test.py --application .build/gcc-review/mosdns-c --output .build/kernel-evidence/regression
+          '
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: kernel-regression-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          path: .build/kernel-evidence/
+          if-no-files-found: error
+          retention-days: 90
+
   delivery:
-    needs: [native, static]
+    needs: [native, static, kernel]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 10

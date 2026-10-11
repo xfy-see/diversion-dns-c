@@ -1,0 +1,242 @@
+{
+  "ipv4-plain": [
+    0,
+    2
+  ],
+  "ipv4-interval": [
+    0,
+    2
+  ],
+  "ipv6-plain": [
+    0,
+    2
+  ],
+  "ipv6-interval": [
+    0,
+    2
+  ],
+  "underscore-name": [
+    0,
+    2
+  ],
+  "maximum-name": [
+    0,
+    2
+  ],
+  "no-answer-does-not-spawn": [
+    0,
+    0
+  ],
+  "reject-table-digit-first": [
+    3,
+    0
+  ],
+  "reject-set-digit-first": [
+    3,
+    0
+  ],
+  "reject-hyphen-first": [
+    3,
+    0
+  ],
+  "reject-quote": [
+    3,
+    0
+  ],
+  "reject-semicolon": [
+    3,
+    0
+  ],
+  "reject-slash": [
+    3,
+    0
+  ],
+  "reject-backslash": [
+    3,
+    0
+  ],
+  "reject-too-long": [
+    3,
+    0
+  ],
+  "update-nonzero-exit": [
+    4,
+    2
+  ],
+  "reject-malformed-metadata": [
+    4,
+    1
+  ],
+  "update-bounded-timeout": [
+    4,
+    2
+  ],
+  "fast-dedup-ipv4": [
+    0,
+    0
+  ],
+  "fast-dedup-ipv6": [
+    0,
+    0
+  ],
+  "fast-reset-ipv4": [
+    0,
+    0
+  ],
+  "fast-reset-ipv6": [
+    0,
+    0
+  ],
+  "fast-renew-ipv4": [
+    0,
+    0
+  ],
+  "fast-renew-ipv6": [
+    0,
+    0
+  ],
+  "fast-existing-ipv4": [
+    0,
+    0
+  ],
+  "fast-existing-ipv6": [
+    0,
+    0
+  ],
+  "fast-interval-ipv4": [
+    4,
+    0
+  ],
+  "fast-interval-ipv6": [
+    4,
+    0
+  ],
+  "fast-error-ipv4": [
+    4,
+    0
+  ],
+  "fast-error-ipv6": [
+    4,
+    0
+  ],
+  "fast-permanent-ipv4": [
+    0,
+    0
+  ],
+  "fast-permanent-ipv6": [
+    0,
+    0
+  ],
+  "fast-permanent-reset-ipv4": [
+    0,
+    0
+  ],
+  "fast-permanent-reset-ipv6": [
+    0,
+    0
+  ],
+  "fast-old-kernel-ipv4": [
+    4,
+    0
+  ],
+  "fast-old-kernel-ipv6": [
+    4,
+    0
+  ],
+  "fast-ttl-highbit-ipv4": [
+    0,
+    0
+  ],
+  "fast-ttl-highbit-ipv6": [
+    0,
+    0
+  ],
+  "fast-ttl-cap-ipv4": [
+    0,
+    0
+  ],
+  "fast-ttl-cap-ipv6": [
+    0,
+    0
+  ],
+  "fast-race-before-ipv4": [
+    0,
+    0
+  ],
+  "fast-race-before-ipv6": [
+    0,
+    0
+  ],
+  "fast-race-after-ipv4": [
+    0,
+    0
+  ],
+  "fast-race-after-ipv6": [
+    0,
+    0
+  ],
+  "fast-race-flush-ipv4": [
+    0,
+    0
+  ],
+  "fast-race-flush-ipv6": [
+    0,
+    0
+  ],
+  "fast-race-forever-ipv4": [
+    4,
+    0
+  ],
+  "fast-race-forever-ipv6": [
+    4,
+    0
+  ],
+  "fast-restart-ipv4": [
+    0,
+    0
+  ],
+  "fast-restart-ipv6": [
+    0,
+    0
+  ],
+  "fast-sequence-ipv4": [
+    0,
+    0
+  ],
+  "fast-sequence-ipv6": [
+    0,
+    0
+  ],
+  "fast-small-buffer-ipv4": [
+    0,
+    0
+  ],
+  "fast-small-buffer-ipv6": [
+    0,
+    0
+  ],
+  "fast-large-answer-ipv4": [
+    4,
+    0
+  ],
+  "fast-large-answer-ipv6": [
+    4,
+    0
+  ],
+  "fast-cohort-ipv4": [
+    0,
+    0
+  ],
+  "fast-cohort-ipv6": [
+    0,
+    0
+  ],
+  "fast-cohort-poison-ipv4": [
+    0,
+    0
+  ],
+  "fast-cohort-poison-ipv6": [
+    0,
+    0
+  ]
+}

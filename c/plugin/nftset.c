@@ -18,6 +18,7 @@
 #include <sys/wait.h>
 #include <sys/syscall.h>
 #include <sys/socket.h>
+#include <sys/utsname.h>
 #include <stdatomic.h>
 #include <linux/netlink.h>
 #include <linux/netfilter.h>
@@ -371,6 +372,7 @@ static int nft_nl_receive(int fd, uint8_t *wire, size_t capacity, size_t *length
  * 乐观并发条件；不能用 nfgenmsg.res_id 的 16 位摘要替代。 */
 static int nft_nl_generation(int fd, uint32_t port, uint32_t seq, uint8_t *receive, uint64_t until, uint32_t *generation, char *err) {
     uint8_t request[20]; md_nl_requests requests; size_t length; int kernel_errno = 0;
+    if (!seq) { snprintf(err, MD_ERROR_SIZE, "nft sequence exhausted"); return -1; }
     if (md_nft_nl_getgen_encode(request, sizeof(request), &requests, port, seq) || nft_nl_send(fd, request, requests.length, until, err) || nft_nl_receive(fd, receive, MD_NL_BUFFER_SIZE, &length, until, err)) return -1;
     if (md_nft_nl_gen_consume(&requests, receive, length, generation, &kernel_errno)) { snprintf(err, MD_ERROR_SIZE, "invalid nft generation reply"); return -1; }
     if (kernel_errno) { snprintf(err, MD_ERROR_SIZE, "nft generation query: %s", strerror(kernel_errno)); return -1; }
@@ -478,6 +480,17 @@ int md_nft_enable_fast(md_nft *n, char *err) {
         (n->v4.enabled && n->v4.mask != 32) || (n->v6.enabled && n->v6.mask != 128)) {
         snprintf(err, MD_ERROR_SIZE, "fast nftset requires full-address /32 and /128 targets"); return -1;
     }
+#ifdef __linux__
+    /* Conservative deployment baseline; older/backported kernels must use the
+     * compatible path until their timeout-update semantics are validated. */
+    struct utsname system;
+    unsigned major = 0, minor = 0;
+    if (uname(&system) || sscanf(system.release, "%u.%u", &major, &minor) != 2 ||
+        major < 6 || (major == 6 && minor < 12)) {
+        snprintf(err, MD_ERROR_SIZE, "fast nftset requires Linux 6.12 or newer; use nftset_fast=0");
+        return -1;
+    }
+#endif
     n->fast_enabled = true; return 0;
 }
 

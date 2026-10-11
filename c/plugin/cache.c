@@ -121,7 +121,7 @@ typedef struct { md_packet *packet; uint64_t age; bool stale; } adjust_ttl;
 static int subtract_ttl(const md_packet *p, const md_rr *rr, void *arg) {
     (void)p; adjust_ttl *v = arg;
     if (rr->type != 41) md_write32(v->packet->data + rr->ttl_offset,
-        v->stale ? 5 : v->age < rr->ttl ? rr->ttl - (uint32_t)v->age : 0);
+        v->stale ? 5 : v->age < md_dns_ttl(rr->ttl) ? md_dns_ttl(rr->ttl) - (uint32_t)v->age : 0);
     return 0;
 }
 /* 返回 0 未命中、1 新鲜、2 stale。持锁期间复制完整报文并更新 LRU，
@@ -154,7 +154,8 @@ typedef struct { uint32_t minimum; unsigned extended_rcode; bool found, signed_;
 static int find_minimum_ttl(const md_packet *p, const md_rr *rr, void *arg) {
     (void)p; ttl_minimum *v = arg;
     if (rr->type != 41) {
-        if (!v->found || rr->ttl < v->minimum) v->minimum = rr->ttl;
+        uint32_t ttl = md_dns_ttl(rr->ttl);
+        if (!v->found || ttl < v->minimum) v->minimum = ttl;
         v->found = true;
         if (rr->type == 250 || (rr->type == 24 && rr->section == 2)) v->signed_ = true;
     } else v->extended_rcode = rr->ttl >> 24;

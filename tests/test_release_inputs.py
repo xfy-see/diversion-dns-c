@@ -25,6 +25,19 @@ def record(data=b"synthetic, never executed"):
     return {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
 
 
+class CorpusVersionContracts(unittest.TestCase):
+    def test_original_18_case_evidence(self):
+        self.assertEqual(len(verify.nft_cases({"VERSION": b"0.1.0"})), 18)
+
+    def test_fast_30_case_evidence(self):
+        self.assertEqual(len(verify.nft_cases({"VERSION": b"0.1.0", "c/plugin/nft_fast.h": b""})), 30)
+
+    def test_current_contract_from_verified_source(self):
+        manifest = (ROOT / "c/tests/nft_cli_contract.json").read_bytes()
+        self.assertEqual(len(verify.nft_cases({"VERSION": b"0.1.1", "c/tests/nft_cli_contract.json": manifest})), 60)
+        with self.assertRaises(ValueError):
+            verify.nft_cases({"VERSION": b"0.1.1", "c/plugin/nft_fast.h": b""})
+
 class Evidence:
     def __init__(self, root, arch="aarch64_cortex-a53"):
         self.root, self.arch = root, arch
@@ -37,6 +50,7 @@ class Evidence:
             "packaging/openwrt/targets.json": (ROOT / "packaging/openwrt/targets.json").read_bytes(),
             "c/main.c": b"synthetic C source, never compiled\n",
             "c/plugin/nftset.c": b"synthetic NFT source, never compiled\n",
+            "c/plugin/nft_fast.h": b"synthetic historical fast source\n",
             "c/tests/fixed_integration.py": (ROOT / "c/tests/fixed_integration.py").read_bytes(),
         }
         for name, data in self.source.items():

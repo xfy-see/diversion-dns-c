@@ -145,6 +145,33 @@ restricted syntax and printable-ASCII subject contract are documented in
 
 `nftset_fast=1` requires /32 IPv4 and /128 IPv6 targets in pre-existing **plain timeout sets** (flags timeout only, address types ipv4_addr / ipv6_addr). It makes no subprocess calls and does not create sets or rules. Keep static CN-IP prefixes in separate interval sets. The default remains the compatible interval/CLI implementation.
 
-The fast writer batches queued queries (up to 32), merges duplicate answer addresses, and waits for every kernel ACK before DNS success. Each cohort checks ruleset generation; external reload/flush invalidates metadata and address caches. Misses read existing expiration so a short-lived name does not shorten a shared address's longer-lived mapping. Updates explicitly refresh timeout and expiration; Linux 6.12 is the deployment baseline. TTL plus fifteen seconds is installed, with conservative cache-hit slack. A 2048-slot direct-mapped cache per family is bounded; collisions cause safe kernel readback. State allocation is lazy and below 0.7 MiB per configured instance. Missing/wrong sets, generation races, malformed ACKs and timeouts fail the cohort and reset its socket/cache; there is no CLI fallback or premature successful answer. A firewall change immediately after the final check is inherently outside the transaction; re-query after reload repairs cached answers.
+The fast writer batches up to 32 queued queries and 1024 address records, using
+socket-sized transactions of at most 512 keys. DNS success waits for all ACKs.
+Each response may contain at most 256 Answer IN A/AAAA records (duplicates count);
+larger answers fail before joining the queue. A failed cohort is retried member by
+member within fair shares of the original five-second deadlines, preserving healthy
+queries when another member has a bad target or update. It never returns a partial
+successful DNS answer. IPv4 and IPv6 writes are not one atomic transaction.
+
+Linux 6.12 or newer is checked at configuration time on Linux. Older/backported
+kernels must use `nftset_fast=0` until their behavior is validated. Every request
+checks generation; races and kernel ERESTART trigger at most three attempts within
+the original deadline. A post-ACK generation jump is revalidated, never blindly
+accepted: the external writer may have flushed the just-written mappings.
+
+Permanent existing elements are preserved, including after restart. A sufficiently
+long existing lease is reused; short leases are refreshed without shortening a
+longer shared mapping. No migration flush is required solely for permanent entries.
+The DNS response and cache normalize TTL high-bit values to zero (RFC 2181) and
+cap ordinary RR TTLs at 86400 seconds. OPT fields are exempt. nft installs that TTL
+plus 15 seconds, overriding the set's default timeout deliberately. No configurable
+minimum TTL or dynamic-set support is added. Transaction-signed responses requiring
+TTL rewriting fail rather than return an invalid signature.
+
+The 2048-slot cache per family remains bounded, generation-invalidated and lazy.
+Missing/wrong sets, malformed ACKs and exhausted deadlines fail closed, with no CLI
+fallback. Rule changes immediately after the final check remain outside any DNS/nft
+transaction; re-query after reload repairs cached answers. Existing connections can
+retain their route through the separate conntrack pinning rules.
 
 Route lookups must include both static CN-IP and dynamic DNS-learned sets. Do not remove dnsmasq learning until these lookups and C writes have passed real A/AAAA, first-connection, reload and rollback tests.

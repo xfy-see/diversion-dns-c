@@ -235,3 +235,28 @@ void md_dns_limit_udp(const md_packet *q, md_packet *r) {
     md_write16(r->data + 2, (uint16_t)(md_read16(r->data + 2) | 0x0200u));
     memset(r->data + 6, 0, 6);
 }
+
+/* Validate before mutation; don't invalidate transaction signatures by silently
+ * rewriting a TSIG/SIG(0) packet. DNSSEC RRSIG original-TTL data stays intact. */
+typedef struct { md_packet *packet; bool changed, signed_, write; } ttl_policy;
+static int normalize_ttl_record(const md_packet *p, const md_rr *rr, void *opaque) {
+    (void)p;
+    ttl_policy *v = opaque;
+    if (rr->type == 250 || (rr->type == 24 && rr->section == 2)) v->signed_ = true;
+    if (rr->type != 41 && rr->ttl != md_dns_ttl(rr->ttl)) {
+        v->changed = true;
+        if (v->write) md_write32(v->packet->data + rr->ttl_offset, md_dns_ttl(rr->ttl));
+    }
+    return 0;
+}
+int md_dns_normalize_ttl(md_packet *p, char *err) {
+    ttl_policy v = {.packet = p};
+    if (md_dns_records(p, normalize_ttl_record, &v, err)) return -1;
+    if (!v.changed) return 0;
+    if (v.signed_) {
+        if (err) snprintf(err, MD_ERROR_SIZE, "signed DNS response exceeds TTL policy");
+        return -1;
+    }
+    v.write = true;
+    return md_dns_records(p, normalize_ttl_record, &v, err);
+}

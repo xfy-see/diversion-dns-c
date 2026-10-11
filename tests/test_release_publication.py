@@ -21,9 +21,9 @@ spec.loader.exec_module(pub)
 
 class VersionContracts(unittest.TestCase):
     def test_application_recipe_and_metadata_share_version(self):
-        self.assertEqual((ROOT / "VERSION").read_text(), "0.1.0\n")
-        self.assertIn('puts("mosdns-c 0.1.0 fixed-splitter")', (ROOT / "c/main.c").read_text())
-        self.assertIn("PKG_VERSION:=0.1.0\nPKG_RELEASE:=1\n", (ROOT / "packaging/openwrt/Makefile").read_text())
+        self.assertEqual((ROOT / "VERSION").read_text(), "0.1.1\n")
+        self.assertIn('puts("mosdns-c 0.1.1 fixed-splitter")', (ROOT / "c/main.c").read_text())
+        self.assertIn("PKG_VERSION:=0.1.1\nPKG_RELEASE:=1\n", (ROOT / "packaging/openwrt/Makefile").read_text())
         self.assertIn("application_version", (ROOT / "scripts/artifacts.py").read_text())
 
     def test_only_main_push_release_job_gets_write_permission(self):

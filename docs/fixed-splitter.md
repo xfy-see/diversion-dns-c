@@ -85,6 +85,7 @@ cache_size=1024 # explanation
 | `tcp_idle_timeout` | 单值，所有 TCP listener 共用，1–86400 秒 | 30 |
 | `nftset_ipv4` | 单值，五段逗号格式，IPv4 mask 1–32 | 不学习 IPv4 |
 | `nftset_ipv6` | 单值，五段逗号格式，IPv6 mask 1–128 | 不学习 IPv6 |
+| `nftset_fast` | 单值，0/1；1 要求 Linux ≥6.12、/32 或 /128 和预建普通 timeout set | 0 |
 
 必须至少配置一个 listener。UDP 和 TCP listener **合计最多 64 个**，同一传输中的重复
 数字地址被拒绝。`cache_size=0` 时，非零 `cache_lazy_ttl` 会报错。
@@ -191,3 +192,15 @@ CN qname 条件下的一到两个 nftset 参数，随后 accept。它不尝试�
 本程序不会安装服务、接管系统 DNS、创建路由或自动调整生产环境。配置/规则预检、
 mock 功能回归、真实 Linux nft/出口验证、文件大小/RSS/QPS 和持续稳定性是不同证据，
 不能互相代替。
+
+## 快速 nft 学习的边界（0.1.1）
+
+普通 RR 的 TTL 最高位为 1 时按 0 处理，其余最多 86400 秒；返回报文、缓存、
+nft 学习使用同一规则，EDNS OPT 不改写。需要改写 TTL 的 TSIG/SIG(0) 报文会失败。
+fast 路径写入 TTL+15 秒，不继承 set 默认 timeout；已有永久元素不会被改短。
+目标必须 flags timeout（不含 dynamic/interval/map）；静态 CN-IP 保留独立集合。
+
+每个响应最多 256 条 Answer IN A/AAAA（重复也计数），超限只拒绝该请求；队列批次
+最多 32 个请求、1024 条地址。事务按实际 SO_SNDBUF 拆分。generation 竞争最多尝试
+三次，不延长原有 5 秒期限；批次失败后按成员剩余时间份额隔离，仍无法完成者返回失败。
+已有连接需要另外保存 conntrack 分流标记；新连接按当前地址集合判断。

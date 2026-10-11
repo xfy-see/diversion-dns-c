@@ -138,7 +138,7 @@ def main():
     # Helpers and recipe must correspond to the same frozen commit as the C code.
     for name in ["scripts/build-openwrt-apk.py", "scripts/check-openwrt-elf.py",
                  "scripts/stage-openwrt-package.py", "packaging/openwrt/Makefile",
-                 "packaging/openwrt/targets.json", "c/Makefile", "c/main.c", "VERSION"]:
+                 "packaging/openwrt/targets.json", "c/Makefile", "c/main.c", "VERSION", "c/tests/nft_cli_contract.json"]:
         expected = subprocess.check_output(["git", "show", commit + ":" + name], cwd=ROOT)
         require((ROOT / name).read_bytes() == expected, "uncommitted build input: " + name)
     version = (ROOT / "VERSION").read_text().strip()
@@ -147,6 +147,7 @@ def main():
     require(f"PKG_VERSION:={version}\n" in recipe and "PKG_RELEASE:=1\n" in recipe,
             "recipe version differs from application version")
     package_version = version + "-r1"
+    nft_count = len(json.loads((ROOT / "c/tests/nft_cli_contract.json").read_text()))
     work, out = args.work.resolve(), args.output.resolve()
     require(not work.exists() and not out.exists(), "fresh work and output directories required")
     work.mkdir(parents=True)
@@ -313,11 +314,11 @@ def main():
         require("43200 matches passed" in (logs / "qemu-cache_domain_test.log").read_text(), "concurrency corpus missing")
         require('"assertions":157' in (logs / "qemu-nft_netlink_test.log").read_text(), "netlink corpus missing")
         nft = json.loads((out / "nft-cli/result.json").read_text())
-        require(nft["ok"] and len(nft["checks"]) == 30 and all(item["passed"] for item in nft["checks"]), "nft CLI corpus changed or failed")
+        require(nft["ok"] and len(nft["checks"]) == nft_count and all(item["passed"] for item in nft["checks"]), "nft CLI corpus changed or failed")
         require("Ran 12 tests" in (logs / "qemu-final-apk-integration.log").read_text(), "final APK integration corpus missing")
         differential = json.loads((out / "regex-differential.json").read_text())
         require(differential["portable_comparisons"] == 81089 and differential["unexpected_differences"] == 0, "differential corpus changed or failed")
-        state["tests"] = {"final_apk_loopback_integration": 12, "netlink_mock_assertions": 157, "nft_cli_checks": 30,
+        state["tests"] = {"final_apk_loopback_integration": 12, "netlink_mock_assertions": 157, "nft_cli_checks": nft_count,
                           "regex_concurrent_matches": 43200, "portable_regex_comparisons": 81089,
                           "unexpected_regex_differences": 0, "known_budget_differences": 2,
                           "reference": "native PCRE2 10.48 no-Unicode/no-JIT built from same commit; not target performance"}

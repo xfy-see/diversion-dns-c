@@ -105,6 +105,22 @@ static void cache_tests(void) {
     assert(md_cache_get(c, &q, &hit, 810) == 2); assert_ttl(&hit, 5);
     md_cache_free(c);
 
+    c = md_cache_new(4, 0); assert(c);
+    query(&q, "ttl-cap.test", 0x0100, 1); positive(&q, &response, 0x7fffffff);
+    md_cache_put(c, &q, &response, 100);
+    assert(md_cache_get(c, &q, &hit, 100) == 1); assert_ttl(&hit, 86400);
+    assert(!md_cache_get(c, &q, &hit, 86500));
+    assert(!md_dns_normalize_ttl(&response, err)); assert_ttl(&response, 86400);
+    query(&q, "ttl-high.test", 0x0100, 1); positive(&q, &response, UINT32_MAX);
+    md_cache_put(c, &q, &response, 100); assert(!md_cache_get(c, &q, &hit, 100));
+    assert(!md_dns_normalize_ttl(&response, err)); assert_ttl(&response, 0);
+    positive(&q, &response, 0x80000000); add_opt(&response, true, false);
+    uint32_t opt = md_read32(response.data + response.len - 6);
+    assert(!md_dns_normalize_ttl(&response, err));
+    assert(md_read32(response.data + q.len + 6) == 0);
+    assert(md_read32(response.data + response.len - 6) == opt);
+    md_cache_free(c);
+
     c = md_cache_new(2, 0); assert(c);
     query(&q, "one.test", 0x0100, 1); positive(&q, &response, 30); md_cache_put(c, &q, &response, 1);
     query(&other, "two.test", 0x0100, 1); positive(&other, &response, 30); md_cache_put(c, &other, &response, 1);

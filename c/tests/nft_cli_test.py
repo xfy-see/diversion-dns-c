@@ -159,14 +159,15 @@ def main():
     case('update-bounded-timeout',interval=True,expected_rc=4,failure='timeout')
     # Fast mode uses only fake netlink. Repeated requests verify successful ACK
     # dedup, expiration renewal, reset recovery and strict metadata/error handling.
-    for mode, expected_batches, expected_rc in [('fast-dedup',1,0),('fast-reset',2,0),('fast-renew',2,0),('fast-existing',1,0),('fast-interval',0,4),('fast-error',1,4)]:
+    for mode, expected_batches, expected_rc in [('fast-dedup', 1, 0), ('fast-reset', 2, 0), ('fast-renew', 2, 0), ('fast-existing', 0, 0), ('fast-interval', 0, 4), ('fast-error', 1, 4), ('fast-permanent', 0, 0), ('fast-permanent-reset', 0, 0), ('fast-old-kernel', 0, 4), ('fast-ttl-highbit', 1, 0), ('fast-ttl-cap', 1, 0), ('fast-race-before', 1, 0), ('fast-race-after', 1, 0), ('fast-race-flush', 2, 0), ('fast-race-forever', 0, 4), ('fast-restart', 2, 0), ('fast-sequence', 2, 0), ('fast-small-buffer', 5, 0), ('fast-large-answer', 0, 4), ('fast-cohort', None, 0), ('fast-cohort-poison', 3, 0)]:
         for kind in ('ipv4','ipv6'):
             local_env=env|{'FAKE_MODE':mode,'NFT_TEST_LOG':str(out/(mode+'-'+kind+'.unexpected-cli'))}
             result=subprocess.run([str(driver),str(child),kind,'diag','learn'],capture_output=True,text=True,timeout=8,env=local_env)
             (out/(mode+'-'+kind+'.stdout')).write_text(result.stdout);(out/(mode+'-'+kind+'.stderr')).write_text(result.stderr)
             assert result.returncode==expected_rc,(mode,kind,result.stdout,result.stderr)
-            stats=json.loads(result.stdout.splitlines()[0]);assert stats['batches']==expected_batches,(mode,kind,stats)
-            assert stats['opens']==stats['closes']==1,(mode,kind,stats)
+            stats=json.loads(result.stdout.splitlines()[0]);assert expected_batches is None or stats['batches']==expected_batches,(mode,kind,stats)
+            assert stats['opens']==stats['closes'],(mode,kind,stats)
+            assert stats['opens'] <= 3,(mode,kind,stats)
             assert not Path(local_env['NFT_TEST_LOG']).exists(),'fast path invoked CLI'
             checks.append({'label':mode+'-'+kind,'exit':expected_rc,'calls':0,'passed':True,'device_or_kernel_evidence':False})
     if args.old_source:
