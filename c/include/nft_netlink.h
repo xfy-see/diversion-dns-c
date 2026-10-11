@@ -187,8 +187,10 @@ static inline int md_nft_nl_gen_consume(md_nl_requests *r,const uint8_t *p,size_
 }
 /* GETSET metadata only: never dump elements. Require an ordinary timeout
  * address set, rejecting interval/map/constant/concatenated sets before writing.
- * Optional future attributes are length-checked, not interpreted. */
-static inline int md_nft_nl_set_consume(md_nl_requests *r,const uint8_t *p,size_t n,uint8_t family,const char *table,const char *set,unsigned bytes,int *kernel_errno) {
+ * Optional future attributes are length-checked, not interpreted.
+ * plain=true (compatible CLI path) accepts any non-interval, non-map address
+ * set: FLAGS may be absent (flags 0) and constant/timeout/dynamic/expr bits are allowed. */
+static inline int md_nft_nl_set_check(md_nl_requests *r,const uint8_t *p,size_t n,uint8_t family,const char *table,const char *set,unsigned bytes,int *kernel_errno,bool plain) {
     if(!r||r->count!=1||!p||n<20||n>MD_NL_BUFFER_SIZE||!kernel_errno||r->seen[0])return -1;
     *kernel_errno=0;size_t len=md_nl_u32(p);
     if(len!=n||md_nl_align(len)!=n||md_nl_u32(p+8)!=md_nl_u32(r->wire+8)||md_nl_u32(p+12)!=r->port)return -1;
@@ -202,11 +204,20 @@ static inline int md_nft_nl_set_consume(md_nl_requests *r,const uint8_t *p,size_
     seen|=1u<<kind;
             if(kind<=2){const char *want=kind==1?table:set;size_t z=strlen(want)+1;if(a!=4+z||memcmp(p+4,want,z))return -1;}
             else {if(a!=8)return -1;
-    uint32_t v=md_nl_read_be32(p+4);if((kind==3&&v!=16)||(kind==4&&v!=(bytes==4?7u:8u))||(kind==5&&v!=bytes))return -1;}
+    uint32_t v=md_nl_read_be32(p+4);
+                /* ANONYMOUS|INTERVAL|MAP|OBJECT|CONCAT are never plain address sets; the
+                 * kernel itself decides CONSTANT/bound-set updates, as for the CLI check. */
+                if((kind==3&&(plain?(v&0xCDu)!=0:v!=16))||(kind==4&&v!=(bytes==4?7u:8u))||(kind==5&&v!=bytes))return -1;}
         }
         p+=md_nl_align(a);len-=md_nl_align(a);
     }
-    if(seen!=62)return -1;
+    if(plain?(seen|8u)!=62:seen!=62)return -1;
     r->seen[0]=true;return 0;
+}
+static inline int md_nft_nl_set_consume(md_nl_requests *r,const uint8_t *p,size_t n,uint8_t family,const char *table,const char *set,unsigned bytes,int *kernel_errno) {
+    return md_nft_nl_set_check(r,p,n,family,table,set,bytes,kernel_errno,false);
+}
+static inline int md_nft_nl_plain_set_consume(md_nl_requests *r,const uint8_t *p,size_t n,uint8_t family,const char *table,const char *set,unsigned bytes,int *kernel_errno) {
+    return md_nft_nl_set_check(r,p,n,family,table,set,bytes,kernel_errno,true);
 }
 #endif

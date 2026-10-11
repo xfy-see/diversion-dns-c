@@ -1,7 +1,7 @@
 {
   "ipv4-plain": [
     0,
-    2
+    1
   ],
   "ipv4-interval": [
     0,
@@ -9,7 +9,7 @@
   ],
   "ipv6-plain": [
     0,
-    2
+    1
   ],
   "ipv6-interval": [
     0,
@@ -17,11 +17,11 @@
   ],
   "underscore-name": [
     0,
-    2
+    1
   ],
   "maximum-name": [
     0,
-    2
+    1
   ],
   "no-answer-does-not-spawn": [
     0,
@@ -237,6 +237,46 @@
   ],
   "fast-cohort-poison-ipv6": [
     0,
+    0
+  ],
+  "plain-sequence-wrap-ipv4": [
+    0,
+    0
+  ],
+  "plain-sequence-wrap-ipv6": [
+    0,
+    0
+  ],
+  "plain-race-retry-ipv4": [
+    0,
+    0
+  ],
+  "plain-race-retry-ipv6": [
+    0,
+    0
+  ],
+  "plain-race-forever-ipv4": [
+    4,
+    0
+  ],
+  "plain-race-forever-ipv6": [
+    4,
+    0
+  ],
+  "plain-restart-ipv4": [
+    0,
+    0
+  ],
+  "plain-restart-ipv6": [
+    0,
+    0
+  ],
+  "plain-interval-metadata-ipv4": [
+    4,
+    0
+  ],
+  "plain-interval-metadata-ipv6": [
+    4,
     0
   ]
 }

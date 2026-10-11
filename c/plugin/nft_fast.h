@@ -348,6 +348,8 @@ static int nft_fast_cohort(md_nft *n, nft_fast_waiter **cohort, size_t count,
         nft_fast_reset(s);
         if (!rc) snprintf(err, MD_ERROR_SIZE, "fast nft deadline exceeded after verification");
         if (rc != NFT_FAST_RETRY) return -1;
+        /* Concurrent writers: jittered backoff instead of an immediate retry. */
+        if (attempt + 1 < NFT_FAST_ATTEMPTS) nft_retry_backoff(attempt, until);
     }
     snprintf(err, MD_ERROR_SIZE, "fast nft retry budget/deadline exhausted");
     return -1;
@@ -380,6 +382,8 @@ static int nft_fast_count(const md_packet *p, const md_rr *rr, void *arg) {
 static int nft_fast_apply(md_nft *n, const md_packet *r, char *err) {
     nft_fast_waiter self = {.packet = r, .until = milliseconds() + 5000};
     if (md_dns_records(r, nft_fast_count, &self.addresses, err)) return -1;
+    /* No A/AAAA (NXDOMAIN, TXT, CNAME-only): nothing to learn, no netlink round trip. */
+    if (!self.addresses) return 0;
     if (self.addresses > NFT_FAST_ANSWER_KEYS) {
         snprintf(err, MD_ERROR_SIZE, "fast nft answer exceeds 256 address records");
         return -1;
