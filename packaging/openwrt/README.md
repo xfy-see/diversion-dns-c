@@ -103,9 +103,11 @@ for verified inputs, measured values, and the current limitations.
 
 `.github/workflows/openwrt-apk.yml` runs on branch pushes, pull requests and
 manual dispatch. It does not itself publish a GitHub Release. The one-version
-`v0.1.0` main-only release job waits for these two jobs and all four regular
-build/test jobs, independently downloads and verifies their exact artifacts,
-and publishes them together without changing the PCRE2 default. Its two independently named artifacts
+main-only release jobs in `build.yml` (`release-011` for `v0.1.1`; the archived
+`release-010` for `v0.1.0` skips because `VERSION` no longer matches) wait for
+these two jobs and all four regular build/test jobs, independently download and
+verify their exact artifacts, and publish them together without changing the
+PCRE2 default. An existing tag or release is never overwritten. The APK workflow's two independently named artifacts
 contain an architecture-suffixed APK, SHA256SUMS, the exact Git source archive,
 source manifest, SDK configuration, buildinfo, ABI checks and raw test logs:
 
@@ -183,12 +185,16 @@ Both directories must be new. Use `aarch64_cortex-a53` and its SDK for ARM64.
 The wrapper freezes committed build inputs and rejects modified helper/recipe
 files. It only works on build artifacts and never connects to a router.
 
-## v0.1.0 version and migration
+## v0.1.1 version and migration
 
-The application version is `0.1.0`; this recipe produces `0.1.0-r1`.
-Historical experimental packages used `0.2.0-r1`, so APK version ordering treats
-this release as a downgrade, not an automatic upgrade. Back up configuration
-and rules before arranging a separate installation. Never force-overwrite user
-configuration. The release changes no running device or trust configuration.
-See [the release notes](../../docs/release-v0.1.0.md) for exact verification and
-hardware-acceptance boundaries.
+The application version is `0.1.1`; this recipe produces `0.1.1-r1`, which APK
+version ordering treats as an upgrade over `0.1.0-r1`. Historical experimental
+packages used `0.2.0-r1` and still compare higher, so replacing one of those is
+a downgrade, not an automatic upgrade. Back up configuration and rules before
+arranging a separate installation. Never force-overwrite user configuration.
+The release changes no running device or trust configuration. See
+[the v0.1.1 release notes](../../docs/release-v0.1.1.md) for behaviour changes,
+exact verification and hardware-acceptance boundaries.
+
+The previous release, `v0.1.0` (`0.1.0-r1`), is described in
+[its release notes](../../docs/release-v0.1.0.md).

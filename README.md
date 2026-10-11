@@ -4,7 +4,13 @@
 
 原始问题名匹配 CN 规则后，走共享缓存及唯一 CN/foreign 上游组；CN 回答包含缓存命中都经过原有 nft 最终处理。保留数字 UDP/TCP 上游、TCP 持久连接、TTL/LRU/lazy 缓存、Linux mark/接口绑定和 domain/full/keyword/regexp。没有跨组 fallback、热重载、服务安装或系统 DNS 接管。GPL-3.0-or-later；未参与构建的历史 libyaml 源码和原 MIT 许可证保留。
 
-## v0.1.0 正式版本
+## v0.1.1 正式版本
+
+[下载 v0.1.1](https://github.com/xfy-see/diversion-dns-c/releases/tag/v0.1.1) · [发布说明与升级注意](docs/release-v0.1.1.md)
+
+v0.1.1 是稳定性版本：新增可选的 `nftset_fast` netlink 快速路径，修复并发写入 SERVFAIL、netlink 序列号耗尽、上游黑洞拖垮查询、musl 小线程栈段错误、TCP 慢客户端与 slowloris 等问题，并新增排队期限和 TCP 连接上限配置。`--cpu` 含义、最坏内存和 SERVFAIL 行为有变化，升级前请阅读发布说明。附件组成与 v0.1.0 相同（`0.1.1-r1` 双架构 APK、PCRE2/lite 验证包、SHA256、buildinfo）；`0.1.1-r1` 高于 `0.1.0-r1`。
+
+## v0.1.0（上一版本）
 
 [下载 v0.1.0](https://github.com/xfy-see/diversion-dns-c/releases/tag/v0.1.0) · [发布说明与迁移边界](docs/release-v0.1.0.md)
 
@@ -46,9 +52,9 @@ python3 scripts/migrate-site-config.py docs/go-profiles-site-only.yaml -o /tmp/s
 | Linux ARM64 static | 固定 Zig 0.14.1、PCRE2 10.48，静态 musl 程序和全部测试程序 |
 | Linux x86_64 static | 同样固定依赖的静态 musl 程序和全部测试程序 |
 
-同一工作流还显式构建并验证 POSIX-lite：native/sanitizer 覆盖 macOS ARM64 和 Linux x86_64，静态 musl 覆盖 Linux ARM64/x86_64。它们分别保存在 `experimental-lite-*` Actions 产物中，并在 manifest 内记录 backend；默认产物仍为 PCRE2，lite 不进入原有 CI 预发布；v0.1.0 正式版本另行收录经过同源验证的 lite 包。OpenWrt APK 另走 [SDK 实验流程](packaging/openwrt/README.md)。
+同一工作流还显式构建并验证 POSIX-lite：native/sanitizer 覆盖 macOS ARM64 和 Linux x86_64，静态 musl 覆盖 Linux ARM64/x86_64。它们分别保存在 `experimental-lite-*` Actions 产物中，并在 manifest 内记录 backend；默认产物仍为 PCRE2，lite 不进入原有 CI 预发布；正式版本（v0.1.0、v0.1.1）另行收录经过同源验证的 lite 包。OpenWrt APK 另走 [SDK 实验流程](packaging/openwrt/README.md)。
 
-v0.1.0 的一次性正式发布还等待双 APK job，并独立验证下载内容；已有 tag/release 一律不覆盖。
+每个正式版本由各自的一次性发布 job（`release-010`、`release-011`）发布，只在 `VERSION` 与该版本一致时运行；它还等待双 APK job，并独立验证下载内容；已有 tag/release 一律不覆盖。
 
 main 分支的四个编译/测试 job 成功后，delivery job 会生成 `ci-<commit>-run<id>-attempt<n>` 预发布版本。四个同源 `.tar.gz` 下载包与 `SHA256SUMS` 可以直接从 GitHub Releases 下载，无需 Actions 登录；它们保留 Actions 包内同一份文件。
 
