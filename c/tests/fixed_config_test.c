@@ -54,12 +54,18 @@ static void basic_contract(void) {
     const md_listener *listener = md_engine_listener(e, 0); assert(listener);
     assert(!listener->tcp && listener->entry == 0 && listener->idle_timeout == 30);
     assert(!strcmp(listener->listen, "127.0.0.1:5300"));
-    assert(!md_engine_listener(e, 1)); md_engine_free(e);
+    assert(!md_engine_listener(e, 1));
+    const md_server_limits *limits = md_engine_server_limits(e); assert(limits);
+    assert(limits->queue_timeout_ms == 2000 && limits->tcp_read_timeout == 5 && limits->tcp_write_timeout == 10);
+    assert(limits->tcp_max_connections == 128 && limits->tcp_max_connections_per_ip == 32);
+    assert(!md_engine_server_limits(NULL)); md_engine_free(e);
     accept_config("listen_tcp=[::1]:5300\ntcp_idle_timeout=86400\n");
     accept_config("# whole-line comment\n\n  # indented comment\ncache_size = 0\n");
     accept_config("cache_size=10000000\ncache_lazy_ttl=4294967295\ncn_mark=0xffffffff\nforeign_mark=4294967295\ncn_concurrent=3\nforeign_concurrent=3\n");
     accept_config("cn_mark=0\nforeign_mark=0x0\ncn_concurrent=1\nforeign_concurrent=1\ntcp_idle_timeout=1\n");
     accept_config("cn_interface=eth0.100\nforeign_interface=wg-test_0\n");
+    accept_config("queue_timeout_ms=0\ntcp_read_timeout=1\ntcp_write_timeout=1\ntcp_max_connections=1\ntcp_max_connections_per_ip=1\n");
+    accept_config("queue_timeout_ms=60000\ntcp_read_timeout=300\ntcp_write_timeout=300\ntcp_max_connections=1024\ntcp_max_connections_per_ip=1024\n");
     accept_config("nftset_fast=1\nnftset_ipv4=inet,dns,cn4,ipv4_addr,32\nnftset_ipv6=inet,dns,cn6,ipv6_addr,128\n");
     accept_config("nftset_ipv4=ip,dns,cn4,ipv4_addr,1\nnftset_ipv6=ip6,dns,cn6,ipv6_addr,1\n");
     accept_config("cn_upstream=tcp://[::1]:5353\nforeign_upstream=udp://127.0.0.1:5353\n");
@@ -84,6 +90,10 @@ static void malformed_contract(void) {
         "cn_mark=4294967296\n", "foreign_mark=0x100000000\n", "cn_mark=0x\n", "cn_mark=-1\n", "cn_mark=+1\n", "cn_mark=1e2\n",
         "cn_concurrent=0\n", "cn_concurrent=4\n", "foreign_concurrent=-1\n", "foreign_concurrent=4294967296\n",
         "tcp_idle_timeout=0\n", "tcp_idle_timeout=86401\n", "tcp_idle_timeout=-1\n",
+        "queue_timeout_ms=60001\n", "queue_timeout_ms=-1\n", "queue_timeout_ms=2s\n",
+        "tcp_read_timeout=0\n", "tcp_read_timeout=301\n", "tcp_write_timeout=0\n", "tcp_write_timeout=301\n",
+        "tcp_max_connections=0\n", "tcp_max_connections=1025\n",
+        "tcp_max_connections_per_ip=0\n", "tcp_max_connections_per_ip=1025\n",
         "cn_interface=eth/0\n", "foreign_interface=eth\\0\n", "cn_interface=eth 0\n", "foreign_interface=eth\t0\n", "cn_interface=eth\0010\n",
         "nftset_fast=1\n", "nftset_fast=2\n", "nftset_fast=1\nnftset_ipv4=inet,t,s,ipv4_addr,24\n",
         "cache_size=10 # inline comments are not supported\n", "cache_size='10'\n", "cache_size=\"10\"\n", "cache_size=${CACHE_SIZE}\n",
@@ -99,6 +109,8 @@ static void malformed_contract(void) {
     for (size_t i = 0; i < sizeof(bad)/sizeof(bad[0]); ++i) reject(bad[i]);
     const char *single[] = {"cache_size=1", "cache_lazy_ttl=0", "cn_mark=0", "foreign_mark=0",
         "cn_interface=lo", "foreign_interface=lo", "cn_concurrent=1", "foreign_concurrent=1", "tcp_idle_timeout=30",
+        "queue_timeout_ms=2000", "tcp_read_timeout=5", "tcp_write_timeout=10", "tcp_max_connections=128",
+        "tcp_max_connections_per_ip=32",
         "nftset_ipv4=inet,t,s,ipv4_addr,32", "nftset_ipv6=inet,t,s,ipv6_addr,128"};
     for (size_t i = 0; i < sizeof(single)/sizeof(single[0]); ++i) {
         char extra[1024]; snprintf(extra, sizeof(extra), "%s\n%s\n", single[i], single[i]); reject(extra);

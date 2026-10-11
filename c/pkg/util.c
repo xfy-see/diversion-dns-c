@@ -9,6 +9,11 @@ uint64_t md_now(void) {
     if (clock_gettime(CLOCK_MONOTONIC, &ts)) return 0;
     return (uint64_t)ts.tv_sec;
 }
+uint64_t md_now_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts)) return 0;
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
 /* worker 与 lazy refresh 线程会执行 nft、缓存和上游代码；不依赖链接参数，
  * 显式保证线程栈不小于 MD_THREAD_STACK，平台默认更大时保持不变。 */
 int md_thread_create(pthread_t *thread, void *(*fn)(void *), void *arg) {
