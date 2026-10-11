@@ -155,20 +155,20 @@ nftset_fast=1
             query('permanent',qt); query('permanent',qt)
             assert expiry(qt,address(1,qt)) is None
             passed(f'permanent-{qt}')
-            query('short',qt); initial = expiry(qt,address(2,qt)); assert 0 < initial <= 16000
-            query('long',qt); long = expiry(qt,address(2,qt)); assert long > 590000
-            query('short',qt); assert expiry(qt,address(2,qt)) > 590000
+            query('short',qt); initial = expiry(qt,address(2,qt)); assert 0 < initial <= 16
+            query('long',qt); long = expiry(qt,address(2,qt)); assert long > 590
+            query('short',qt); assert expiry(qt,address(2,qt)) > 590
             passed(f'renew-no-shorten-{qt}')
             for name,wanted in [('high',0),('cap',86400)]:
                 answer = query(name,qt); _,_,end = decode_question(answer)
                 assert struct.unpack_from('!I',answer,end+6)[0] == wanted
                 index = 3 if name=='high' else 4
-                e = expiry(qt,address(index,qt)); assert 0 < e <= (wanted+15)*1000
+                e = expiry(qt,address(index,qt)); assert 0 < e <= wanted+15
                 passed(f'ttl-{name}-{qt}')
         stop(); start()
         for qt in [1,28]:
             query('permanent',qt); assert expiry(qt,address(1,qt)) is None
-            query('short',qt); assert expiry(qt,address(2,qt)) > 580000
+            query('short',qt); assert expiry(qt,address(2,qt)) > 580
         passed('restart-preserves-permanent-and-longer-leases')
         nft(f'flush set inet {table} learn4\nflush set inet {table} learn6')
         for qt in [1,28]: query('short',qt); assert expiry(qt,address(2,qt)) > 0

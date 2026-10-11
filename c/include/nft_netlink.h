@@ -43,7 +43,8 @@ static inline int md_nl_reserve(md_nl_writer *w,size_t n,size_t *at) {
 static inline int md_nl_attr(md_nl_writer *w,uint16_t type,const void *data,size_t n) {
     size_t at;if(n>65531u||md_nl_reserve(w,md_nl_align(n+4),&at))return -1;
     md_nl_put16(w->wire+at,(uint16_t)(n+4));md_nl_put16(w->wire+at+2,type);
-    if(n)memcpy(w->wire+at+4,data,n);return 0;
+    if(n)memcpy(w->wire+at+4,data,n);
+    return 0;
 }
 /* 嵌套属性先写 NLA_F_NESTED，结束时回填长度；长度包含子属性及
  * 它们的 padding，但单个属性的 nla_len 不含自己的末尾对齐填充。 */
