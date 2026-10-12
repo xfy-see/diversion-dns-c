@@ -2,6 +2,9 @@
 /* 上游转发采用非阻塞 socket 和 poll 驱动状态机。连接池只在显式启用的
  * worker 线程内存在；普通库调用使用新连接，不依赖服务端线程生命周期。 */
 #define _GNU_SOURCE
+#ifdef __APPLE__
+#define _DARWIN_C_SOURCE /* arc4random_buf under -std=c11/_POSIX_C_SOURCE */
+#endif
 #include "mosdns.h"
 #include <arpa/inet.h>
 #include <errno.h>
