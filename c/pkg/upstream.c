@@ -122,6 +122,8 @@ int md_upstream_init(md_upstream *u, const char *addr, const char *dial_addr,
 typedef enum { CONNECTING, SENDING, UDP_READING, TCP_LENGTH, TCP_BODY, DEAD } phase;
 #define WORKER_TCP_CAPACITY 8
 #define WORKER_TCP_IDLE_MS 30000
+#define WORKER_UDP_SPARES 8
+#define WORKER_UDP_DEAD 16
 /* 空闲 socket 归池所有，借出后由 exchange 持有 fd。每条连接记录已用 ID，
  * 复用同一 ID 前退休连接，避免旧响应被当成新查询的结果。 */
 typedef struct {
@@ -153,6 +155,16 @@ typedef struct {
     exchange exchanges[3];
     md_packet query; /* The upstream copy of the query (random ID, M4). */
     bool exchanges_in_use;
+    /* M4 keeps one fresh, never-used UDP socket per upstream. Each socket still
+     * carries exactly one query (its own kernel-random ephemeral port), but
+     * socket/fcntl/connect and close of the used one run in
+     * md_forward_worker_idle() after the reply, not on the query's path. */
+    int spare_fd[WORKER_UDP_SPARES];
+    uint64_t spare_born[WORKER_UDP_SPARES];
+    md_upstream spare_key[WORKER_UDP_SPARES];
+    bool spare_wanted[WORKER_UDP_SPARES];
+    int dead_fd[WORKER_UDP_DEAD];
+    unsigned dead_count;
 } worker_connections;
 /* 池和可复用报文缓冲都属于当前线程，不需要跨 worker 加锁。 */
 static _Thread_local worker_connections *worker_tcp;
@@ -210,14 +222,18 @@ static void retire(worker_connection *c) {
 void md_forward_worker_cleanup(void) {
     if (!worker_tcp) return;
     for (unsigned i = 0; i < WORKER_TCP_CAPACITY; i++) retire(&worker_tcp->slots[i]);
+    for (unsigned i = 0; i < WORKER_UDP_SPARES; i++) if (worker_tcp->spare_fd[i] >= 0) close(worker_tcp->spare_fd[i]);
+    for (unsigned i = 0; i < worker_tcp->dead_count; i++) close(worker_tcp->dead_fd[i]);
     free(worker_tcp); worker_tcp = NULL;
 }
 /* 分配失败时保持 NULL，后续转发自动退回临时 exchange 和新 socket。 */
 void md_forward_worker_enable(void) {
     md_forward_worker_cleanup();
     worker_tcp = calloc(1, sizeof(*worker_tcp));
-    if (worker_tcp)
+    if (worker_tcp) {
         for (unsigned i = 0; i < WORKER_TCP_CAPACITY; i++) worker_tcp->slots[i].fd = -1;
+        for (unsigned i = 0; i < WORKER_UDP_SPARES; i++) worker_tcp->spare_fd[i] = -1;
+    }
 }
 /* 池键包含目标、配置协议、mark 和设备，避免复用改变了路由约束的连接。 */
 static bool same_endpoint(const md_upstream *a, const md_upstream *b) {
@@ -270,7 +286,10 @@ static worker_connection *take_connection(const md_upstream *u, bool tcp, uint16
 }
 /* 失败和未胜出的 exchange 都关闭自己持有的 fd，并释放对应池槽。 */
 static void stop(exchange *x) {
-    if (x->fd >= 0) close(x->fd);
+    /* A used UDP socket is never reused; its close is deferred to idle time. */
+    if (x->fd >= 0 && !x->tcp && !x->cached && worker_tcp && worker_tcp->dead_count < WORKER_UDP_DEAD)
+        worker_tcp->dead_fd[worker_tcp->dead_count++] = x->fd;
+    else if (x->fd >= 0) close(x->fd);
     x->fd = -1; x->state = DEAD; x->udp_retry = 0;
     if (x->cached) { retire(x->cached); x->cached = NULL; }
     x->reused = x->dirty = false;
@@ -297,6 +316,48 @@ static int socket_options(int fd, const md_upstream *u, char *err) {
         return syserr(err, "set socket flags");
     return 0;
 }
+/* Hand out this upstream's pre-opened UDP socket (single use) and ask
+ * md_forward_worker_idle() to open its replacement. A spare that is stale,
+ * retargeted, or already holds a datagram is closed instead of used. */
+static int take_spare(const md_upstream *u) {
+    if (!worker_tcp) return -1;
+    unsigned free_slot = WORKER_UDP_SPARES;
+    for (unsigned i = 0; i < WORKER_UDP_SPARES; i++) {
+        if (!worker_tcp->spare_wanted[i]) { if (free_slot == WORKER_UDP_SPARES) free_slot = i; continue; }
+        if (!same_endpoint(&worker_tcp->spare_key[i], u)) continue;
+        int fd = worker_tcp->spare_fd[i];
+        worker_tcp->spare_fd[i] = -1;
+        if (fd < 0) return -1;
+        if (milliseconds() - worker_tcp->spare_born[i] < WORKER_TCP_IDLE_MS && quiet_socket(fd)) return fd;
+        close(fd); return -1;
+    }
+    if (free_slot < WORKER_UDP_SPARES) {
+        worker_tcp->spare_key[free_slot] = *u; worker_tcp->spare_wanted[free_slot] = true;
+    }
+    return -1;
+}
+void md_forward_worker_idle(void) {
+    if (!worker_tcp) return;
+    for (unsigned i = 0; i < worker_tcp->dead_count; i++) close(worker_tcp->dead_fd[i]);
+    worker_tcp->dead_count = 0;
+    for (unsigned i = 0; i < WORKER_UDP_SPARES; i++) {
+        if (!worker_tcp->spare_wanted[i]) continue;
+        if (worker_tcp->spare_fd[i] >= 0) {
+            /* An upstream unused for the idle period loses its slot. */
+            if (milliseconds() - worker_tcp->spare_born[i] >= WORKER_TCP_IDLE_MS) {
+                close(worker_tcp->spare_fd[i]); worker_tcp->spare_fd[i] = -1; worker_tcp->spare_wanted[i] = false;
+            }
+            continue;
+        }
+        const md_upstream *u = &worker_tcp->spare_key[i];
+        int fd = socket(u->address.ss_family, SOCK_DGRAM, 0);
+        if (fd < 0) continue;
+        if (socket_options(fd, u, NULL) || connect(fd, (const struct sockaddr *)&u->address, u->address_len)) {
+            close(fd); continue;
+        }
+        worker_tcp->spare_fd[i] = fd; worker_tcp->spare_born[i] = milliseconds();
+    }
+}
 /* 借用时把 fd 从池槽移到 exchange；成功后 keep_response 才将所有权交还。 */
 /* M4: only TCP connections are pooled. Every UDP exchange opens a fresh
  * connected socket, so the kernel picks a new random ephemeral source port per
@@ -310,6 +371,7 @@ static int begin_connection(exchange *x, const md_upstream *u, bool tcp, bool al
             x->state = SENDING; x->reused = true; return 0;
         }
     }
+    if (!tcp && (x->fd = take_spare(u)) >= 0) { x->state = SENDING; return 0; }
     x->fd = socket(u->address.ss_family, tcp ? SOCK_STREAM : SOCK_DGRAM, 0);
     if (x->fd < 0) { syserr(err, "create upstream socket"); stop(x); return -1; }
     if (socket_options(x->fd, u, err)) { stop(x); return -1; }

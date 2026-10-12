@@ -92,6 +92,9 @@ int md_forward(const md_upstream *us, size_t count, unsigned concurrent,
  * Unscoped/library calls keep fresh sockets. Allocation failure also stays fresh. */
 void md_forward_worker_enable(void);
 void md_forward_worker_cleanup(void);
+/* Called by a worker after replying: closes used UDP sockets and pre-opens a
+ * fresh single-use UDP socket per recently used upstream (M4 port randomness). */
+void md_forward_worker_idle(void);
 
 /* nft 对象负责提取响应 Answer 中 IN 类 A/AAAA 并更新既有集合。
  * 创建只解析参数，Linux 写入在 apply 执行；销毁前调用方须确保所有
