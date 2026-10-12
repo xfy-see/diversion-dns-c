@@ -11,6 +11,10 @@ Checks:
   foreign-lane-recovery   R1: stale queued jobs are dropped; identical in-flight queries coalesce
   tcp-slow-readers        R2: TCP clients that never read cannot make UDP CN cache hits SERVFAIL
   tcp-connection-limits   M5: 1-byte TCP clients cannot lock out new TCP clients; read/write deadlines
+  interval-overlap        M1: interval sets without auto-merge: overlapping prefixes are skipped, the
+                          rest is added, the answer is NOERROR; `check` warns about missing auto-merge
+  upstream-id-spoof       M4: random upstream ID and UDP source port; wrong-ID, wrong-question and
+                          off-socket replies are ignored and never cached or learned
 """
 import argparse
 import concurrent.futures
@@ -53,7 +57,8 @@ class Upstream:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(('127.0.0.1', 0)); self.port = self.sock.getsockname()[1]
         self.blackhole = False; self.closed = False
-        self.lock = threading.Lock(); self.counts = {}
+        self.lock = threading.Lock(); self.counts = {}; self.seen = []
+        self.other = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); self.other.bind(('127.0.0.1', 0))
         threading.Thread(target=self.serve, daemon=True).start()
 
     def count(self, name):
@@ -74,6 +79,44 @@ class Upstream:
                 self.counts[name] = self.counts.get(name, 0) + 1
             if self.blackhole or name.startswith('dead'):
                 continue
+            if name.startswith('multi'):
+                # M1: one prefix inside a pre-filled interval plus two disjoint ones.
+                ips = ['192.0.2.77', '198.18.5.5', '203.0.113.9'] if qt == 1 else ['2001:db8:1::5', '3fff::9']
+                answer = struct.pack('!6H', struct.unpack('!H', q[:2])[0], 0x8180, 1, len(ips), 0, 0) + q[12:end]
+                for ip in ips:
+                    data = ipaddress.ip_address(ip).packed
+                    answer += b'\xc0\x0c' + struct.pack('!HHIH', qt, 1, 300, len(data)) + data
+                try:
+                    self.sock.sendto(answer, peer)
+                except OSError:
+                    pass
+                continue
+            if name.startswith('spoof'):
+                # M4: before the real answer, send replies that must all be ignored:
+                # wrong ID, wrong qname, wrong qtype (same socket), and a correct-looking
+                # reply from a different source port. "spoofcase" answers use 0x20 case
+                # (accepted, but not cached because the cache needs exact question bytes).
+                ident = struct.unpack('!H', q[:2])[0]
+                with self.lock:
+                    self.seen.append((name, ident, peer[1]))
+                poison = ipaddress.ip_address('192.0.2.66' if qt == 1 else '2001:db8:dead::66').packed
+                real = ipaddress.ip_address(address(name, qt)).packed
+                def build(i, section, data):
+                    return (struct.pack('!6H', i, 0x8180, 1, 1, 0, 0) + section + b'\xc0\x0c'
+                            + struct.pack('!HHIH', qt, 1, 300, len(data)) + data)
+                other_name = question('spoog' + name[5:], qt)[12:]
+                other_type = q[12:end-4] + struct.pack('!2H', 16 if qt == 1 else 1, 1)
+                try:
+                    self.sock.sendto(build(ident ^ 0x5a5a, q[12:end], poison), peer)
+                    self.sock.sendto(build(ident, other_name, poison), peer)
+                    self.sock.sendto(build(ident, other_type, poison), peer)
+                    self.other.sendto(build(ident, q[12:end], poison), peer)
+                    time.sleep(.02)
+                    section = q[12:end].upper() if name.startswith('spoofcase') else q[12:end]
+                    self.sock.sendto(build(ident, section, real), peer)
+                except OSError:
+                    pass
+                continue
             if name.startswith('big') and qt == 1:
                 answer = struct.pack('!6H', struct.unpack('!H', q[:2])[0], 0x8180, 1, 4000, 0, 0) + q[12:end]
                 answer += b''.join(b'\xc0\x0c' + struct.pack('!HHIH', 1, 1, 300, 4) + bytes([10, 0, k >> 8, k & 255])
@@ -92,7 +135,7 @@ class Upstream:
                 pass
 
     def close(self):
-        self.closed = True; self.sock.close()
+        self.closed = True; self.sock.close(); self.other.close()
 
 
 def main():
@@ -103,7 +146,8 @@ def main():
     ap.add_argument('--max-servfail', type=int, default=0)
     ap.add_argument('--max-p99-ms', type=float, default=200.0)
     ap.add_argument('--only', choices=['cli-external-writers', 'foreign-blackhole-lanes', 'small-thread-stack',
-                                       'foreign-lane-recovery', 'tcp-slow-readers', 'tcp-connection-limits'])
+                                       'foreign-lane-recovery', 'tcp-slow-readers', 'tcp-connection-limits',
+                                       'interval-overlap', 'upstream-id-spoof'])
     ap.add_argument('--max-recovery-s', type=float, default=15.0,
                     help='R1: longest tolerated healthy-foreign failure window after a blackhole burst')
     ap.add_argument('--no-assert', action='store_true', help='measure only (for before/after comparisons)')
@@ -129,12 +173,16 @@ def main():
 set learn4 {{ type ipv4_addr; }}
 set learn6 {{ type ipv6_addr; }}
 set unrelated {{ type ipv4_addr; flags timeout; }}
+set iv4 {{ type ipv4_addr; flags interval; }}
+set iv6 {{ type ipv6_addr; flags interval; }}
+set am4 {{ type ipv4_addr; flags interval; auto-merge; }}
+set am6 {{ type ipv6_addr; flags interval; auto-merge; }}
 }}\n''')
     (out/'cn.txt').write_text('domain:cn\n')
     cn_up, foreign_up = Upstream(), Upstream()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); sock.bind(('127.0.0.1', 0)); port = sock.getsockname()[1]; sock.close()
 
-    def config(name, extra=''):
+    def config(name, extra='', sets=('learn4,ipv4_addr,32', 'learn6,ipv6_addr,128')):
         path = out/(name+'.conf')
         path.write_text(f'''listen_udp=127.0.0.1:{port}
 listen_tcp=127.0.0.1:{port}
@@ -142,14 +190,14 @@ cn_domain_file={out}/cn.txt
 cn_upstream=127.0.0.1:{cn_up.port}
 foreign_upstream=127.0.0.1:{foreign_up.port}
 cache_size=4096
-nftset_ipv4=inet,{table},learn4,ipv4_addr,32
-nftset_ipv6=inet,{table},learn6,ipv6_addr,128
+nftset_ipv4=inet,{table},{sets[0]}
+nftset_ipv6=inet,{table},{sets[1]}
 nftset_fast=0
 {extra}''')
         return path
 
-    def query(name, qtype=1, timeout=7.0, source='127.0.0.1'):
-        q = question(name, qtype)
+    def query(name, qtype=1, timeout=7.0, source='127.0.0.1', raw=False, ident=0x1234):
+        q = question(name, qtype, ident)
         started = time.monotonic()
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.bind((source, 0))
@@ -157,8 +205,19 @@ nftset_fast=0
             try:
                 r = s.recv(65535)
             except socket.timeout:
-                return 'TIMEOUT', (time.monotonic()-started)*1000
-        return {0: 'NOERROR', 2: 'SERVFAIL', 3: 'NXDOMAIN'}.get(r[3] & 15, str(r[3] & 15)), (time.monotonic()-started)*1000
+                return ('TIMEOUT', (time.monotonic()-started)*1000) + ((None,) if raw else ())
+        code = {0: 'NOERROR', 2: 'SERVFAIL', 3: 'NXDOMAIN'}.get(r[3] & 15, str(r[3] & 15))
+        return (code, (time.monotonic()-started)*1000) + ((r,) if raw else ())
+
+    def answers(r):
+        """A/AAAA addresses in the answer section of a response."""
+        _, _, pos = decode_question(r); out_ = []
+        for _ in range(struct.unpack_from('!H', r, 6)[0]):
+            assert r[pos] & 0xc0 == 0xc0; pos += 2
+            rtype, _, _, size = struct.unpack_from('!HHIH', r, pos); pos += 10
+            if rtype in (1, 28): out_.append(str(ipaddress.ip_address(r[pos:pos+size])))
+            pos += size
+        return out_
 
     def tcp_query(name, qtype=1, timeout=7.0, source='127.0.0.1'):
         q = question(name, qtype)
@@ -187,12 +246,13 @@ nftset_fast=0
         return len([x for x in p.stdout.splitlines() if x.strip()])
 
     class App:
-        def __init__(self, name, stack=None, cpu='4', extra=''):
+        def __init__(self, name, stack=None, cpu='4', extra='', sets=None):
             self.log = (out/(name+'.log')).open('w')
             def limit():
                 if stack:
                     resource.setrlimit(resource.RLIMIT_STACK, (stack, stack))
-            self.proc = subprocess.Popen([str(app), 'start', '-c', str(config(name, extra)), '--cpu', cpu],
+            path = config(name, extra, sets) if sets else config(name, extra)
+            self.proc = subprocess.Popen([str(app), 'start', '-c', str(path), '--cpu', cpu],
                                          stdout=self.log, stderr=self.log, preexec_fn=limit)
             for _ in range(200):
                 assert self.proc.poll() is None, f'application exited: see {name}.log'
@@ -214,7 +274,12 @@ nftset_fast=0
     def elements(name):
         data = nft('', ['list', 'set', 'inet', table, name], record=False)
         value = next(x['set'] for x in data['nftables'] if 'set' in x)
-        return {x if isinstance(x, str) else x.get('elem', x).get('val') for x in value.get('elem', [])}
+        def text(x):
+            if isinstance(x, str): return x
+            x = x.get('elem', x)
+            if 'prefix' in x: return f"{x['prefix']['addr']}/{x['prefix']['len']}"
+            return x.get('val')
+        return {text(x) for x in value.get('elem', [])}
 
     def run_check(label, fn):
         if args.only and args.only != label:
@@ -414,6 +479,66 @@ nftset_fast=0
                         and result['exit'] == 0)
         return result
 
+    def interval_overlap():
+        # M1: CN answers into interval sets without auto-merge that already hold a
+        # covering prefix. Before 0.1.2 nft rejected the whole batch -> SERVFAIL.
+        nft(f'flush set inet {table} iv4\nflush set inet {table} iv6\n'
+            f'add element inet {table} iv4 {{ 198.18.0.0/16 }}\nadd element inet {table} iv6 {{ 2001:db8::/32 }}')
+        sets = ('iv4,ipv4_addr,24', 'iv6,ipv6_addr,48')
+        checked = {}
+        for label, pair in [('without_auto_merge', sets), ('with_auto_merge', ('am4,ipv4_addr,24', 'am6,ipv6_addr,48'))]:
+            p = subprocess.run([str(app), 'check', '-c', str(config('check-'+label, '', pair))],
+                               capture_output=True, text=True, timeout=20)
+            checked[label] = {'exit': p.returncode, 'auto_merge_warnings': p.stderr.count('without auto-merge')}
+        a = App('interval-overlap', sets=sets)
+        codes = [query(f'multi{i}.cn', qt)[0] for i, qt in enumerate((1, 28, 1, 28))]
+        rc = a.stop()
+        learned4, learned6 = elements('iv4'), elements('iv6')
+        log = (out/'interval-overlap.log').read_text()
+        result = {'rcodes': codes, 'iv4': sorted(learned4), 'iv6': sorted(learned6), 'check': checked,
+                  'startup_auto_merge_warnings': log.count('without auto-merge'),
+                  'overlap_warnings': log.count('overlaps an existing interval'), 'exit': rc}
+        result['ok'] = (codes == ['NOERROR']*4 and learned4 == {'198.18.0.0/16', '192.0.2.0/24', '203.0.113.0/24'}
+                        and learned6 == {'2001:db8::/32', '3fff::/48'} and result['overlap_warnings'] >= 1
+                        and result['startup_auto_merge_warnings'] == 2
+                        and checked['without_auto_merge'] == {'exit': 0, 'auto_merge_warnings': 2}
+                        and checked['with_auto_merge'] == {'exit': 0, 'auto_merge_warnings': 0} and rc == 0)
+        return result
+
+    def upstream_id_spoof():
+        # M4: client IDs (distinct per query, like real stub resolvers) must not
+        # reach the upstream; spoofed replies are dropped and neither the answer,
+        # the cache nor the nft set is poisoned.
+        nft(f'flush set inet {table} learn4\nflush set inet {table} learn6')
+        a = App('upstream-id-spoof')
+        names = [(f'spoof{i}.cn', 1 if i % 2 == 0 else 28) for i in range(8)]
+        cases = [(f'spoofcase{i}.cn', 1 if i % 2 == 0 else 28) for i in range(2)]
+        client = {n: 0x1200 + i for i, (n, _) in enumerate(names + cases)}
+        first = [query(n, qt, raw=True, ident=client[n]) for n, qt in names]
+        again = [query(n, qt, raw=True, ident=client[n] ^ 0x8000) for n, qt in names]
+        mixed = [query(n, qt, raw=True, ident=client[n]) for n, qt in cases]
+        rc = a.stop()
+        with cn_up.lock:
+            seen = [x for x in cn_up.seen if x[0].startswith('spoof')]
+        learned = elements('learn4') | elements('learn6')
+        poisoned = {'192.0.2.66', '2001:db8:dead::66'}
+        def ok(r, n, qt, flip=0):
+            return (r[0] == 'NOERROR' and struct.unpack('!H', r[2][:2])[0] == client[n] ^ flip
+                    and answers(r[2]) == [address(n, qt)])
+        result = {'upstream_queries': len(seen), 'upstream_ids': [x[1] for x in seen],
+                  'client_id_seen_upstream': sum(1 for x in seen if x[1] == client.get(x[0])),
+                  'distinct_upstream_ids': len({x[1] for x in seen}), 'distinct_source_ports': len({x[2] for x in seen}),
+                  'first_ok': sum(ok(r, n, qt) for r, (n, qt) in zip(first, names)),
+                  'cached_ok': sum(ok(r, n, qt, 0x8000) for r, (n, qt) in zip(again, names)),
+                  'mixed_case_ok': sum(ok(r, n, qt) for r, (n, qt) in zip(mixed, cases)),
+                  'poisoned_learned': sorted(learned & poisoned), 'exit': rc}
+        # 10 = 8 first queries + 2 mixed-case ones; the 8 repeats are cache hits.
+        result['ok'] = (result['upstream_queries'] == 10 and result['client_id_seen_upstream'] <= 1
+                        and result['distinct_upstream_ids'] >= 9 and result['distinct_source_ports'] >= 9
+                        and result['first_ok'] == 8 and result['cached_ok'] == 8 and result['mixed_case_ok'] == 2
+                        and not result['poisoned_learned'] and rc == 0)
+        return result
+
     complete = False
     try:
         run_check('cli-external-writers', cli_external_writers)
@@ -422,6 +547,8 @@ nftset_fast=0
         run_check('foreign-lane-recovery', foreign_lane_recovery)
         run_check('tcp-slow-readers', tcp_slow_readers)
         run_check('tcp-connection-limits', tcp_connection_limits)
+        run_check('interval-overlap', interval_overlap)
+        run_check('upstream-id-spoof', upstream_id_spoof)
         complete = True
     finally:
         cn_up.close(); foreign_up.close()

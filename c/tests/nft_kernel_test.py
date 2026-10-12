@@ -65,7 +65,8 @@ class Answer(socketserver.BaseRequestHandler):
             elif tag.startswith('bulk'):
                 _, number, start = tag.split('-'); count, index = int(number), int(start)
             elif tag.startswith('race'): index = 10000 + int(tag[4:])
-            answer = struct.pack('!6H', 1234, 0x8180, 1, count, 0, 0) + q[12:end]
+            # Echo the query ID: the application sends a random upstream ID (M4).
+            answer = q[:2] + struct.pack('!5H', 0x8180, 1, count, 0, 0) + q[12:end]
             for i in range(count):
                 data = ipaddress.ip_address(address(index+i, qt)).packed
                 answer += b'\xc0\x0c' + struct.pack('!HHIH', qt, 1, ttl, len(data)) + data
@@ -184,10 +185,19 @@ nftset_fast=1
         passed('mixed-family-failure-isolation-64-queries')
         nft(f'delete set inet {table} learn6\nadd set inet {table} learn6 {{ type ipv6_addr; flags timeout; size 16384; }}')
         query('short',28); passed('metadata-failure-recovery')
+        # N2: an answer with more than 256 A/AAAA records is still answered
+        # (NOERROR); exactly its first 256 addresses are learned.
+        def present(qt):
+            return {x if isinstance(x,str) else x.get('elem',x).get('val') for x in elements(qt)}
         for qt in [1,28]:
-            query('bulk-257-100',qt,2)
+            for count,start in [(257,100),(1000,20000)]:
+                answer = query(f'bulk-{count}-{start}',qt)
+                assert struct.unpack_from('!H',answer,6)[0] == count, (count, answer[:12].hex())
+                learned = present(qt)
+                assert all(address(start+i,qt) in learned for i in range(256)), (qt,count)
+                assert not any(address(start+i,qt) in learned for i in range(256,count)), (qt,count)
             query('short',qt)
-        passed('oversized-answer-rejected-with-healthy-recovery')
+        passed('oversized-answer-first-256-learned-noerror')
         for qt in [1,28]:
             barrier = threading.Barrier(32)
             def bulk(i):
