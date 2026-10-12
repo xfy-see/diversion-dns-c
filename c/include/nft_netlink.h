@@ -190,7 +190,13 @@ static inline int md_nft_nl_gen_consume(md_nl_requests *r,const uint8_t *p,size_
  * Optional future attributes are length-checked, not interpreted.
  * plain=true (compatible CLI path) accepts any non-interval, non-map address
  * set: FLAGS may be absent (flags 0) and constant/timeout/dynamic/expr bits are allowed. */
-static inline int md_nft_nl_set_check(md_nl_requests *r,const uint8_t *p,size_t n,uint8_t family,const char *table,const char *set,unsigned bytes,int *kernel_errno,bool plain) {
+/* mode 0: fast (exactly TIMEOUT); 1: plain (no INTERVAL); 2: compatible CLI path,
+ * which also accepts INTERVAL and reports it. flags/automerge are optional outputs:
+ * automerge is nft's NFTNL_UDATA_SET_MERGE_ELEMENTS (type 2) in NFTA_SET_USERDATA. */
+static inline int md_nft_nl_set_inspect(md_nl_requests *r,const uint8_t *p,size_t n,uint8_t family,const char *table,const char *set,unsigned bytes,int *kernel_errno,unsigned mode,uint32_t *flags,bool *automerge) {
+    bool plain=mode!=0;uint32_t reject=mode==2?0xC9u:0xCDu;
+    if(flags)*flags=0;
+    if(automerge)*automerge=false;
     if(!r||r->count!=1||!p||n<20||n>MD_NL_BUFFER_SIZE||!kernel_errno||r->seen[0])return -1;
     *kernel_errno=0;size_t len=md_nl_u32(p);
     if(len!=n||md_nl_align(len)!=n||md_nl_u32(p+8)!=md_nl_u32(r->wire+8)||md_nl_u32(p+12)!=r->port)return -1;
@@ -207,12 +213,18 @@ static inline int md_nft_nl_set_check(md_nl_requests *r,const uint8_t *p,size_t 
     uint32_t v=md_nl_read_be32(p+4);
                 /* ANONYMOUS|INTERVAL|MAP|OBJECT|CONCAT are never plain address sets; the
                  * kernel itself decides CONSTANT/bound-set updates, as for the CLI check. */
-                if((kind==3&&(plain?(v&0xCDu)!=0:v!=16))||(kind==4&&v!=(bytes==4?7u:8u))||(kind==5&&v!=bytes))return -1;}
+                if((kind==3&&(plain?(v&reject)!=0:v!=16))||(kind==4&&v!=(bytes==4?7u:8u))||(kind==5&&v!=bytes))return -1;
+                if(kind==3&&flags)*flags=v;}
         }
+        else if(t==13&&automerge){const uint8_t *u=p+4;size_t z=a-4;
+            while(z>=2&&(size_t)u[1]+2<=z){if(u[0]==2)*automerge=true;z-=(size_t)u[1]+2;u+=(size_t)u[1]+2;}}
         p+=md_nl_align(a);len-=md_nl_align(a);
     }
     if(plain?(seen|8u)!=62:seen!=62)return -1;
     r->seen[0]=true;return 0;
+}
+static inline int md_nft_nl_set_check(md_nl_requests *r,const uint8_t *p,size_t n,uint8_t family,const char *table,const char *set,unsigned bytes,int *kernel_errno,bool plain) {
+    return md_nft_nl_set_inspect(r,p,n,family,table,set,bytes,kernel_errno,plain?1u:0u,NULL,NULL);
 }
 static inline int md_nft_nl_set_consume(md_nl_requests *r,const uint8_t *p,size_t n,uint8_t family,const char *table,const char *set,unsigned bytes,int *kernel_errno) {
     return md_nft_nl_set_check(r,p,n,family,table,set,bytes,kernel_errno,false);

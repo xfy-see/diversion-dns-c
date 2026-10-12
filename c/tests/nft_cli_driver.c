@@ -90,13 +90,15 @@ static ssize_t __attribute__((unused)) fake_send(int fd,const void *data,size_t 
         ++metadata_reads;md_nl_requests q={0};q.port=41771;md_nl_writer w={fake_reply,sizeof(fake_reply),0};size_t at;
         assert(!md_nl_message_start(&w,&q,0xA09,0,md_nl_u32(p+8),p[16],0,&at));
         size_t a=20;for(unsigned i=1;i<=2;i++){size_t z=md_nl_u16(p+a);assert(!md_nl_attr(&w,(uint16_t)i,p+a+4,z-4));a+=md_nl_align(z);}
-        uint8_t val[4];md_nl_be32(val,!strcmp(fake_mode(),"fast-interval")?20:!strcmp(fake_mode(),"plain-interval-metadata")?4:16);assert(!md_nl_attr(&w,3,val,4));
-        bool v6=getenv("FAST_V6")!=NULL;md_nl_be32(val,v6?8:7);assert(!md_nl_attr(&w,4,val,4));md_nl_be32(val,v6?16:4);assert(!md_nl_attr(&w,5,val,4));
+        /* CLI cases: the grammar child's NFT_TEST_INTERVAL now drives the GETSET flags (R3). */
+        const char *interval=getenv("NFT_TEST_INTERVAL"),*failure=getenv("NFT_TEST_FAILURE");
+        uint8_t val[4];md_nl_be32(val,!strcmp(fake_mode(),"fast-interval")?20:!strcmp(fake_mode(),"plain-interval-metadata")||(interval&&!strcmp(interval,"1"))?4:16);assert(!md_nl_attr(&w,3,val,4));
+        bool v6=getenv("FAST_V6")!=NULL;md_nl_be32(val,failure&&!strcmp(failure,"malformed-metadata")?13:v6?8:7);assert(!md_nl_attr(&w,4,val,4));md_nl_be32(val,v6?16:4);assert(!md_nl_attr(&w,5,val,4));
         md_nl_message_end(&w,at);fake_length=w.length;return (ssize_t)n;
     }
     if(fast_mode()&&md_nl_u16(p+4)==0xA0D){
         ++element_reads;
-        if(strcmp(fake_mode(),"fast-existing") && strcmp(fake_mode(),"fast-permanent") && strcmp(fake_mode(),"fast-permanent-reset") && !(batches && !strcmp(fake_mode(),"fast-race-after"))){fake_length=fake_ack(p,fake_reply,-ENOENT);return (ssize_t)n;}
+        if(strcmp(fake_mode(),"fast-existing") && strcmp(fake_mode(),"fast-permanent") && strcmp(fake_mode(),"fast-permanent-reset") && !(batches && (!strcmp(fake_mode(),"fast-race-after") || !strcmp(fake_mode(),"fast-race-before")))){fake_length=fake_ack(p,fake_reply,-ENOENT);return (ssize_t)n;}
         md_nl_requests q={0};q.port=41771;md_nl_writer w={fake_reply,sizeof(fake_reply),0};size_t at,es,el,key;
         assert(!md_nl_message_start(&w,&q,0xA0C,0,md_nl_u32(p+8),p[16],0,&at));size_t a=20;
         for(unsigned i=1;i<=2;i++){size_t z=md_nl_u16(p+a);assert(!md_nl_attr(&w,(uint16_t)i,p+a+4,z-4));a+=md_nl_align(z);}
@@ -226,6 +228,11 @@ int main(int argc, char **argv) {
         record(&response, v6 ? 28 : 1, 1, wanted);
         if (!strcmp(fake_mode(), "dedup")) { record(&response, v6 ? 28 : 1, 1, wanted); md_write16(response.data + 6, 3); }
         record(&response, v6 ? 28 : 1, 3, unwanted); /* Answer CH must not learn. */
+        if (getenv("NFT_TEST_FAILURE") && !strcmp(getenv("NFT_TEST_FAILURE"), "overlap")) {
+            /* M1: a second prefix that the grammar child reports as overlapping. */
+            record(&response, v6 ? 28 : 1, 1, v6 ? "2001:db8:beef::7" : "198.51.100.7");
+            md_write16(response.data + 6, 3);
+        }
     }
     record(&response, v6 ? 28 : 1, 1, unwanted); /* Authority must not learn. */
     record(&response, v6 ? 28 : 1, 1, unwanted); /* Additional must not learn. */
@@ -266,6 +273,8 @@ int main(int argc, char **argv) {
                 if (!strcmp(fake_mode(), "fast-sequence")) n->fast->seq = UINT32_MAX - 40;
                 rc = md_nft_apply(n, &response, error);
             }
+            /* N2: an oversized answer learns exactly its first 256 addresses. */
+            if (!rc && !strcmp(fake_mode(), "fast-large-answer")) assert(key_count == 256);
         }
     }else rc = add_target(argv[1], v6 ? &n->v6 : &n->v4, &response, milliseconds() + 5000, error);
     md_nft_free(n);

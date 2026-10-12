@@ -100,6 +100,9 @@ typedef struct md_nft md_nft;
 md_nft *md_nft_new(const char *args, char *err);
 int md_nft_enable_fast(md_nft *n, char *err);
 int md_nft_apply(md_nft *n, const md_packet *r, char *err);
+/* 只读检查兼容路径的目标集合，interval set 缺少 auto-merge 时向 stderr 告警；
+ * 读取失败时静默，不改变内核状态，也不影响返回结果。 */
+void md_nft_audit(const md_nft *n);
 void md_nft_free(md_nft *n);
 
 /* engine 拥有不可变分流配置、规则、缓存、nft 和监听器。

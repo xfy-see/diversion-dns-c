@@ -44,7 +44,7 @@ int main(int argc, char **argv) {
     char err[MD_ERROR_SIZE] = {0};
     md_engine *e = md_engine_load(config, check, err);
     if (!e) { fprintf(stderr, "%s\n", err); return 1; }
-    /* check 验证固定配置并加载规则文件，不启动监听器或访问 nft。 */
+    /* check 验证固定配置并加载规则文件，不启动监听器、不写 nft（只读检查集合元数据并告警）。 */
     if (check) {
         puts("configuration and rule files valid (no listeners/upstream connections or nft writes; runtime resources not fully checked)");
         md_engine_free(e); return 0;
