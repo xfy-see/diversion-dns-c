@@ -1,16 +1,14 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* The FIFO leader owns the socket and caches without holding the queue mutex.
- * Generation changes invalidate readback, never imply that a mapping survived:
- * after a concurrent commit every key is read back again (present with enough
- * lifetime = success). A bounded retry re-reads all targets and writes only the
- * keys still missing; successful DNS requires complete ACKs.
+ * Generation changes invalidate readback, never imply that a mapping survived.
+ * A bounded retry re-reads all targets; successful DNS requires complete ACKs.
  */
 #define NFT_FAST_SLOTS 2048u
 #define NFT_FAST_KEYS 1024u
 #define NFT_FAST_ANSWER_KEYS 256u
 #define NFT_FAST_WIRE 65536u
 #define NFT_FAST_COHORT 32u
-#define NFT_FAST_ATTEMPTS 5u
+#define NFT_FAST_ATTEMPTS 3u
 #define NFT_FAST_RETRY 1
 #define NFT_FAST_SEQ_RESERVE ((2u * NFT_FAST_KEYS + 64u) * 16u)
 struct nft_fast_waiter {
@@ -109,10 +107,9 @@ static void nft_fast_remember(nft_fast_state *s, unsigned family, const uint8_t 
 static uint8_t nft_fast_family(const nft_target *t) {
     return !strcmp(t->family, "inet") ? 1 : !strcmp(t->family, "ip") ? 2 : 10;
 }
-static int nft_fast_generation(nft_fast_state *s, uint64_t until, uint32_t *seen, char *err) {
+static int nft_fast_generation(nft_fast_state *s, uint64_t until, char *err) {
     uint32_t after;
     if (nft_nl_generation(s->fd, s->port, nft_fast_seq(s), s->receive, until, &after, err)) return -1;
-    if (seen) *seen = after;
     if (after == s->generation) return 0;
     snprintf(err, MD_ERROR_SIZE, "nft generation changed; revalidate all mappings");
     return NFT_FAST_RETRY;
@@ -225,13 +222,10 @@ invalid:
     snprintf(err, MD_ERROR_SIZE, "invalid fast nft element metadata");
     return -1;
 }
-/* seen/limit count Answer IN A+AAAA in wire order, so an oversized answer
- * learns exactly its first `limit` addresses (the same records as nft_fast_count). */
-typedef struct { nft_fast_state *s; const nft_target *t; size_t count; uint64_t until; unsigned seen, limit; } nft_fast_keys;
+typedef struct { nft_fast_state *s; const nft_target *t; size_t count; uint64_t until; } nft_fast_keys;
 static int nft_fast_collect(const md_packet *p, const md_rr *rr, void *arg) {
     nft_fast_keys *v = arg;
-    if (rr->section || rr->class_ != 1 || (rr->type != 1 && rr->type != 28) || ++v->seen > v->limit) return 0;
-    if (rr->type != (v->t->bytes == 4 ? 1 : 28)) return 0;
+    if (rr->section || rr->class_ != 1 || rr->type != (v->t->bytes == 4 ? 1 : 28)) return 0;
     if (rr->data_len != v->t->bytes || milliseconds() >= v->until) return -1;
     const uint8_t *key = p->data + rr->data_offset;
     uint64_t ttl = (uint64_t)md_dns_ttl(rr->ttl) * 1000 + 15000;
@@ -247,41 +241,8 @@ static int nft_fast_collect(const md_packet *p, const md_rr *rr, void *arg) {
     v->s->timeouts[v->count++] = ttl;
     return 0;
 }
-/* Adopt a generation committed by another writer: drop every cached mapping
- * (that commit may have removed them) and re-check this target's metadata. */
-static int nft_fast_revalidate(nft_fast_state *s, const nft_target *t, unsigned family,
-                               uint32_t generation, uint64_t until, char *err) {
-    memset(s->entries, 0, sizeof(s->entries));
-    s->metadata[0] = s->metadata[1] = false;
-    s->generation = generation;
-    if (nft_fast_metadata(s, t, until, err)) return -1;
-    s->metadata[family] = true;
-    return 0;
-}
-/* Readback confirmation after an ambiguous concurrent commit. Each key must be
- * present (or permanent) with remaining lifetime >= requested - 14 s, the same
- * margin nft_fast_target uses to skip writes. Confirmed keys are cached under
- * the new generation; if any key is missing the cohort retries, and the retry's
- * per-key readback writes only the keys that are still missing or short. */
-static int nft_fast_confirm(nft_fast_state *s, const nft_target *t, unsigned family,
-                            size_t offset, size_t count, uint64_t until, char *err) {
-    size_t missing = 0;
-    for (size_t i = offset; i < offset + count; i++) {
-        uint64_t existing = 0, now = milliseconds();
-        if (nft_fast_existing(s, t, s->keys[i], until, &existing, err)) return -1;
-        uint64_t expires = existing > UINT64_MAX - now ? UINT64_MAX : now + existing;
-        if (existing == UINT64_MAX || (existing && expires >= until + s->timeouts[i] - 14000)) {
-            nft_fast_remember(s, family, s->keys[i], t->bytes, expires);
-            continue;
-        }
-        missing++;
-    }
-    if (!missing) return 0;
-    snprintf(err, MD_ERROR_SIZE, "nft generation changed around commit; %zu of %zu keys not confirmed", missing, count);
-    return NFT_FAST_RETRY;
-}
 static int nft_fast_commit(nft_fast_state *s, const nft_target *t, unsigned family,
-                           size_t offset, size_t count, uint64_t until, bool *moved, char *err) {
+                           size_t offset, size_t count, uint64_t until, char *err) {
     md_nl_requests requests;
     if (md_nft_nl_batch_timed_encode(s->wire, sizeof(s->wire), &requests, s->port,
         nft_fast_seq(s), nft_fast_family(t), t->table, t->set,
@@ -311,12 +272,8 @@ static int nft_fast_commit(nft_fast_state *s, const nft_target *t, unsigned fami
     uint32_t after;
     if (nft_nl_generation(s->fd, s->port, nft_fast_seq(s), s->receive, until, &after, err)) return -1;
     if (after != s->generation + 1u) {
-        /* Every ACK succeeded, so this GENID-guarded batch committed; another
-         * writer committed too. Instead of failing (and retrying) the cohort,
-         * adopt the new generation; nft_fast_target then reads every key back
-         * (present with at least the requested lifetime counts as success). */
-        *moved = true;
-        return nft_fast_revalidate(s, t, family, after, until, err);
+        snprintf(err, MD_ERROR_SIZE, "nft generation changed around commit; revalidate all mappings");
+        return NFT_FAST_RETRY;
     }
     s->generation = after;
     for (size_t i = offset; i < offset + count; i++)
@@ -326,21 +283,14 @@ static int nft_fast_commit(nft_fast_state *s, const nft_target *t, unsigned fami
 static int nft_fast_target(nft_fast_state *s, const nft_target *t, unsigned family,
                            nft_fast_waiter **cohort, size_t count, uint64_t until, char *err) {
     if (!t->enabled) return 0;
-    nft_fast_keys v = {s, t, 0, until, 0, 0};
-    for (size_t i = 0; i < count; i++) {
-        v.seen = 0; v.limit = NFT_FAST_ANSWER_KEYS;
+    nft_fast_keys v = {s, t, 0, until};
+    for (size_t i = 0; i < count; i++)
         if (md_dns_records(cohort[i]->packet, nft_fast_collect, &v, err)) return -1;
-    }
     if (!v.count) return 0;
-    /* Metadata must be read inside one stable generation. If another writer
-     * commits meanwhile, adopt its generation and read the metadata again
-     * (bounded) instead of failing the whole attempt (N3). */
-    for (unsigned tries = 0; !s->metadata[family]; tries++) {
-        uint32_t seen = 0;
+    if (!s->metadata[family]) {
         if (nft_fast_metadata(s, t, until, err)) return -1;
-        int rc = nft_fast_generation(s, until, &seen, err);
-        if (rc && (rc != NFT_FAST_RETRY || tries + 1 >= NFT_FAST_ATTEMPTS)) return rc;
-        if (rc) { nft_fast_invalidate(s); s->generation = seen; continue; }
+        int rc = nft_fast_generation(s, until, err);
+        if (rc) return rc;
         s->metadata[family] = true;
     }
     size_t pending = 0;
@@ -360,39 +310,24 @@ static int nft_fast_target(nft_fast_state *s, const nft_target *t, unsigned fami
             continue;
         }
         if (existing > s->timeouts[i]) s->timeouts[i] = existing + 1000;
-        /* Swap, not overwrite: keys[0..count) stay complete so every key can
-         * be confirmed again if another writer commits. */
         if (pending != i) {
-            uint8_t key[16]; uint64_t timeout = s->timeouts[pending];
-            memcpy(key, s->keys[pending], 16);
             memcpy(s->keys[pending], s->keys[i], 16);
             s->timeouts[pending] = s->timeouts[i];
-            memcpy(s->keys[i], key, 16);
-            s->timeouts[i] = timeout;
         }
         pending++;
     }
     /* Even an all-readback/all-cache hit validates the generation before
      * success. External flush can occur without any writes from this cohort.
-     * If another writer committed meanwhile, do not discard the whole attempt:
-     * adopt its generation (metadata re-checked), commit the pending keys under
-     * it, then read every key back once more (N3).
      */
-    bool moved = false;
-    uint32_t seen = 0;
-    int rc = nft_fast_generation(s, until, &seen, err);
-    if (rc == NFT_FAST_RETRY) {
-        moved = true;
-        if (nft_fast_revalidate(s, t, family, seen, until, err)) return -1;
-    } else if (rc) return rc;
+    int rc = nft_fast_generation(s, until, err);
+    if (rc) return rc;
     for (size_t offset = 0; offset < pending; ) {
         size_t n = pending - offset;
         if (n > s->chunk_keys) n = s->chunk_keys;
-        rc = nft_fast_commit(s, t, family, offset, n, until, &moved, err);
+        rc = nft_fast_commit(s, t, family, offset, n, until, err);
         if (rc) return rc;
         offset += n;
     }
-    if (moved) return nft_fast_confirm(s, t, family, 0, v.count, until, err);
     return 0;
 }
 static int nft_fast_cohort(md_nft *n, nft_fast_waiter **cohort, size_t count,
@@ -449,12 +384,9 @@ static int nft_fast_apply(md_nft *n, const md_packet *r, char *err) {
     if (md_dns_records(r, nft_fast_count, &self.addresses, err)) return -1;
     /* No A/AAAA (NXDOMAIN, TXT, CNAME-only): nothing to learn, no netlink round trip. */
     if (!self.addresses) return 0;
-    /* N2: learn the first 256 addresses and answer normally; SERVFAIL for a
-     * large CDN/round-robin answer would hide every address from the client. */
     if (self.addresses > NFT_FAST_ANSWER_KEYS) {
-        nft_warn(NFT_WARN_ANSWER_CAP, "fast nft answer has %u A/AAAA records; only the first %u are added to the set",
-                 self.addresses, NFT_FAST_ANSWER_KEYS);
-        self.addresses = NFT_FAST_ANSWER_KEYS;
+        snprintf(err, MD_ERROR_SIZE, "fast nft answer exceeds 256 address records");
+        return -1;
     }
     int lock_rc = pthread_mutex_lock(&n->lock);
     if (lock_rc) { snprintf(err, MD_ERROR_SIZE, "fast nft mutex: %s", strerror(lock_rc)); return -1; }
