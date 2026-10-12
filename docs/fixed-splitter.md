@@ -41,6 +41,8 @@ cache key，命中时改为当前请求 ID。nft 学习失败会使查询失败�
 验证必填资源、数值、监听地址和 nft 参数。缺失文件或错误规则会立即失败，报告配置或
 规则的文件路径及行号。`check` 不打开 listener、不给上游发包、不调用 nft 写入，也不验证
 端口能否绑定、上游是否可达、Linux mark/接口权限、nft 可执行文件或目标集合是否存在。
+例外：在 Linux 上能只读访问 nf_tables 时，`check`/`start` 会用 Netlink GETSET 检查默认（非 fast）
+路径的 interval 目标集合，缺少 `auto-merge` 时打印告警；读取失败不报错，也不影响退出码。
 命名 IPv6 scope（如 `%eth0`）会查询本机接口索引；这仍不能证明实际网络可用。
 它是完整规则预检，不是运行环境验收。
 
@@ -116,7 +118,9 @@ IPv4 key 要求 `family=inet|ip` 且 `address_type=ipv4_addr`；IPv6 key 要求
 
 nft 执行模块保留原语义：只学习 Answer 中 IN A/AAAA，不读取 CNAME 目标来改变路由，
 不学习 Authority/Additional。普通地址集合使用原 Linux Netlink generation 检查、事务和
-完整成功回执（generation 窗口内用 Netlink GETSET 校验元数据，冲突时有界重试 3 次）；interval 集合保留原 argv/stdin CLI 与前缀行为。mask 对 interval 集合生效，
+完整成功回执（generation 窗口内用 Netlink GETSET 校验元数据，冲突时有界重试 3 次）；interval 集合保留原 argv/stdin CLI 与前缀行为
+（是否 interval 也由 GETSET 判断，不再调用 `nft list set`）。没有 auto-merge 的 interval 集合遇到重叠前缀时跳过冲突元素、
+写入其余元素并正常回答，打印限速告警；`check`/`start` 对缺少 auto-merge 的 interval 目标只告警。mask 对 interval 集合生效，
 普通集合写入具体地址。集合必须预先存在，程序不会创建表或集合，不发送元素 TTL，
 继续使用集合默认 timeout，也没有用户态 membership 缓存或维护线程。
 
@@ -220,7 +224,10 @@ fast 路径不会让它们过期：切换时对只含 DNS 学习地址的集合�
 [c/README.md](../c/README.md) 的迁移说明）。
 目标必须 flags timeout（不含 dynamic/interval/map）；静态 CN-IP 保留独立集合。
 
-每个响应最多 256 条 Answer IN A/AAAA（重复也计数），超限只拒绝该请求；队列批次
+每个响应只学习前 256 条 Answer IN A/AAAA（按报文顺序，重复也计数），超出部分不写入，
+DNS 正常回答并打印限速告警（0.1.1 及以前回 SERVFAIL）；队列批次
 最多 32 个请求、1024 条地址。事务按实际 SO_SNDBUF 拆分。generation 竞争最多尝试
-三次，不延长原有 5 秒期限；批次失败后按成员剩余时间份额隔离，仍无法完成者返回失败。
+五次，不延长原有 5 秒期限：提交前后 generation 变化时采用新 generation，并用 GETSETELEM
+逐条读回本批地址（存在且 timeout 不短于期望），只重写缺失或过短的元素；批次失败后按
+成员剩余时间份额隔离，仍无法完成者返回失败。
 已有连接需要另外保存 conntrack 分流标记；新连接按当前地址集合判断。
