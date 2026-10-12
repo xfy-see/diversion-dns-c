@@ -15,6 +15,9 @@
 #include <time.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/random.h>
+#endif
 
 static int fail(char *err, const char *s) {
     if (err) snprintf(err, MD_ERROR_SIZE, "%s", s);
@@ -145,6 +148,7 @@ typedef struct {
     /* One synchronous forward at a time per worker. Reentrant/library calls
      * keep an independent allocation so they cannot overwrite live replies. */
     exchange exchanges[3];
+    md_packet query; /* The upstream copy of the query (random ID, M4). */
     bool exchanges_in_use;
 } worker_connections;
 /* 池和可复用报文缓冲都属于当前线程，不需要跨 worker 加锁。 */
@@ -155,6 +159,46 @@ static uint64_t milliseconds(void) {
     struct timespec t;
     if (clock_gettime(CLOCK_MONOTONIC, &t)) return 0;
     return (uint64_t)t.tv_sec * 1000 + (uint64_t)t.tv_nsec / 1000000;
+}
+/* M4: every forwarded query gets a fresh unpredictable 16-bit DNS ID instead
+ * of the client's. Bytes come from the kernel CSPRNG (getrandom/arc4random) in
+ * small per-thread batches; if that is unavailable (very early boot, seccomp),
+ * fall back to a splitmix64 stream seeded from the monotonic and realtime
+ * clocks, the thread's stack address and a global counter. */
+static _Thread_local uint16_t random_pool[32];
+static _Thread_local unsigned random_left;
+static _Thread_local uint64_t random_state;
+static atomic_uint_fast64_t random_counter;
+static bool random_fill(void *buffer, size_t size) {
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    arc4random_buf(buffer, size); return true;
+#elif defined(__linux__)
+    uint8_t *p = buffer;
+    while (size) {
+        ssize_t n = getrandom(p, size, GRND_NONBLOCK);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        p += n; size -= (size_t)n;
+    }
+    return true;
+#else
+    (void)buffer; (void)size; return false;
+#endif
+}
+static uint16_t random_id(void) {
+    if (!random_left) {
+        if (random_fill(random_pool, sizeof(random_pool))) random_left = sizeof(random_pool) / sizeof(random_pool[0]);
+        else {
+            struct timespec a = {0, 0}, b = {0, 0};
+            clock_gettime(CLOCK_MONOTONIC, &a); clock_gettime(CLOCK_REALTIME, &b);
+            random_state ^= (uint64_t)a.tv_nsec ^ ((uint64_t)a.tv_sec << 32) ^ (uint64_t)b.tv_nsec * 0x9e3779b97f4a7c15u ^
+                (uint64_t)(uintptr_t)&a ^ atomic_fetch_add_explicit(&random_counter, 0x632be59bd9b4e019u, memory_order_relaxed);
+            uint64_t z = (random_state += 0x9e3779b97f4a7c15u);
+            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9u; z = (z ^ (z >> 27)) * 0x94d049bb133111ebu;
+            return (uint16_t)((z ^ (z >> 31)) >> 16);
+        }
+    }
+    return random_pool[--random_left];
 }
 static void retire(worker_connection *c) {
     if (c->fd >= 0) close(c->fd);
@@ -251,9 +295,12 @@ static int socket_options(int fd, const md_upstream *u, char *err) {
     return 0;
 }
 /* 借用时把 fd 从池槽移到 exchange；成功后 keep_response 才将所有权交还。 */
+/* M4: only TCP connections are pooled. Every UDP exchange opens a fresh
+ * connected socket, so the kernel picks a new random ephemeral source port per
+ * query; together with the random ID an off-path spoofer must guess ~31 bits. */
 static int begin_connection(exchange *x, const md_upstream *u, bool tcp, bool allow_reuse, char *err) {
     stop(x); x->tcp = tcp; x->upstream = u; x->done = 0;
-    if ((x->cached = take_connection(u, tcp, x->query_id, allow_reuse))) {
+    if (tcp && (x->cached = take_connection(u, tcp, x->query_id, allow_reuse))) {
         x->cached->ids[x->query_id / 8] |= (uint8_t)(1u << (x->query_id % 8));
         if (x->cached->fd >= 0) {
             x->fd = x->cached->fd; x->cached->fd = -1;
@@ -369,6 +416,10 @@ static int advance(exchange *x, short events, const md_packet *q, char *err) {
         size_t wanted = prefix ? 2 : x->packet.len;
         ssize_t n = recv(x->fd, data + x->done, wanted - x->done, 0);
         if (n < 0) { if (again()) return 0; syserr(err, "receive upstream TCP"); stop(x); return -1; }
+        /* A pooled connection the upstream closed while idle can still accept
+         * our send; EOF before any response byte then gets one fresh connection.
+         * Random upstream IDs (M4) make such reuse common, so this is required. */
+        if (!n && x->reused && prefix && !x->done) return begin_connection(x, x->upstream, x->tcp, false, err);
         if (!n) { fail(err, "upstream TCP closed before a response"); stop(x); return -1; }
         x->done += (size_t)n;
         if (x->done == wanted) {
@@ -405,8 +456,18 @@ int md_forward(const md_upstream *us, size_t count, unsigned concurrent,
     /* 同步 worker 调用复用大报文缓冲；重入调用独立分配，避免覆盖尚在读取的响应。 */
     bool scoped = worker_tcp && !worker_tcp->exchanges_in_use;
     exchange *xs = scoped ? worker_tcp->exchanges : malloc(concurrent * sizeof(*xs));
-    if (!xs) return fail(err, "out of memory for upstream exchanges");
+    md_packet *uq = scoped ? &worker_tcp->query : malloc(sizeof(*uq));
+    if (!xs || !uq) {
+        if (!scoped) { free(xs); free(uq); }
+        return fail(err, "out of memory for upstream exchanges");
+    }
     if (scoped) worker_tcp->exchanges_in_use = true;
+    /* M4: upstreams see a random ID, never the client's. Responses must match
+     * that ID and the question (case-insensitive name, type, class) on the
+     * connected socket of that upstream; the client ID is restored below. */
+    uint16_t client_id = md_read16(q->data), upstream_id = random_id();
+    memcpy(uq->data, q->data, q->len); uq->len = q->len;
+    md_write16(uq->data, upstream_id);
     for (unsigned i = 0; i < concurrent; i++) {
         memset(&xs[i], 0, offsetof(exchange, packet));
         xs[i].packet.len = 0; xs[i].fd = -1; xs[i].state = DEAD;
@@ -417,11 +478,11 @@ int md_forward(const md_upstream *us, size_t count, unsigned concurrent,
     prepare_worker(us, count);
     char last_error[MD_ERROR_SIZE] = "all upstreams failed";
     for (unsigned i = 0; i < concurrent; i++) {
-        xs[i].query_id = md_read16(q->data);
+        xs[i].query_id = upstream_id;
         begin(&xs[i], &us[(first + i) % count], us[(first + i) % count].tcp, last_error);
         /* A connected nonblocking socket can try sending immediately. A TCP
          * connect still waits for poll/SO_ERROR; EAGAIN keeps SENDING pending. */
-        if (xs[i].state == SENDING) advance(&xs[i], POLLOUT, q, last_error);
+        if (xs[i].state == SENDING) advance(&xs[i], POLLOUT, uq, last_error);
     }
     bool have_error_response = false;
     int result = -1;
@@ -446,15 +507,15 @@ int md_forward(const md_upstream *us, size_t count, unsigned concurrent,
         if (!n) continue; /* A one-second resend timer does not end the exchange. */
         for (unsigned i = 0; i < concurrent; i++) {
             if (!fds[i].revents || xs[i].state == DEAD) continue;
-            int status = advance(&xs[i], fds[i].revents, q, last_error);
+            int status = advance(&xs[i], fds[i].revents, uq, last_error);
             if (status == 1) {
                 unsigned rcode = md_read16(xs[i].packet.data + 2) & 15;
                 md_dns_records(&xs[i].packet, extended_rcode, &rcode, NULL);
+                memcpy(r->data, xs[i].packet.data, xs[i].packet.len); r->len = xs[i].packet.len;
+                md_write16(r->data, client_id);
                 if (rcode == 0 || rcode == 3) {
-                    memcpy(r->data, xs[i].packet.data, xs[i].packet.len); r->len = xs[i].packet.len;
                     keep_response(&xs[i], fds[i].revents); result = 0; goto finished;
                 }
-                memcpy(r->data, xs[i].packet.data, xs[i].packet.len); r->len = xs[i].packet.len;
                 have_error_response = true; stop(&xs[i]);
             }
             /* Check readable replies first, then service a due retry. Invalid
@@ -463,7 +524,7 @@ int md_forward(const md_upstream *us, size_t count, unsigned concurrent,
             uint64_t retry_now = milliseconds();
             if (!status && xs[i].state == UDP_READING && (fds[i].revents & POLLOUT) &&
                 retry_now >= xs[i].udp_retry && retry_now < deadline)
-                resend_udp(&xs[i], q, last_error);
+                resend_udp(&xs[i], uq, last_error);
         }
     }
     if (have_error_response) result = 0;
@@ -475,6 +536,6 @@ finished:
     /* 胜出且符合条件的连接已交回池；这里关闭所有其他仍在竞争的连接。 */
     for (unsigned i = 0; i < concurrent; i++) stop(&xs[i]);
     if (scoped) worker_tcp->exchanges_in_use = false;
-    else free(xs);
+    else { free(xs); free(uq); }
     return result;
 }
