@@ -303,7 +303,7 @@ static int socket_options(int fd, const md_upstream *u, char *err) {
  * query; together with the random ID an off-path spoofer must guess ~31 bits. */
 static int begin_connection(exchange *x, const md_upstream *u, bool tcp, bool allow_reuse, char *err) {
     stop(x); x->tcp = tcp; x->upstream = u; x->done = 0;
-    if (tcp && (x->cached = take_connection(u, tcp, x->query_id, allow_reuse))) {
+    if ((x->cached = take_connection(u, tcp, x->query_id, allow_reuse))) {
         x->cached->ids[x->query_id / 8] |= (uint8_t)(1u << (x->query_id % 8));
         if (x->cached->fd >= 0) {
             x->fd = x->cached->fd; x->cached->fd = -1;
