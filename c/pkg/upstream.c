@@ -165,6 +165,7 @@ typedef struct {
     bool spare_wanted[WORKER_UDP_SPARES];
     int dead_fd[WORKER_UDP_DEAD];
     unsigned dead_count;
+    bool maintenance; /* Set only when a spare was taken or a UDP fd retired. */
 } worker_connections;
 /* 池和可复用报文缓冲都属于当前线程，不需要跨 worker 加锁。 */
 static _Thread_local worker_connections *worker_tcp;
@@ -288,7 +289,7 @@ static worker_connection *take_connection(const md_upstream *u, bool tcp, uint16
 static void stop(exchange *x) {
     /* A used UDP socket is never reused; its close is deferred to idle time. */
     if (x->fd >= 0 && !x->tcp && !x->cached && worker_tcp && worker_tcp->dead_count < WORKER_UDP_DEAD)
-        worker_tcp->dead_fd[worker_tcp->dead_count++] = x->fd;
+        worker_tcp->dead_fd[worker_tcp->dead_count++] = x->fd, worker_tcp->maintenance = true;
     else if (x->fd >= 0) close(x->fd);
     x->fd = -1; x->state = DEAD; x->udp_retry = 0;
     if (x->cached) { retire(x->cached); x->cached = NULL; }
@@ -326,25 +327,30 @@ static int take_spare(const md_upstream *u) {
         if (!worker_tcp->spare_wanted[i]) { if (free_slot == WORKER_UDP_SPARES) free_slot = i; continue; }
         if (!same_endpoint(&worker_tcp->spare_key[i], u)) continue;
         int fd = worker_tcp->spare_fd[i];
-        worker_tcp->spare_fd[i] = -1;
+        worker_tcp->spare_fd[i] = -1; worker_tcp->maintenance = true;
         if (fd < 0) return -1;
         if (milliseconds() - worker_tcp->spare_born[i] < WORKER_TCP_IDLE_MS && quiet_socket(fd)) return fd;
         close(fd); return -1;
     }
     if (free_slot < WORKER_UDP_SPARES) {
         worker_tcp->spare_key[free_slot] = *u; worker_tcp->spare_wanted[free_slot] = true;
+        worker_tcp->maintenance = true;
     }
     return -1;
 }
+/* Cache hits and other replies that did not touch a UDP upstream return
+ * here after one flag test: no clock read, no syscall, no slot scan. */
 void md_forward_worker_idle(void) {
-    if (!worker_tcp) return;
+    if (!worker_tcp || !worker_tcp->maintenance) return;
+    worker_tcp->maintenance = false;
+    uint64_t now = milliseconds();
     for (unsigned i = 0; i < worker_tcp->dead_count; i++) close(worker_tcp->dead_fd[i]);
     worker_tcp->dead_count = 0;
     for (unsigned i = 0; i < WORKER_UDP_SPARES; i++) {
         if (!worker_tcp->spare_wanted[i]) continue;
         if (worker_tcp->spare_fd[i] >= 0) {
             /* An upstream unused for the idle period loses its slot. */
-            if (milliseconds() - worker_tcp->spare_born[i] >= WORKER_TCP_IDLE_MS) {
+            if (now - worker_tcp->spare_born[i] >= WORKER_TCP_IDLE_MS) {
                 close(worker_tcp->spare_fd[i]); worker_tcp->spare_fd[i] = -1; worker_tcp->spare_wanted[i] = false;
             }
             continue;
@@ -355,7 +361,7 @@ void md_forward_worker_idle(void) {
         if (socket_options(fd, u, NULL) || connect(fd, (const struct sockaddr *)&u->address, u->address_len)) {
             close(fd); continue;
         }
-        worker_tcp->spare_fd[i] = fd; worker_tcp->spare_born[i] = milliseconds();
+        worker_tcp->spare_fd[i] = fd; worker_tcp->spare_born[i] = now;
     }
 }
 /* 借用时把 fd 从池槽移到 exchange；成功后 keep_response 才将所有权交还。 */
