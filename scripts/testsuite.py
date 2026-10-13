@@ -190,6 +190,19 @@ def write_human(out, result):
     (out / 'REPORT.md').write_text('\n'.join(lines) + '\n')
 
 
+def runner_identity():
+    files = ('testsuite.py', 'suite_device.py', 'suite_metrics.py', 'suite_network.py')
+    result = dict(python=sys.version, platform=platform.platform(),
+                  files_sha256={name: sha(ROOT/'scripts'/name) for name in files})
+    try:
+        result['commit'] = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True, stderr=subprocess.DEVNULL).strip()
+        result['dirty'] = bool(subprocess.check_output(['git', 'status', '--porcelain', '--untracked-files=no'], cwd=ROOT, text=True))
+    except (OSError, subprocess.SubprocessError):
+        result['commit'] = None
+        result['dirty'] = None
+    return result
+
+
 def run(args):
     out = args.output.resolve()
     require(not out.exists(), 'fresh result directory required')
@@ -197,7 +210,7 @@ def run(args):
     config = {}
     result = dict(schema_version=1, profile=args.profile, started_utc=now(), completed=False,
                   scope='Only explicitly configured and executed groups; catalog is a coverage map, not proof of all subcases',
-                  status='incomplete', cases=[], identity={}, commands=[], compilers_invoked=False)
+                  status='incomplete', cases=[], identity={}, runner=runner_identity(), commands=[], compilers_invoked=False)
     status = 2
     try:
         config = load(args.config) if args.config else {}

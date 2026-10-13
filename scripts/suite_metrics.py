@@ -73,7 +73,7 @@ def aggregate(rows, repeats=3):
         balanced = set(identity) == expected
         summary = dict(zip(('version', 'scenario', 'rate', 'seconds', 'workers'), key))
         summary.update(runs=len(values), balanced=balanced, comparable=balanced and all(v.get('case_pass') is True and v['metrics']['strict_qps_pass'] for v in values),
-                       strict_qps_pass=balanced and all(v['metrics']['strict_qps_pass'] for v in values),
+                       strict_qps_pass=all(v['metrics']['strict_qps_pass'] for v in values),
                        p50_median_ms=statistics.median([v['metrics']['p50_ms'] for v in values if v['metrics']['p50_ms'] is not None]) if any(v['metrics']['p50_ms'] is not None for v in values) else None,
                        p99_median_ms=statistics.median([v['metrics']['p99_ms'] for v in values if v['metrics']['p99_ms'] is not None]) if any(v['metrics']['p99_ms'] is not None for v in values) else None,
                        worst_max_ms=max([v['metrics']['max_ms'] for v in values if v['metrics']['max_ms'] is not None], default=None),

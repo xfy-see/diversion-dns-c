@@ -7,6 +7,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -161,6 +162,20 @@ class ConfigTests(unittest.TestCase):
 
 
 class PlanAndMetricsTests(unittest.TestCase):
+    def test_detached_shell_ignores_hup_without_nohup(self):
+        with tempfile.TemporaryDirectory() as folder:
+            marker = Path(folder) / 'survived'
+            log = Path(folder) / 'detached.log'
+            script = 'kill -HUP $$; printf survived > ' + shlex.quote(str(marker))
+            command = device.detached_command(script, str(log))
+            self.assertNotIn('nohup', command)
+            self.assertIn('2>&1 < /dev/null &', command)
+            subprocess.run(['sh', '-c', command], check=True, timeout=5, capture_output=True)
+            deadline = time.monotonic() + 2
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertEqual(marker.read_text(), 'survived')
+
     def test_six_versions_three_forward_reverse_rounds(self):
         cfg = dict(versions=[dict(name=n) for n in ('V0','P7','A1','A2','A3','P8')], repeats=3)
         rows = device.plan(cfg, 'ablation')
@@ -281,9 +296,20 @@ class FakeTransportTests(unittest.TestCase):
         self.assertTrue(all(v['status']=='pass' for v in result['cleanup'].values()))
         commands='\n'.join(command for role,command in state['commands'])
         self.assertEqual(commands.count('nft flush set inet '+suite.table+' cn4'),5)
-        self.assertIn('nohup sh',commands)
+        self.assertNotIn('nohup',commands)
+        self.assertIn('trap "" HUP',commands)
+        self.assertIn('command -v netstat',commands)
         self.assertIn('/cleanup.sh',commands)
         self.assertNotIn('flush ruleset',commands)
+        self.assertNotRegex(commands, r'\bsleep\s+[0-9]+\.[0-9]+')
+
+    def test_stop_poll_uses_only_integer_seconds_with_five_second_bound(self):
+        suite,state=self.suite()
+        suite.stop_app()
+        command=state['commands'][-1][1]
+        self.assertIn('test "$n" -lt 5 || exit 91',command)
+        self.assertIn('sleep 1; n=$((n+1))',command)
+        self.assertNotRegex(command,r'\bsleep\s+[0-9]+\.[0-9]+')
 
     def test_failed_ssh_still_finally_cleans_both_devices(self):
         suite,state=self.suite(True)
@@ -304,6 +330,24 @@ class FakeTransportTests(unittest.TestCase):
         result=suite.execute()
         self.assertEqual(result['status'],'incomplete')
         self.assertFalse(any('mkdir -m700' in command for role,command in state['commands']))
+
+    def test_remote_command_journal_records_success_failure_without_payload(self):
+        suite,state=self.suite()
+        payload=b'binary-input-must-not-be-logged'
+        suite.rem('target','cat > '+suite.root+'/probe',data=payload)
+        state['fail_load']=True
+        with self.assertRaisesRegex(RuntimeError,'disconnected'):
+            suite.rem('client',suite.root+'/load -addr ignored')
+        raw=(suite.output/'commands.jsonl').read_text()
+        rows=[json.loads(line) for line in raw.splitlines()]
+        self.assertEqual(len(rows),2)
+        self.assertTrue(rows[0]['success'])
+        self.assertEqual(rows[0]['input_sha256'],device.digest(payload))
+        self.assertEqual(rows[0]['input_bytes'],len(payload))
+        self.assertNotIn(payload.decode(),raw)
+        self.assertFalse(rows[1]['success'])
+        self.assertEqual(rows[1]['error_type'],'RuntimeError')
+        self.assertTrue(all(row['duration_seconds']>=0 for row in rows))
 
     def test_binary_drift_after_config_validation_is_rejected(self):
         suite,state=self.suite()

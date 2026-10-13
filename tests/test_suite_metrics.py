@@ -42,6 +42,7 @@ class MetricsTests(unittest.TestCase):
         result=m.aggregate(rows)[0]
         self.assertTrue(result['balanced']);self.assertEqual(result['p99_median_ms'],2)
         self.assertFalse(m.aggregate(rows[:-1])[0]['comparable'])
+        self.assertTrue(m.aggregate(rows[:-1])[0]['strict_qps_pass'])
         with self.assertRaises(ValueError):m.aggregate(rows+[rows[0]])
     def test_missing_send_timestamp_cannot_pass_strict_rate(self):
         r=raw();r['samples'][0].pop('late_ms')

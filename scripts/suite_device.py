@@ -7,6 +7,7 @@ repository's artifact tools. Pin that verification receipt in the configuration;
 this adapter rechecks the receipt and every executable's bytes before SSH.
 """
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import ipaddress
 import json
@@ -271,6 +272,12 @@ def nft_addresses(document, table):
     return values
 
 
+def detached_command(script, log_path):
+    """BusyBox-compatible detach, preserving ignored HUP across the payload exec."""
+    return ('sh -c ' + shlex.quote('trap "" HUP; ' + script) + ' > '
+            + shlex.quote(log_path) + ' 2>&1 < /dev/null &')
+
+
 class SSH:
     def __init__(self, argv):
         self.argv = argv
@@ -359,7 +366,29 @@ class DeviceSuite:
         self.previous_version_round = None
 
     def rem(self, role, command, **kwargs):
-        return self.remote[role].run(command, **kwargs)
+        started = time.monotonic()
+        data = kwargs.get('data')
+        if isinstance(data, str):
+            data = data.encode()
+        record = dict(role=role, command=command,
+                      started_utc=datetime.now(timezone.utc).isoformat(),
+                      input_bytes=len(data) if data is not None else 0,
+                      input_sha256=digest(data) if data is not None else None,
+                      timeout_seconds=kwargs.get('timeout', 30), success=False)
+        try:
+            result = self.remote[role].run(command, **kwargs)
+            encoded = result.encode('utf-8')
+            record.update(success=True, stdout_utf8_bytes=len(encoded),
+                          stdout_utf8_sha256=digest(encoded))
+            return result
+        except Exception as error:
+            record.update(error=str(error), error_type=type(error).__name__)
+            raise
+        finally:
+            record['duration_seconds'] = time.monotonic() - started
+            # Only payload size/digest are retained, never binary stdin or stdout.
+            with (self.output / 'commands.jsonl').open('a') as log:
+                log.write(json.dumps(record, sort_keys=True, allow_nan=False) + '\n')
 
     def snapshot(self, role, group=False):
         files = self.cfg[role]['production_files']
@@ -435,7 +464,7 @@ class DeviceSuite:
             port = self.cfg['listen_port'] if role == 'target' else self.cfg['fixture_port']
             self.rem(role, 'set -e; test ! -e ' + self.root + '; test ! -e ' + self.group
                      + '; test ! -e /tmp/ddns-suite.lock; test -e /sys/fs/cgroup/cgroup.controllers; '
-                     + 'command -v nft >/dev/null; command -v nohup >/dev/null; '
+                     + 'command -v nft >/dev/null; command -v sh >/dev/null; command -v netstat >/dev/null; '
                      + 'test -z "$(netstat -ln 2>/dev/null | awk \'$4 ~ /:' + str(port) + '$/ {print}\')"')
         require(self.before['target']['boot'] != self.before['client']['boot'], 'SSH aliases point to same machine')
         for role in ('target', 'client'):
@@ -443,6 +472,7 @@ class DeviceSuite:
             host = self.cfg[role]
             recovery = shlex.quote(cleanup_script(self.token))
             watcher = shlex.quote(watch_script(self.token, host))
+            detached_watch = detached_command('exec sh ' + self.root + '/watch.sh', self.root + '/watch.log')
             self.rem(role, f'''set -eu
 mkdir -m700 /tmp/ddns-suite.lock
 echo {self.token} > /tmp/ddns-suite.lock/owner
@@ -452,7 +482,7 @@ printf '%s' {recovery} > {self.root}/cleanup.sh
 printf '%s' {watcher} > {self.root}/watch.sh
 trap 'sh {self.root}/cleanup.sh' EXIT HUP INT TERM
 echo $(( $(date +%s) + 120 )) > {self.root}/lease
-nohup sh {self.root}/watch.sh > {self.root}/watch.log 2>&1 < /dev/null &
+{detached_watch}
 if ! grep -qw memory /sys/fs/cgroup/cgroup.subtree_control; then
   touch {self.root}/enabled-memory
   echo +memory > /sys/fs/cgroup/cgroup.subtree_control
@@ -498,8 +528,7 @@ trap - EXIT HUP INT TERM
     def start(self, role, name, argv):
         command = shlex.join(argv)
         script = self.launch_prefix() + 'echo $$ > ' + self.root + '/' + name + '.pid; exec ' + command
-        self.rem(role, 'nohup sh -c ' + shlex.quote(script) + ' > ' + self.root + '/' + name
-                 + '.log 2>&1 < /dev/null &')
+        self.rem(role, detached_command(script, self.root + '/' + name + '.log'))
         self.sleep(.3)
         self.rem(role, 'set -e; p=$(cat ' + self.root + '/' + name + '.pid); kill -0 "$p"; '
                  + 'test "$(readlink /proc/$p/exe)" = ' + shlex.quote(argv[0]) + '; grep -Fx '
@@ -511,8 +540,8 @@ p=$(cat {self.root}/app.pid)
 test "$(readlink /proc/$p/exe)" = "{self.root}/$(cat {self.root}/active-version)"
 kill -TERM "$p"
 n=0; while kill -0 "$p" 2>/dev/null; do
-  test "$n" -lt 50 || exit 91
-  sleep 0.1; n=$((n+1))
+  test "$n" -lt 5 || exit 91
+  sleep 1; n=$((n+1))
 done
 rm {self.root}/app.pid
 ''')
