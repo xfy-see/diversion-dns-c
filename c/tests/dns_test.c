@@ -527,6 +527,55 @@ static void view_compare(const md_packet *q, const md_packet *m, md_dns_view *v)
     else assert(!v->valid || (y->len == m->len && !memcmp(y->data, m->data, m->len)));
     free(x); free(y);
 }
+/* Regression: a compression pointer must target an earlier name start. A
+ * pointer into an RR's TYPE/CLASS/TTL/RDLENGTH, opaque RDATA, the question's
+ * QTYPE/QCLASS or the middle of a label makes the whole response invalid on
+ * every parse path (legacy, view, TTL normalisation), so nothing is learned.
+ * Previously TTL=0xC00C0000 made the TTL bytes a "pointer" and after TTL
+ * normalisation to 0 the referring owner silently became the root name. */
+static void ptr_target_tests(const md_packet *q, md_packet *m, md_dns_view *v) {
+    char err[MD_ERROR_SIZE]; md_question parsed;
+    const uint8_t ptr[] = {0xc0, 12}, a4[] = {192,0,2,1};
+    /* RR1 owner (2) + TYPE(2) CLASS(2) TTL(4) RDLENGTH(2) RDATA(4). */
+    struct { const char *what; size_t delta; } bad[] = {
+        {"TYPE", 2}, {"CLASS", 4}, {"TTL", 6}, {"TTL+2", 8}, {"RDLENGTH", 10}, {"RDATA", 12},
+    };
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        for (unsigned ttlptr = 0; ttlptr < 2; ttlptr++) {
+            assert(!md_dns_error(q, m, 0)); md_write16(m->data + 2, 0x8180);
+            size_t base = m->len;
+            /* With TTL=0xC00C0000 the TTL bytes look like a valid pointer to qname. */
+            view_add_rr(m, 0, ptr, 2, 1, ttlptr ? 0xC00C0000u : 300, a4, 4);
+            view_add_rr(m, 0, ptr, 2, 1, 300, a4, 4);
+            uint8_t o[2] = {(uint8_t)(0xc0 | ((base + bad[i].delta) >> 8)), (uint8_t)(base + bad[i].delta)};
+            view_add_rr(m, 0, o, 2, 1, 300, a4, 4);
+            md_packet copy = *m;
+            assert(md_dns_view_parse(m, v, err) && !v->valid && v->count == 0);
+            assert(md_dns_question(m, &parsed, err));
+            assert(md_dns_records(m, NULL, NULL, err));
+            assert(md_dns_normalize_ttl(m, err) && !memcmp(m->data, copy.data, m->len));
+            assert(!md_dns_response_matches(q, m));
+            view_compare(q, m, v);
+        }
+    }
+    /* Pointer into an rdata name start (CNAME target) is fine; into the
+     * middle of a label or into the question's QTYPE is not. */
+    assert(!md_dns_error(q, m, 0)); md_write16(m->data + 2, 0x8180);
+    size_t cname_at = m->len + 12; const uint8_t cname[] = {3,'w','w','w',0xc0,12};
+    view_add_rr(m, 0, ptr, 2, 5, 300, cname, sizeof(cname));
+    md_packet good = *m;
+    uint8_t o[2] = {(uint8_t)(0xc0 | (cname_at >> 8)), (uint8_t)cname_at};
+    view_add_rr(m, 0, o, 2, 1, 300, a4, 4);
+    assert(!md_dns_view_parse(m, v, err) && v->count == 2); view_compare(q, m, v);
+    *m = good; o[1] = (uint8_t)(cname_at + 1); view_add_rr(m, 0, o, 2, 1, 300, a4, 4);
+    assert(md_dns_view_parse(m, v, err)); view_compare(q, m, v);
+    size_t qtype = q->len - 4;
+    *m = good; o[0] = (uint8_t)(0xc0 | (qtype >> 8)); o[1] = (uint8_t)qtype; view_add_rr(m, 0, o, 2, 1, 300, a4, 4);
+    assert(md_dns_view_parse(m, v, err)); view_compare(q, m, v);
+    /* Qname pointing at its own first label (target not before the name). */
+    md_packet self = *q; self.data[12] = 0xc0; self.data[13] = 12;
+    assert(md_dns_question(&self, &parsed, err));
+}
 static void view_tests(void) {
     md_dns_view *v = malloc(sizeof(*v)); assert(v);
     md_packet q, r, *m = malloc(sizeof(*m)); char err[MD_ERROR_SIZE]; assert(m);
@@ -567,34 +616,23 @@ static void view_tests(void) {
         view_compare(&q, m, v);
     }
     /* Pointer chains: backward pointer-only chain of 255 hops is accepted,
-     * 256 hops rejected; a label loop through a backward pointer is rejected. */
+     * 256 hops rejected. Every hop must land on an earlier name start, so the
+     * chain is built from owner names: RR k's owner points at RR k-1's owner. */
     for (unsigned hops = 254; hops <= 256; hops++) {
         assert(!md_dns_error(&q, m, 0)); md_write16(m->data + 2, 0x8180);
         size_t prev = 12;
         for (unsigned h = 1; h < hops; h++) {
             size_t here = m->len;
-            m->data[m->len++] = (uint8_t)(0xc0 | (prev >> 8)); m->data[m->len++] = (uint8_t)prev; prev = here;
+            uint8_t o[2] = {(uint8_t)(0xc0 | (prev >> 8)), (uint8_t)prev};
+            view_add_rr(m, 0, o, 2, 99, 1, NULL, 0); prev = here;
         }
-        /* The owner name itself is the final pointer: `hops` jumps in total. */
         uint8_t owner[2] = {(uint8_t)(0xc0 | (prev >> 8)), (uint8_t)prev};
-        /* Filler pointers must be inside an RR: carry them in an opaque RDATA. */
-        size_t filler = m->len - q.len; md_packet chain = *m; m->len = q.len;
-        uint8_t data[600]; memcpy(data, chain.data + q.len, filler);
-        /* Rebuild: RR0 opaque (type 99) holds the chain, RR1 owner jumps into it. */
-        view_add_rr(m, 0, root, 1, 99, 1, data, filler);
-        size_t shift = q.len + 1 + 10; /* chain bytes moved by owner(1)+fixed(10) */
-        for (size_t o = 0; o < filler; o += 2) {
-            size_t at = shift + o, t = (((size_t)(m->data[at] & 0x3f) << 8) | m->data[at + 1]);
-            if (t != 12) t += shift - q.len;
-            m->data[at] = (uint8_t)(0xc0 | (t >> 8)); m->data[at + 1] = (uint8_t)t;
-        }
-        size_t last = (hops > 1) ? prev + shift - q.len : 12;
-        owner[0] = (uint8_t)(0xc0 | (last >> 8)); owner[1] = (uint8_t)last;
         view_add_rr(m, 0, owner, 2, 1, 1, a4, 4);
         int rc = md_dns_view_parse(m, v, err);
         assert(hops <= 255 ? rc == 0 : rc != 0);
         view_compare(&q, m, v);
     }
+    ptr_target_tests(&q, m, v);
     /* Stale views (length changed) are refused by every view consumer. */
     *m = seeds[2]; assert(!md_dns_view_parse(m, v, err)); m->len--;
     assert(md_dns_view_each(m, v, NULL, NULL, err) && md_dns_normalize_ttl_view(m, v, err));

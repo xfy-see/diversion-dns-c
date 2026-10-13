@@ -52,7 +52,21 @@ static int fail(char *err, const char *s) {
  * 增加 2 字节展开长度，会被 255 字节上限截断。hops 再给指针链一个固定上限，
  * 取代原先每次调用都清零的 8 KiB visited 位图（MIPS 上开销明显）。 */
 #define MD_NAME_MAX_HOPS 255
-static int name(const md_packet *p, size_t start, size_t *end, char *out, char *err) {
+/* 名称起点位图：每次整包解析一块，按报文长度清零（不是固定 8 KiB）。name()
+ * 在名称的原始编码部分把每个标签/指针/结束字节的偏移标记为“可作名称起点”；
+ * 压缩指针只能指向已标记的偏移，并且首跳必须落在当前名称起点之前。于是指向
+ * 问题段 QTYPE/QCLASS、任何 RR 的 TYPE/CLASS/TTL/RDLENGTH、不透明 RDATA
+ * （A/AAAA/TXT/OPT/未知类型、MX/SRV/SOA 的定长字段）或标签内部的指针全部
+ * 被拒绝，整包按格式错误处理。之前若允许指入 TTL，TTL 规范化会改写被引用的
+ * 字节，使名称在缓存/nft 处理时变成另一个（例如根名 "."）。 */
+typedef struct { uint8_t bits[(MD_MAX_PACKET + 7) / 8]; } name_marks;
+static void marks_reset(name_marks *m, const md_packet *p) {
+    size_t n = p && p->len <= MD_MAX_PACKET ? (p->len + 7) / 8 : sizeof(m->bits);
+    memset(m->bits, 0, n);
+}
+#define MARK(m, o) ((m)->bits[(o) >> 3] |= (uint8_t)(1u << ((o) & 7)))
+#define MARKED(m, o) (((m)->bits[(o) >> 3] >> ((o) & 7)) & 1u)
+static int name(const md_packet *p, name_marks *m, size_t start, size_t *end, char *out, char *err) {
     size_t at = start, wire = 1, used = 0;
     unsigned hops = 0;
     bool jumped = false;
@@ -60,10 +74,12 @@ static int name(const md_packet *p, size_t start, size_t *end, char *out, char *
     for (;;) {
         if (at >= p->len) return fail(err, "DNS name exceeds packet");
         unsigned n = p->data[at];
+        if (!jumped) MARK(m, at);
         if ((n & 0xc0) == 0xc0) {
             if (at + 2 > p->len) return fail(err, "short DNS compression pointer");
             size_t target = ((size_t)(n & 0x3f) << 8) | p->data[at + 1];
-            if (target < 12 || target >= at) return fail(err, "invalid DNS compression target");
+            if (target < 12 || target >= (jumped ? at : start) || !MARKED(m, target))
+                return fail(err, "invalid DNS compression target");
             if (++hops > MD_NAME_MAX_HOPS) return fail(err, "DNS compression cycle");
             if (!jumped) { *end = at + 2; jumped = true; }
             at = target;
@@ -92,7 +108,7 @@ static int name(const md_packet *p, size_t start, size_t *end, char *out, char *
 }
 
 /* 本实现仅支持标准 QUERY 操作码和单问题报文；默认 UDP 限制为 512，OPT 扫描后再覆盖。 */
-static int question(const md_packet *p, md_question *q, char *err) {
+static int question(const md_packet *p, name_marks *m, md_question *q, char *err) {
     COUNT(IS_RESPONSE(p) ? 2 : 0);
     if (!p || p->len < 12 || p->len > MD_MAX_PACKET)
         return fail(err, "short DNS header");
@@ -100,7 +116,7 @@ static int question(const md_packet *p, md_question *q, char *err) {
     memset(q, 0, sizeof(*q));
     q->flags = md_read16(p->data + 2);
     if (q->flags & 0x7800) return fail(err, "unsupported DNS opcode");
-    if (name(p, 12, &q->end, q->name, err)) return -1;
+    if (name(p, m, 12, &q->end, q->name, err)) return -1;
     if (q->end + 4 > p->len) return fail(err, "short DNS question");
     q->type = md_read16(p->data + q->end);
     q->class_ = md_read16(p->data + q->end + 2);
@@ -110,33 +126,33 @@ static int question(const md_packet *p, md_question *q, char *err) {
 }
 
 /* 压缩名称可以引用记录外的旧字节，但此处名称的原始编码必须完整位于 RDATA 内。 */
-static int rdata_name(const md_packet *p, size_t at, size_t limit, size_t *end, char *err) {
-    if (at >= limit || name(p, at, end, NULL, err)) return -1;
+static int rdata_name(const md_packet *p, name_marks *m, size_t at, size_t limit, size_t *end, char *err) {
+    if (at >= limit || name(p, m, at, end, NULL, err)) return -1;
     if (*end > limit) return fail(err, "DNS RDATA name exceeds record");
     return 0;
 }
 
 /* 显式支持的 RR 类型校验其内部结构；其他类型把 RDATA 当作不透明字节串。 */
-static int rdata(const md_packet *p, const md_rr *rr, char *err) {
+static int rdata(const md_packet *p, name_marks *m, const md_rr *rr, char *err) {
     size_t at = rr->data_offset, end = at + rr->data_len, next;
     switch (rr->type) {
     case 1: if (rr->data_len != 4) return fail(err, "invalid DNS A length"); break;
     case 28: if (rr->data_len != 16) return fail(err, "invalid DNS AAAA length"); break;
     case 2: case 5: case 12: case 39:
-        if (rdata_name(p, at, end, &next, err) || next != end)
+        if (rdata_name(p, m, at, end, &next, err) || next != end)
             return fail(err, "invalid DNS name record");
         break;
     case 15:
-        if (rr->data_len < 3 || rdata_name(p, at + 2, end, &next, err) || next != end)
+        if (rr->data_len < 3 || rdata_name(p, m, at + 2, end, &next, err) || next != end)
             return fail(err, "invalid DNS MX record");
         break;
     case 6:
-        if (rdata_name(p, at, end, &next, err) ||
-            rdata_name(p, next, end, &next, err) || next + 20 != end)
+        if (rdata_name(p, m, at, end, &next, err) ||
+            rdata_name(p, m, next, end, &next, err) || next + 20 != end)
             return fail(err, "invalid DNS SOA record");
         break;
     case 33:
-        if (rr->data_len < 7 || rdata_name(p, at + 6, end, &next, err) || next != end)
+        if (rr->data_len < 7 || rdata_name(p, m, at + 6, end, &next, err) || next != end)
             return fail(err, "invalid DNS SRV record");
         break;
     case 16: /* One or more length-prefixed TXT strings. */
@@ -158,7 +174,7 @@ static int rdata(const md_packet *p, const md_rr *rr, char *err) {
 
 /* 顺序扫描 answer、authority、additional，并要求计数恰好覆盖整个报文。
  * OPT 只允许一个且必须在 additional；TTL 字段在 OPT 中承载 EDNS 标志而非生存时间。 */
-static int records(const md_packet *p, md_question *q, md_rr_fn fn, void *arg,
+static int records(const md_packet *p, name_marks *m, md_question *q, md_rr_fn fn, void *arg,
                    size_t *opt_start, size_t *opt_end, md_dns_view *view, char *err) {
     size_t at = q->end;
     bool have_opt = false;
@@ -167,7 +183,7 @@ static int records(const md_packet *p, md_question *q, md_rr_fn fn, void *arg,
         unsigned count = md_read16(p->data + 6 + section * 2);
         for (unsigned i = 0; i < count; i++) {
             size_t start = at, owner_end;
-            if (name(p, at, &owner_end, NULL, err)) return -1;
+            if (name(p, m, at, &owner_end, NULL, err)) return -1;
             at = owner_end;
             if (p->len - at < 10) return fail(err, "short DNS resource record");
             md_rr rr = { .type = md_read16(p->data + at),
@@ -177,11 +193,11 @@ static int records(const md_packet *p, md_question *q, md_rr_fn fn, void *arg,
             at += 10;
             if (rr.data_len > p->len - at) return fail(err, "short DNS resource data");
             at += rr.data_len;
-            if (rdata(p, &rr, err)) return -1;
+            if (rdata(p, m, &rr, err)) return -1;
             if (rr.type == 41) {
                 size_t root_end;
                 char owner[256];
-                if (section != 2 || have_opt || name(p, start, &root_end, owner, err) || strcmp(owner, "."))
+                if (section != 2 || have_opt || name(p, m, start, &root_end, owner, err) || strcmp(owner, "."))
                     return fail(err, "invalid or duplicate DNS OPT");
                 have_opt = true;
                 q->udp_size = rr.class_ < 512 ? 512 : rr.class_;
@@ -208,17 +224,21 @@ static int records(const md_packet *p, md_question *q, md_rr_fn fn, void *arg,
 
 /* 名为 question 的公共入口仍验证后续所有记录，因此下游不能仅凭问题段绕过校验。 */
 int md_dns_question(const md_packet *p, md_question *q, char *err) {
+    name_marks m;
     if (!q) return fail(err, "missing DNS question output");
-    if (question(p, q, err)) return -1;
-    return records(p, q, NULL, NULL, NULL, NULL, NULL, err);
+    marks_reset(&m, p);
+    if (question(p, &m, q, err)) return -1;
+    return records(p, &m, q, NULL, NULL, NULL, NULL, NULL, err);
 }
 /* 两次扫描把校验与副作用分开：只有整个报文有效时才调用记录回调。 */
 int md_dns_records(const md_packet *p, md_rr_fn fn, void *arg, char *err) {
     md_question q;
-    if (question(p, &q, err)) return -1;
+    name_marks m;
+    marks_reset(&m, p);
+    if (question(p, &m, &q, err)) return -1;
     /* Validate before callbacks so a malformed late RR has no partial effects. */
-    if (records(p, &q, NULL, NULL, NULL, NULL, NULL, err)) return -1;
-    return fn ? records(p, &q, fn, arg, NULL, NULL, NULL, err) : 0;
+    if (records(p, &m, &q, NULL, NULL, NULL, NULL, NULL, err)) return -1;
+    return fn ? records(p, &m, &q, fn, arg, NULL, NULL, NULL, err) : 0;
 }
 /* 事务 ID、QR 方向和问题三元组必须一致；同时拒绝结构不完整的响应。 */
 bool md_dns_response_matches(const md_packet *q, const md_packet *r) {
@@ -232,8 +252,10 @@ bool md_dns_response_matches(const md_packet *q, const md_packet *r) {
  * memmove 允许请求与响应使用同一个报文对象。 */
 int md_dns_error(const md_packet *q, md_packet *r, unsigned rcode) {
     md_question parsed;
+    name_marks m;
     if (!q || !r || rcode > 15) return -1;
-    bool valid = question(q, &parsed, NULL) == 0;
+    marks_reset(&m, q);
+    bool valid = question(q, &m, &parsed, NULL) == 0;
     size_t len = valid ? parsed.end : 12;
     uint16_t id = q->len >= 2 ? md_read16(q->data) : 0;
     uint16_t flags = q->len >= 4 ? md_read16(q->data + 2) : 0;
@@ -249,7 +271,9 @@ int md_dns_error(const md_packet *q, md_packet *r, unsigned rcode) {
 int md_dns_strip_opt(md_packet *p) {
     md_question q;
     size_t start = 0, end = 0;
-    if (question(p, &q, NULL) || records(p, &q, NULL, NULL, &start, &end, NULL, NULL)) return -1;
+    name_marks m;
+    marks_reset(&m, p);
+    if (question(p, &m, &q, NULL) || records(p, &m, &q, NULL, NULL, &start, &end, NULL, NULL)) return -1;
     if (!end) return 0;
     /* Moving later RRs would alter compression offsets. Reject non-terminal OPT
      * rather than emit a corrupt packet or silently remove ordinary records. */
@@ -264,7 +288,9 @@ void md_dns_limit_udp(const md_packet *q, md_packet *r) {
     md_question a, b;
     size_t limit = md_dns_question(q, &a, NULL) ? 512 : a.udp_size;
     if (r->len <= limit) return;
-    if (question(r, &b, NULL)) { md_dns_error(q, r, 2); return; }
+    name_marks m;
+    marks_reset(&m, r);
+    if (question(r, &m, &b, NULL)) { md_dns_error(q, r, 2); return; }
     r->len = b.end;
     md_write16(r->data + 2, (uint16_t)(md_read16(r->data + 2) | 0x0200u));
     memset(r->data + 6, 0, 6);
@@ -306,7 +332,9 @@ int md_dns_view_parse(const md_packet *p, md_dns_view *v, char *err) {
     v->len = 0; v->valid = false; v->count = 0; v->addresses = 0;
     v->has_opt = v->signed_ = false; v->opt_start = v->opt_end = 0; v->opt_ttl = 0;
     COUNT(4);
-    if (question(p, &v->q, err) || records(p, &v->q, NULL, NULL, NULL, NULL, v, err)) {
+    name_marks m;
+    marks_reset(&m, p);
+    if (question(p, &m, &v->q, err) || records(p, &m, &v->q, NULL, NULL, NULL, NULL, v, err)) {
         v->count = 0; return -1;
     }
     v->len = p->len; v->valid = true;
@@ -343,9 +371,9 @@ unsigned md_dns_view_rcode(const md_packet *p, const md_dns_view *v) {
     if (v->has_opt) rcode |= (v->opt_ttl >> 24) << 4;
     return rcode;
 }
-/* 改写后重新解析一次（只在 TTL 超出策略时发生）：名称压缩指针可能指进
- * TTL 字节，改写后报文可能不再合法；此时返回失败且 view 标记无效，
- * 后续 nft/缓存不会使用它（旧实现同样在第二遍解析时失败）。 */
+/* 改写后重新解析一次（只在 TTL 超出策略时发生）。压缩指针已不能指进 TTL
+ * 字节（见 name_marks），这次重解析只是防御性的；失败时 view 标记无效，
+ * 后续 nft/缓存不会使用它。 */
 int md_dns_normalize_ttl_view(md_packet *p, md_dns_view *v, char *err) {
     if (view_ok(p, v, err)) return -1;
     bool changed = false;
