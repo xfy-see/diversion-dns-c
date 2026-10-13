@@ -33,6 +33,7 @@ typedef struct job {
     struct sockaddr_storage peer;
     socklen_t peer_len;
     size_t entry;
+    md_dns_query qv; /* 收包时唯一一次请求解析；acquire_job 清零（valid=false） */
     md_packet query, response;
 } job;
 /* 每条 lane 的待执行队列、正在访问上游的 job 链表与 outstanding；后者包含排队、
@@ -154,7 +155,7 @@ static bool enqueue(pool *p, job *j) {
  * loop. It still owns job recycling. */
 static void reply_udp(job *j) {
     if (j->slot >= 0) return;
-    md_dns_limit_udp(&j->query, &j->response);
+    md_dns_limit_udp_q(&j->query, &j->qv, &j->response);
     if (j->response.len) {
         ssize_t ignored = sendto(j->socket, j->response.data, j->response.len, 0,
                                 (struct sockaddr *)&j->peer, j->peer_len);
@@ -187,10 +188,10 @@ static void *work(void *arg) {
         if (stale) {
             fprintf(stderr, "query dropped: queued %llu ms (queue_timeout_ms=%llu)\n",
                     (unsigned long long)waited, (unsigned long long)p->queue_timeout);
-            if (md_dns_error(&j->query, &j->response, 2)) j->response.len = 0;
-        } else if (md_engine_query(p->engine, j->entry, &j->query, &j->response, err)) {
+            if (md_dns_error_q(&j->query, &j->qv, &j->response, 2)) j->response.len = 0;
+        } else if (md_engine_query_q(p->engine, j->entry, &j->query, &j->qv, &j->response, err)) {
             fprintf(stderr, "query failed: %s\n", err);
-            if (md_dns_error(&j->query, &j->response, 2)) j->response.len = 0;
+            if (md_dns_error_q(&j->query, &j->qv, &j->response, 2)) j->response.len = 0;
         }
         job *followers = NULL;
         if (running) {
@@ -290,12 +291,12 @@ static void tcp_read(pool *p, connection *c, int slot) {
                 memcpy(j->query.data, c->body, c->expected);
                 j->query.len = c->expected;
                 j->entry = c->entry; j->slot = slot; j->generation = c->generation;
-                md_question q; char err[MD_ERROR_SIZE];
-                if (md_dns_question(&j->query, &q, err) || (q.flags & 0x8000)) {
+                char err[MD_ERROR_SIZE];
+                if (md_dns_query_parse(&j->query, &j->qv, err) || (j->qv.q.flags & 0x8000)) {
                     recycle_job(p, j); close_connection(p, c); return;
                 }
                 /* 快路径只处理引擎确认可直接返回的鲜缓存，其他查询按 lane 执行完整查询图。 */
-                j->lane = md_engine_dispatch(p->engine, j->entry, &j->query, &j->response);
+                j->lane = md_engine_dispatch_q(p->engine, j->entry, &j->query, &j->qv, &j->response);
                 if (j->lane == MD_LANE_REPLY) {
                     /* 不占任何 lane 配额：每连接至多一个待写回复，受连接上限与写期限约束。 */
                     c->output = j; c->sent = 0; c->write_start = md_now_ms();
@@ -384,18 +385,18 @@ static void udp_read(pool *p, int fd, size_t entry) {
                              (struct sockaddr *)&j->peer, &j->peer_len);
         if (n < 0) { recycle_job(p, j); return; }
         j->query.len = (size_t)n; j->socket = fd; j->entry = entry; j->slot = -1;
-        md_question q; char err[MD_ERROR_SIZE];
-        if (md_dns_question(&j->query, &q, err) || (q.flags & 0x8000)) { recycle_job(p, j); continue; }
-        j->lane = md_engine_dispatch(p->engine, entry, &j->query, &j->response);
+        char err[MD_ERROR_SIZE];
+        if (md_dns_query_parse(&j->query, &j->qv, err) || (j->qv.q.flags & 0x8000)) { recycle_job(p, j); continue; }
+        j->lane = md_engine_dispatch_q(p->engine, entry, &j->query, &j->qv, &j->response);
         if (j->lane == MD_LANE_REPLY) {
-            md_dns_limit_udp(&j->query, &j->response);
+            md_dns_limit_udp_q(&j->query, &j->qv, &j->response);
             ssize_t ignored = sendto(fd, j->response.data, j->response.len, 0,
                                     (struct sockaddr *)&j->peer, j->peer_len);
             (void)ignored;
             recycle_job(p, j); continue;
         }
         if (!enqueue(p, j)) {
-            if (!md_dns_error(&j->query, &j->response, 2)) {
+            if (!md_dns_error_q(&j->query, &j->qv, &j->response, 2)) {
                 ssize_t ignored = sendto(fd, j->response.data, j->response.len, 0,
                                         (struct sockaddr *)&j->peer, j->peer_len);
                 (void)ignored;

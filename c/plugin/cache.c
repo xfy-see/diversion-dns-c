@@ -39,23 +39,16 @@ static uint64_t hash_key(const uint8_t *key, size_t len) {
     for (size_t i = 0; i < len; ++i) h = (h ^ key[i]) * UINT64_C(1099511628211);
     return h;
 }
-typedef struct { unsigned opts; bool unsafe; } key_options;
-/* 缓存不解释 EDNS 选项：只接受至多一个无选项、版本为 0 且
- * extended RCODE 为 0 的 OPT；带 ECS 等选项或其他记录的查询直接绕过。 */
-static int inspect_query_record(const md_packet *p, const md_rr *rr, void *arg) {
-    (void)p;
-    key_options *v = arg;
-    if (rr->type != 41 || rr->section != 2 || ++v->opts > 1 || rr->data_len ||
-        (rr->ttl & UINT32_C(0xffff0000))) v->unsafe = true;
-    return 0;
-}
 /* key = AD/CD/DO 位 + 原始 QNAME/QTYPE/QCLASS 字节，保留名称大小写。
  * 事务 ID 不参与 key；仅缓存标准 IN 查询，压缩问题不能直接复制成 key。
- * 返回 0 表示此问题不适合缓存，调用方应继续常规解析流程。 */
-static size_t make_key(const md_packet *q, uint8_t key[KEY_SIZE], md_question *out) {
-    md_question scratch, *qp = out ? out : &scratch; char err[MD_ERROR_SIZE];
-    if (!q || md_dns_question(q, qp, err) || qp->class_ != 1 ||
-        (qp->flags & 0xf800) || md_read16(q->data + 6) || md_read16(q->data + 8) ||
+ * 缓存不解释 EDNS 选项：只接受至多一个无选项、版本为 0 且 extended RCODE
+ * 为 0 的 OPT（qv->cache_edns_ok，解析请求时同一遍得出）；带 ECS 等选项或
+ * 其他记录的查询直接绕过。返回 0 表示此问题不适合缓存。
+ * qv 是 q 的一次解析结果；这里只做 O(QNAME) 的标签检查，不再解析整包。 */
+static size_t make_key_q(const md_packet *q, const md_dns_query *qv, uint8_t key[KEY_SIZE]) {
+    if (!md_dns_query_ok(q, qv)) return 0;
+    const md_question *qp = &qv->q;
+    if (qp->class_ != 1 || (qp->flags & 0xf800) || md_read16(q->data + 6) || md_read16(q->data + 8) ||
         qp->end < 17 || qp->end - 12 + 1 > KEY_SIZE) return 0;
     /* Keep the key independent of header IDs: bypass compressed questions. */
     size_t pos = 12;
@@ -66,13 +59,17 @@ static size_t make_key(const md_packet *q, uint8_t key[KEY_SIZE], md_question *o
         if (len > qp->end - pos) return 0;
         pos += len;
     }
-    if (pos + 4 != qp->end) return 0;
-    key_options opts = {0};
-    if (md_dns_records(q, inspect_query_record, &opts, err) || opts.unsafe) return 0;
+    if (pos + 4 != qp->end || !qv->cache_edns_ok) return 0;
     key[0] = (uint8_t)(((qp->flags & 0x20) ? 1 : 0) |
                        ((qp->flags & 0x10) ? 2 : 0) | (qp->do_bit ? 4 : 0));
     memcpy(key + 1, q->data + 12, qp->end - 12);
     return qp->end - 12 + 1;
+}
+/* 兼容入口用：qv 未解析/不匹配时自行解析一次（结果写入 *local）。 */
+static const md_dns_query *query_view(const md_packet *q, const md_dns_query *qv, md_dns_query *local) {
+    if (md_dns_query_ok(q, qv)) return qv;
+    if (!q || md_dns_query_parse(q, local, NULL)) return NULL;
+    return local;
 }
 static cache_entry *find_entry(md_cache *c, const uint8_t *key, size_t len, uint64_t hash) {
     for (cache_entry *e = c->buckets[hash & (c->bucket_count - 1)]; e; e = e->hash_next)
@@ -122,8 +119,12 @@ md_cache *md_cache_new(size_t capacity, uint32_t lazy_ttl) {
  * TTL 按写入时记录的偏移在副本上扣减（OPT 已在写入时去除，条目内容不可变），
  * 不再整包解析。stale 响应的记录统一返回 5 秒 TTL。 */
 int md_cache_get_view(md_cache *c, const md_packet *q, md_packet *r, md_dns_view *rv, uint64_t now) {
+    return md_cache_get_q(c, q, NULL, r, rv, now);
+}
+int md_cache_get_q(md_cache *c, const md_packet *q, const md_dns_query *qv, md_packet *r, md_dns_view *rv, uint64_t now) {
     if (!c || !r) return 0;
-    uint8_t key[KEY_SIZE]; size_t len = make_key(q, key, NULL);
+    md_dns_query local; qv = query_view(q, qv, &local);
+    uint8_t key[KEY_SIZE]; size_t len = qv ? make_key_q(q, qv, key) : 0;
     if (!len) return 0;
     uint64_t h = hash_key(key, len); int hit = 0;
     pthread_mutex_lock(&c->lock);
@@ -158,9 +159,13 @@ int md_cache_get(md_cache *c, const md_packet *q, md_packet *r, uint64_t now) {
  * 不支持的 RCODE 或不安全的问题不会缓存。插入失败仅放弃缓存，
  * 不影响调用方已经取得的上游响应。rv 必须是 r 当前内容的 view。 */
 void md_cache_put_view(md_cache *c, const md_packet *q, const md_packet *r, const md_dns_view *rv, uint64_t now) {
+    md_cache_put_q(c, q, NULL, r, rv, now);
+}
+void md_cache_put_q(md_cache *c, const md_packet *q, const md_dns_query *qv, const md_packet *r, const md_dns_view *rv, uint64_t now) {
     if (!c || !r || !rv || r->len < 12 || (md_read16(r->data + 2) & 0x0200)) return;
-    uint8_t key[KEY_SIZE]; md_question qq; size_t len = make_key(q, key, &qq);
-    if (!len || !md_dns_view_matches(q, &qq, r, rv)) return;
+    md_dns_query local; qv = query_view(q, qv, &local);
+    uint8_t key[KEY_SIZE]; size_t len = qv ? make_key_q(q, qv, key) : 0;
+    if (!len || !md_dns_view_matches(q, &qv->q, r, rv)) return;
     if (rv->q.end - 12 != len - 1 || memcmp(r->data + 12, key + 1, len - 1)) return;
     if (rv->signed_) return;
     uint32_t minimum = 0; bool found = false; size_t ttl_count = 0;
@@ -213,9 +218,11 @@ void md_cache_put(md_cache *c, const md_packet *q, const md_packet *r, uint64_t 
 }
 /* 只有成功取得占位的调用方才可启动刷新；达到容量或分配失败时拒绝。
  * 所有结束路径（含任务启动失败）都须调用 refresh_end 释放占位。 */
-bool md_cache_refresh_begin(md_cache *c, const md_packet *q) {
+bool md_cache_refresh_begin(md_cache *c, const md_packet *q) { return md_cache_refresh_begin_q(c, q, NULL); }
+bool md_cache_refresh_begin_q(md_cache *c, const md_packet *q, const md_dns_query *qv) {
     if (!c) return false;
-    uint8_t key[KEY_SIZE]; size_t len = make_key(q, key, NULL);
+    md_dns_query local; qv = query_view(q, qv, &local);
+    uint8_t key[KEY_SIZE]; size_t len = qv ? make_key_q(q, qv, key) : 0;
     if (!len) return false;
     uint64_t h = hash_key(key, len); size_t i = h & (c->bucket_count - 1); bool ok = false;
     pthread_mutex_lock(&c->lock);
@@ -230,9 +237,11 @@ done:
     pthread_mutex_unlock(&c->lock); return ok;
 }
 /* 使用与 begin 相同的问题重建 key；不存在占位时安全返回。 */
-void md_cache_refresh_end(md_cache *c, const md_packet *q) {
+void md_cache_refresh_end(md_cache *c, const md_packet *q) { md_cache_refresh_end_q(c, q, NULL); }
+void md_cache_refresh_end_q(md_cache *c, const md_packet *q, const md_dns_query *qv) {
     if (!c) return;
-    uint8_t key[KEY_SIZE]; size_t len = make_key(q, key, NULL);
+    md_dns_query local; qv = query_view(q, qv, &local);
+    uint8_t key[KEY_SIZE]; size_t len = qv ? make_key_q(q, qv, key) : 0;
     if (!len) return;
     uint64_t h = hash_key(key, len); size_t i = h & (c->bucket_count - 1);
     pthread_mutex_lock(&c->lock);

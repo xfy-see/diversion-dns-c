@@ -17,10 +17,10 @@
 static int test_forward(const md_upstream *, size_t, unsigned, const md_packet *, md_packet *, char *);
 static int test_nft_apply(md_nft *, const md_packet *, char *);
 static uint64_t test_now(void);
-static int test_forward_view(const md_upstream *, size_t, unsigned, const md_packet *, md_packet *, md_dns_view *, char *);
+static int test_forward_q(const md_upstream *, size_t, unsigned, const md_packet *, const md_dns_query *, md_packet *, md_dns_view *, char *);
 static int test_nft_apply_view(md_nft *, const md_packet *, const md_dns_view *, char *);
 #define md_forward test_forward
-#define md_forward_view test_forward_view
+#define md_forward_q test_forward_q
 #define md_nft_apply test_nft_apply
 #define md_nft_apply_view test_nft_apply_view
 #define md_now test_now
@@ -132,7 +132,12 @@ static int test_forward(const md_upstream *us, size_t count, unsigned concurrent
 }
 /* The engine now hands forward/nft the single parsed view; the doubles keep
  * their packet-only bodies and the view must describe the exact bytes. */
-static int test_forward_view(const md_upstream *us, size_t count, unsigned concurrent, const md_packet *q, md_packet *r, md_dns_view *v, char *err) {
+/* The engine also hands forward the request's single parse: it must be valid
+ * for exactly these query bytes (no re-parse needed downstream). */
+static int test_forward_q(const md_upstream *us, size_t count, unsigned concurrent, const md_packet *q, const md_dns_query *qv, md_packet *r, md_dns_view *v, char *err) {
+    md_dns_query fresh;
+    assert(md_dns_query_ok(q, qv) && !md_dns_query_parse(q, &fresh, err));
+    assert(!memcmp(&fresh.q, &qv->q, sizeof(fresh.q)) && fresh.cache_edns_ok == qv->cache_edns_ok);
     int rc = test_forward(us, count, concurrent, q, r, err);
     if (r->len) assert(!md_dns_view_parse(r, v, err));
     return rc;

@@ -618,6 +618,115 @@ static void ptr_target_tests(const md_packet *q, md_packet *m, md_dns_view *v) {
     md_packet self = *q; self.data[12] = 0xc0; self.data[13] = 12;
     assert(md_dns_question(&self, &parsed, err));
 }
+/* Request parse-once: md_dns_query_parse must accept/reject exactly like
+ * md_dns_question (same error text and md_question), its cache EDNS flag must
+ * equal the old make_key md_dns_records inspection, and the *_q helpers must
+ * produce byte-identical results to their packet-only counterparts. */
+typedef struct { unsigned opts; bool unsafe; } old_opts;
+static int old_inspect(const md_packet *p, const md_rr *rr, void *arg) {
+    (void)p; old_opts *v = arg;
+    if (rr->type != 41 || rr->section != 2 || ++v->opts > 1 || rr->data_len || (rr->ttl & 0xffff0000u)) v->unsafe = true;
+    return 0;
+}
+static void query_compare(const md_packet *q) {
+    char e1[MD_ERROR_SIZE] = "", e2[MD_ERROR_SIZE] = "";
+    md_question a; md_dns_query v;
+    int r1 = md_dns_question(q, &a, e1), r2 = md_dns_query_parse(q, &v, e2);
+    assert(!r1 == !r2 && !strcmp(e1, e2));
+    assert(md_dns_query_ok(q, &v) == !r2);
+    if (!r1) {
+        assert(!memcmp(&a, &v.q, sizeof(a)) && v.route == -1);
+        old_opts o = {0}; assert(!md_dns_records(q, old_inspect, &o, NULL));
+        assert(v.cache_edns_ok == !o.unsafe);
+    }
+    static md_packet r1p, r2p;
+    for (unsigned rc = 0; rc < 3; rc++) {
+        r1p.len = r2p.len = 0;
+        assert(md_dns_error(q, &r1p, rc) == md_dns_error_q(q, &v, &r2p, rc));
+        assert(r1p.len == r2p.len && !memcmp(r1p.data, r2p.data, r1p.len));
+    }
+    /* Oversized response against the request's UDP limit. */
+    for (size_t big = 400; big <= 1400; big += 500) {
+        r1p = *q; md_write16(r1p.data + 2, 0x8180);
+        if (r1p.len < big) { memset(r1p.data + r1p.len, 0, big - r1p.len); r1p.len = big; }
+        r2p = r1p;
+        md_dns_limit_udp(q, &r1p); md_dns_limit_udp_q(q, &v, &r2p);
+        assert(r1p.len == r2p.len && !memcmp(r1p.data, r2p.data, r1p.len));
+    }
+    /* A stale view (length changed) is never trusted. */
+    if (!r2 && q->len > 12) { md_packet t = *q; t.len--; assert(!md_dns_query_ok(&t, &v)); }
+}
+static void query_parse_tests(void) {
+    md_packet *seeds = calloc(8, sizeof(*seeds)), *m = malloc(sizeof(*m));
+    const uint8_t qn[] = {3,'w','w','w',7,'e','x','a','m','p','l','e',2,'c','n',0,0,1,0,1};
+    unsigned n = 0;
+    for (unsigned k = 0; k < 6; k++) {
+        md_packet *p = &seeds[n++];
+        md_write16(p->data, 0x1234); md_write16(p->data + 2, 0x0100); md_write16(p->data + 4, 1);
+        memcpy(p->data + 12, qn, sizeof(qn)); p->len = 12 + sizeof(qn);
+        if (k == 1 || k == 2 || k == 3 || k == 5) { /* OPT: plain, ECS option, DO bit, non-zero version */
+            uint8_t opt[11] = {0, 0,41, 0x04,0xd0, 0,0,0,0, 0,0};
+            if (k == 3) opt[7] = 0x80;
+            if (k == 5) opt[6] = 1;
+            memcpy(p->data + p->len, opt, 11); p->len += 11; md_write16(p->data + 10, 1);
+            if (k == 2) { const uint8_t ecs[] = {0,8,0,7,0,1,24,0,192,0,2}; md_write16(p->data + p->len - 2, sizeof(ecs));
+                memcpy(p->data + p->len, ecs, sizeof(ecs)); p->len += sizeof(ecs); }
+        }
+        if (k == 4) { /* two OPTs (invalid) */
+            uint8_t opt[11] = {0, 0,41, 0x04,0xd0, 0,0,0,0, 0,0};
+            memcpy(p->data + p->len, opt, 11); p->len += 11; memcpy(p->data + p->len, opt, 11); p->len += 11;
+            md_write16(p->data + 10, 2);
+        }
+    }
+    /* Compressed question name (valid but not cacheable) and a QR=1 packet. */
+    seeds[n] = seeds[0]; seeds[n].data[12] = 0xc0; seeds[n].data[13] = 12; n++;
+    seeds[n] = seeds[1]; md_write16(seeds[n].data + 2, 0x8180); n++;
+    for (unsigned i = 0; i < n; i++) query_compare(&seeds[i]);
+    md_dns_query v; char err[MD_ERROR_SIZE];
+    assert(!md_dns_query_parse(&seeds[0], &v, err) && v.cache_edns_ok);
+    assert(!md_dns_query_parse(&seeds[2], &v, err) && !v.cache_edns_ok);
+    assert(md_dns_query_parse(&seeds[4], &v, err) && !v.valid);
+    /* Cache: *_q entry points with the request parse behave like the legacy
+     * ones (cacheable plain/OPT/DO queries hit; ECS, bad version, two OPTs,
+     * compressed QNAME and QR=1 never hit), across both entry styles. */
+    for (unsigned i = 0; i < n; i++) {
+        md_cache *c1 = md_cache_new(16, 0), *c2 = md_cache_new(16, 0);
+        md_packet *r = malloc(sizeof(*r)), *o1 = malloc(sizeof(*o1)), *o2 = malloc(sizeof(*o2));
+        md_dns_view *rv = malloc(sizeof(*rv));
+        md_dns_query qv; bool ok = !md_dns_query_parse(&seeds[i], &qv, NULL);
+        *r = seeds[i]; md_write16(r->data + 2, (uint16_t)(md_read16(r->data + 2) | 0x8080));
+        r->len = 12 + sizeof(qn); md_write16(r->data + 10, 0); md_write16(r->data + 6, 1);
+        const uint8_t a4[] = {0xc0,12,0,1,0,1,0,0,0,60,0,4,192,0,2,1};
+        memcpy(r->data + r->len, a4, sizeof(a4)); r->len += sizeof(a4);
+        if (i == n - 2) { r->data[12] = 0xc0; r->data[13] = 12; r->len = seeds[i].len; } /* compressed */
+        if (!md_dns_view_parse(r, rv, NULL)) {
+            md_cache_put_view(c1, &seeds[i], r, rv, 100);
+            md_cache_put_q(c2, &seeds[i], ok ? &qv : NULL, r, rv, 100);
+        }
+        int h1 = md_cache_get(c1, &seeds[i], o1, 101);
+        int h2 = md_cache_get_q(c2, &seeds[i], ok ? &qv : NULL, o2, rv, 101);
+        assert(h1 == h2 && (!h1 || (o1->len == o2->len && !memcmp(o1->data, o2->data, o1->len))));
+        assert(h1 == (i == 0 || i == 1 || i == 3));
+        int h3 = md_cache_get(c2, &seeds[i], o1, 101);
+        assert(h3 == h1);
+        assert(md_cache_refresh_begin_q(c1, &seeds[i], ok ? &qv : NULL) == md_cache_refresh_begin(c2, &seeds[i]));
+        md_cache_refresh_end(c1, &seeds[i]); md_cache_refresh_end_q(c2, &seeds[i], ok ? &qv : NULL);
+        if (h1) assert(md_cache_refresh_begin(c1, &seeds[i]) && md_cache_refresh_begin_q(c2, &seeds[i], &qv));
+        md_cache_free(c1); md_cache_free(c2); free(r); free(o1); free(o2); free(rv);
+    }
+    for (unsigned i = 0; i < 200000; i++) {
+        *m = seeds[view_rand() % n];
+        unsigned flips = 1 + view_rand() % 3;
+        for (unsigned f = 0; f < flips; f++) {
+            unsigned kind = view_rand() % 6;
+            if (kind < 4 && m->len) m->data[view_rand() % m->len] = (uint8_t)view_rand();
+            else if (kind == 4 && m->len > 12) m->len -= 1 + view_rand() % 4;
+            else md_write16(m->data + 4 + 2 * (view_rand() % 4), (uint16_t)(view_rand() % 3));
+        }
+        query_compare(m);
+    }
+    free(seeds); free(m);
+}
 static void view_tests(void) {
     md_dns_view *v = malloc(sizeof(*v)); assert(v);
     md_packet q, r, *m = malloc(sizeof(*m)); char err[MD_ERROR_SIZE]; assert(m);
@@ -697,7 +806,7 @@ static void view_tests(void) {
 }
 
 int main(void) {
-    dns_tests(); view_tests(); address_tests(); upstream_tests(); retry_tests(); udp_reuse_tests();
+    dns_tests(); view_tests(); query_parse_tests(); address_tests(); upstream_tests(); retry_tests(); udp_reuse_tests();
     puts("dns/upstream tests passed"); return 0;
 }
 
