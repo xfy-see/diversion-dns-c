@@ -146,6 +146,10 @@ typedef struct {
     worker_connection *cached;
     uint16_t query_id;
     bool reused, dirty;
+    /* UDP park/reuse bookkeeping (ignored for TCP). udp_uses is completed queries
+     * already done on this fd before the current exchange; udp_born is open time. */
+    unsigned udp_uses;
+    uint64_t udp_born;
     md_packet packet;
 } exchange;
 typedef struct {
@@ -155,12 +159,13 @@ typedef struct {
     exchange exchanges[3];
     md_packet query; /* The upstream copy of the query (random ID, M4). */
     bool exchanges_in_use;
-    /* M4 keeps one fresh, never-used UDP socket per upstream. Each socket still
-     * carries exactly one query (its own kernel-random ephemeral port), but
-     * socket/fcntl/connect and close of the used one run in
-     * md_forward_worker_idle() after the reply, not on the query's path. */
+    /* M4 default: one fresh, never-used UDP socket per upstream (spare_uses==0).
+     * Opt-in udp_sport_reuse may park a quiet used socket back with spare_uses>0
+     * until max_uses/ttl, still one in-flight owner at a time. Close of dead fds
+     * and refill of virgin spares run in md_forward_worker_idle(). */
     int spare_fd[WORKER_UDP_SPARES];
     uint64_t spare_born[WORKER_UDP_SPARES];
+    unsigned spare_uses[WORKER_UDP_SPARES];
     md_upstream spare_key[WORKER_UDP_SPARES];
     bool spare_wanted[WORKER_UDP_SPARES];
     int dead_fd[WORKER_UDP_DEAD];
@@ -185,6 +190,29 @@ static _Thread_local uint16_t random_pool[32];
 static _Thread_local unsigned random_left;
 static _Thread_local uint64_t random_state;
 static atomic_uint_fast64_t random_counter;
+/* Process-wide opt-in UDP source-port reuse. Default off preserves M4. Workers
+ * read a snapshot; engine load / tests call set before enabling workers. */
+static md_udp_sport_reuse g_udp_reuse = { .enabled = 0, .max_uses = 16, .ttl_ms = 2000, .pool_size = 2 };
+void md_forward_set_udp_sport_reuse(const md_udp_sport_reuse *cfg) {
+    md_udp_sport_reuse next = { .enabled = 0, .max_uses = 16, .ttl_ms = 2000, .pool_size = 2 };
+    if (cfg) {
+        next.enabled = cfg->enabled ? 1u : 0u;
+        if (cfg->max_uses) next.max_uses = cfg->max_uses;
+        if (cfg->ttl_ms) next.ttl_ms = cfg->ttl_ms;
+        if (cfg->pool_size) next.pool_size = cfg->pool_size;
+        if (next.max_uses < 1) next.max_uses = 1;
+        if (next.max_uses > 256) next.max_uses = 256;
+        if (next.ttl_ms < 100) next.ttl_ms = 100;
+        if (next.ttl_ms > 60000) next.ttl_ms = 60000;
+        if (next.pool_size < 1) next.pool_size = 1;
+        if (next.pool_size > 4) next.pool_size = 4;
+    }
+    g_udp_reuse = next;
+}
+void md_forward_get_udp_sport_reuse(md_udp_sport_reuse *cfg) {
+    if (cfg) *cfg = g_udp_reuse;
+}
+static md_udp_sport_reuse reuse_snapshot(void) { return g_udp_reuse; }
 static bool random_fill(void *buffer, size_t size) {
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
     arc4random_buf(buffer, size); return true;
@@ -233,7 +261,9 @@ void md_forward_worker_enable(void) {
     worker_tcp = calloc(1, sizeof(*worker_tcp));
     if (worker_tcp) {
         for (unsigned i = 0; i < WORKER_TCP_CAPACITY; i++) worker_tcp->slots[i].fd = -1;
-        for (unsigned i = 0; i < WORKER_UDP_SPARES; i++) worker_tcp->spare_fd[i] = -1;
+        for (unsigned i = 0; i < WORKER_UDP_SPARES; i++) {
+            worker_tcp->spare_fd[i] = -1; worker_tcp->spare_uses[i] = 0;
+        }
     }
 }
 /* 池键包含目标、配置协议、mark 和设备，避免复用改变了路由约束的连接。 */
@@ -285,15 +315,51 @@ static worker_connection *take_connection(const md_upstream *u, bool tcp, uint16
     memset(available->ids, 0, sizeof(available->ids));
     return available;
 }
+/* Count parked sockets for one upstream (fd still held in a spare slot). */
+static unsigned parked_for(const md_upstream *u) {
+    unsigned n = 0;
+    for (unsigned i = 0; i < WORKER_UDP_SPARES; i++)
+        if (worker_tcp->spare_wanted[i] && worker_tcp->spare_fd[i] >= 0 &&
+            same_endpoint(&worker_tcp->spare_key[i], u)) n++;
+    return n;
+}
+/* Opt-in: return a quiet UDP socket to the spare list when under max-uses, age,
+ * and per-upstream pool_size. Default path never parks used sockets. */
+static bool park_udp(exchange *x) {
+    md_udp_sport_reuse cfg = reuse_snapshot();
+    if (!cfg.enabled || !worker_tcp || x->fd < 0 || x->tcp || x->dirty || !x->upstream) return false;
+    unsigned next = x->udp_uses + 1;
+    uint64_t now = milliseconds();
+    if (next > cfg.max_uses || now - x->udp_born >= cfg.ttl_ms || !quiet_socket(x->fd)) return false;
+    if (parked_for(x->upstream) >= cfg.pool_size) return false;
+    unsigned slot = WORKER_UDP_SPARES;
+    for (unsigned i = 0; i < WORKER_UDP_SPARES; i++) {
+        if (worker_tcp->spare_wanted[i] && worker_tcp->spare_fd[i] < 0 &&
+            same_endpoint(&worker_tcp->spare_key[i], x->upstream)) { slot = i; break; }
+        if (!worker_tcp->spare_wanted[i] && slot == WORKER_UDP_SPARES) slot = i;
+    }
+    if (slot == WORKER_UDP_SPARES) return false;
+    worker_tcp->spare_fd[slot] = x->fd;
+    worker_tcp->spare_born[slot] = x->udp_born;
+    worker_tcp->spare_uses[slot] = next;
+    worker_tcp->spare_key[slot] = *x->upstream;
+    worker_tcp->spare_wanted[slot] = true;
+    worker_tcp->maintenance = true;
+    x->fd = -1;
+    return true;
+}
 /* 失败和未胜出的 exchange 都关闭自己持有的 fd，并释放对应池槽。 */
 static void stop(exchange *x) {
-    /* A used UDP socket is never reused; its close is deferred to idle time. */
-    if (x->fd >= 0 && !x->tcp && !x->cached && worker_tcp && worker_tcp->dead_count < WORKER_UDP_DEAD)
+    /* Default M4: used UDP sockets are never reused; close is deferred to idle.
+     * With udp_sport_reuse, a quiet socket may park back under uses/age/pool caps. */
+    if (x->fd >= 0 && !x->tcp && !x->cached && worker_tcp && park_udp(x))
+        { /* parked */ }
+    else if (x->fd >= 0 && !x->tcp && !x->cached && worker_tcp && worker_tcp->dead_count < WORKER_UDP_DEAD)
         worker_tcp->dead_fd[worker_tcp->dead_count++] = x->fd, worker_tcp->maintenance = true;
     else if (x->fd >= 0) close(x->fd);
     x->fd = -1; x->state = DEAD; x->udp_retry = 0;
     if (x->cached) { retire(x->cached); x->cached = NULL; }
-    x->reused = x->dirty = false;
+    x->reused = x->dirty = false; x->udp_uses = 0; x->udp_born = 0;
 }
 /* 在 connect 前应用路由 mark/绑定设备；不支持的平台直接报错，
  * 避免配置要求分流时悄悄使用默认路由。 */
@@ -317,24 +383,36 @@ static int socket_options(int fd, const md_upstream *u, char *err) {
         return syserr(err, "set socket flags");
     return 0;
 }
-/* Hand out this upstream's pre-opened UDP socket (single use) and ask
- * md_forward_worker_idle() to open its replacement. A spare that is stale,
- * retargeted, or already holds a datagram is closed instead of used. */
-static int take_spare(const md_upstream *u) {
+/* Hand out a parked or pre-opened UDP socket for this upstream. Default M4 only
+ * accepts virgin (uses==0) spares; opt-in reuse also accepts quiet sockets under
+ * max_uses and ttl. A stale, dirty, or over-limit socket is closed. Asking idle
+ * to refill keeps the next cold query off the hot path when possible. */
+static int take_spare(const md_upstream *u, unsigned *out_uses, uint64_t *out_born) {
     if (!worker_tcp) return -1;
+    md_udp_sport_reuse cfg = reuse_snapshot();
+    uint64_t now = milliseconds();
+    unsigned age_limit = cfg.enabled ? cfg.ttl_ms : WORKER_TCP_IDLE_MS;
     unsigned free_slot = WORKER_UDP_SPARES;
     for (unsigned i = 0; i < WORKER_UDP_SPARES; i++) {
         if (!worker_tcp->spare_wanted[i]) { if (free_slot == WORKER_UDP_SPARES) free_slot = i; continue; }
         if (!same_endpoint(&worker_tcp->spare_key[i], u)) continue;
         int fd = worker_tcp->spare_fd[i];
-        worker_tcp->spare_fd[i] = -1; worker_tcp->maintenance = true;
+        unsigned uses = worker_tcp->spare_uses[i];
+        uint64_t born = worker_tcp->spare_born[i];
+        worker_tcp->spare_fd[i] = -1; worker_tcp->spare_uses[i] = 0; worker_tcp->maintenance = true;
         if (fd < 0) return -1;
-        if (milliseconds() - worker_tcp->spare_born[i] < WORKER_TCP_IDLE_MS && quiet_socket(fd)) return fd;
+        bool age_ok = now - born < age_limit;
+        bool uses_ok = cfg.enabled ? uses < cfg.max_uses : uses == 0;
+        if (age_ok && uses_ok && quiet_socket(fd)) {
+            if (out_uses) *out_uses = uses;
+            if (out_born) *out_born = born;
+            return fd;
+        }
         close(fd); return -1;
     }
     if (free_slot < WORKER_UDP_SPARES) {
         worker_tcp->spare_key[free_slot] = *u; worker_tcp->spare_wanted[free_slot] = true;
-        worker_tcp->maintenance = true;
+        worker_tcp->spare_uses[free_slot] = 0; worker_tcp->maintenance = true;
     }
     return -1;
 }
@@ -343,17 +421,28 @@ static int take_spare(const md_upstream *u) {
 void md_forward_worker_idle(void) {
     if (!worker_tcp || !worker_tcp->maintenance) return;
     worker_tcp->maintenance = false;
+    md_udp_sport_reuse cfg = reuse_snapshot();
     uint64_t now = milliseconds();
+    unsigned age_limit = cfg.enabled ? cfg.ttl_ms : WORKER_TCP_IDLE_MS;
     for (unsigned i = 0; i < worker_tcp->dead_count; i++) close(worker_tcp->dead_fd[i]);
     worker_tcp->dead_count = 0;
     for (unsigned i = 0; i < WORKER_UDP_SPARES; i++) {
         if (!worker_tcp->spare_wanted[i]) continue;
         if (worker_tcp->spare_fd[i] >= 0) {
-            /* An upstream unused for the idle period loses its slot. */
-            if (now - worker_tcp->spare_born[i] >= WORKER_TCP_IDLE_MS) {
-                close(worker_tcp->spare_fd[i]); worker_tcp->spare_fd[i] = -1; worker_tcp->spare_wanted[i] = false;
+            /* Aged or over-limit parked sockets leave the pool. */
+            bool over_age = now - worker_tcp->spare_born[i] >= age_limit;
+            bool over_uses = cfg.enabled && worker_tcp->spare_uses[i] >= cfg.max_uses;
+            if (over_age || over_uses || (!cfg.enabled && worker_tcp->spare_uses[i] > 0)) {
+                close(worker_tcp->spare_fd[i]);
+                worker_tcp->spare_fd[i] = -1; worker_tcp->spare_uses[i] = 0;
+                worker_tcp->spare_wanted[i] = false;
             }
             continue;
+        }
+        /* Refill empty wanted slots with a virgin prewarm (uses==0). Cap how many
+         * sockets one upstream keeps when reuse is on (pool_size). */
+        if (cfg.enabled && parked_for(&worker_tcp->spare_key[i]) >= cfg.pool_size) {
+            worker_tcp->spare_wanted[i] = false; continue;
         }
         const md_upstream *u = &worker_tcp->spare_key[i];
         int fd = socket(u->address.ss_family, SOCK_DGRAM, 0);
@@ -361,15 +450,16 @@ void md_forward_worker_idle(void) {
         if (socket_options(fd, u, NULL) || connect(fd, (const struct sockaddr *)&u->address, u->address_len)) {
             close(fd); continue;
         }
-        worker_tcp->spare_fd[i] = fd; worker_tcp->spare_born[i] = now;
+        worker_tcp->spare_fd[i] = fd; worker_tcp->spare_born[i] = now; worker_tcp->spare_uses[i] = 0;
     }
 }
 /* 借用时把 fd 从池槽移到 exchange；成功后 keep_response 才将所有权交还。 */
-/* M4: only TCP connections are pooled. Every UDP exchange opens a fresh
- * connected socket, so the kernel picks a new random ephemeral source port per
- * query; together with the random ID an off-path spoofer must guess ~31 bits. */
+/* M4 default: only TCP connections are pooled; every UDP exchange uses a fresh
+ * connected socket (kernel-random ephemeral port) so an off-path spoofer must
+ * guess ~31 bits with the random ID. Opt-in udp_sport_reuse may hand out a quiet
+ * parked UDP socket under max_uses/ttl instead of opening a new port. */
 static int begin_connection(exchange *x, const md_upstream *u, bool tcp, bool allow_reuse, char *err) {
-    stop(x); x->tcp = tcp; x->upstream = u; x->done = 0;
+    stop(x); x->tcp = tcp; x->upstream = u; x->done = 0; x->udp_uses = 0; x->udp_born = 0;
     if (tcp && (x->cached = take_connection(u, tcp, x->query_id, allow_reuse))) {
         x->cached->ids[x->query_id / 8] |= (uint8_t)(1u << (x->query_id % 8));
         if (x->cached->fd >= 0) {
@@ -377,13 +467,19 @@ static int begin_connection(exchange *x, const md_upstream *u, bool tcp, bool al
             x->state = SENDING; x->reused = true; return 0;
         }
     }
-    if (!tcp && (x->fd = take_spare(u)) >= 0) { x->state = SENDING; return 0; }
+    if (!tcp) {
+        unsigned uses = 0; uint64_t born = 0;
+        if ((x->fd = take_spare(u, &uses, &born)) >= 0) {
+            x->udp_uses = uses; x->udp_born = born; x->state = SENDING; return 0;
+        }
+    }
     x->fd = socket(u->address.ss_family, tcp ? SOCK_STREAM : SOCK_DGRAM, 0);
     if (x->fd < 0) { syserr(err, "create upstream socket"); stop(x); return -1; }
     if (socket_options(x->fd, u, err)) { stop(x); return -1; }
     if (!connect(x->fd, (const struct sockaddr *)&u->address, u->address_len)) x->state = SENDING;
     else if (errno == EINPROGRESS || errno == EWOULDBLOCK) x->state = CONNECTING;
     else { syserr(err, "connect upstream"); stop(x); return -1; }
+    if (!tcp) { x->udp_uses = 0; x->udp_born = milliseconds(); }
     return 0;
 }
 static int begin(exchange *x, const md_upstream *u, bool tcp, char *err) {

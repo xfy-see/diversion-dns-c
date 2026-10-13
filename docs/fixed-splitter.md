@@ -93,6 +93,10 @@ cache_size=1024 # explanation
 | `nftset_ipv4` | 单值，五段逗号格式，IPv4 mask 1–32 | 不学习 IPv4 |
 | `nftset_ipv6` | 单值，五段逗号格式，IPv6 mask 1–128 | 不学习 IPv6 |
 | `nftset_fast` | 单值，0/1；1 要求 Linux ≥6.12、/32 或 /128 和预建普通 timeout set | 0 |
+| `udp_sport_reuse` | 单值，0/1；1 启用有限上游 UDP 源端口复用（削弱每查询端口唯一性） | 0 |
+| `udp_sport_reuse_max_uses` | 单值，1–256；每个 socket 复用查询次数上限（仅 `udp_sport_reuse=1` 时生效） | 16 |
+| `udp_sport_reuse_ttl_ms` | 单值，100–60000 毫秒；socket 自打开起的最长存活（仅启用时生效） | 2000 |
+| `udp_sport_reuse_pool` | 单值，1–4；每 worker 每上游可停放的空闲 UDP socket 数（仅启用时生效） | 2 |
 
 必须至少配置一个 listener。UDP 和 TCP listener **合计最多 64 个**，同一传输中的重复
 数字地址被拒绝。`cache_size=0` 时，非零 `cache_lazy_ttl` 会报错。
@@ -234,11 +238,32 @@ DNS 正常回答并打印限速告警（0.1.1 及以前回 SERVFAIL）；队列�
 
 ## 上游 UDP 已知限制（0.1.2 / M4）
 
-每次上游 UDP 交换使用全新 connected socket 与内核随机源端口（随机 ID + 随机端口约 31 位熵；
-端口不复用）。在 **mipsel_24kc**（.122，Linux 6.12.94）上，冷缓存 / 首次上游 UDP 查询相对
-v0.1.1 约多 **+4–5 ms P50**、约 **+5 ms P99**（2026-10-13 六轮中位数消融：冷 A P99 约
-**7.3 → ~12 ms**）；热路径不受影响。该路径上 conntrack 约每条冷查询增加 1 条。
-**aarch64**（.131）冷路径无实质回归。默认保留每查询新源端口并接受该 MIPS 冷查询代价；
-有时限/小容量复用池可作为后续可选 opt-in，当前不提供。消融结论：恢复 UDP 池（保留随机 ID）
-或整段回退 M4 可回到基线冷 P99；回退 N3 不能。
+**默认**每次上游 UDP 交换使用全新 connected socket 与内核随机源端口（随机 ID + 随机端口约
+31 位熵；已用 socket 不复用；空闲预开只把 `socket`/`connect` 挪出热路径）。在
+**mipsel_24kc**（.122，Linux 6.12.94）上，冷缓存 / 首次上游 UDP 查询相对 v0.1.1 约多
+**+4–5 ms P50**、约 **+5 ms P99**（2026-10-13 六轮中位数消融：冷 A P99 约 **7.3 → ~12 ms**）；
+热路径不受影响。该路径上 conntrack 约每条冷查询增加 1 条。**aarch64**（.131）冷路径无实质回归。
+
+### 可选：`udp_sport_reuse`（显式 opt-in）
+
+设置 `udp_sport_reuse=1` 可启用有时限、有次数上限的小容量 UDP 源端口复用，以降低 MIPS 冷查询
+代价。启用后每个 worker 可按上游停放最多 `udp_sport_reuse_pool` 个空闲 socket，在
+`udp_sport_reuse_max_uses` 次查询或 `udp_sport_reuse_ttl_ms` 毫秒内复用（须无待收数据报）；
+超限后关闭并换新端口。同一 socket 不会并发服务多个 in-flight 查询。热路径在未触及上游 /
+纯缓存命中时仍只做维护标志检查（与 PR #8 一致）。
+
+**安全权衡：** 启用会削弱「每查询唯一源端口」；离路径伪造仍须猜中随机 DNS ID，但端口熵随复用
+窗口下降。仅在接受该权衡、并需要 MIPS 冷延迟时打开。建议起步值：
+
+```conf
+udp_sport_reuse=1
+udp_sport_reuse_max_uses=16
+udp_sport_reuse_ttl_ms=2000
+udp_sport_reuse_pool=2
+```
+
+默认 `udp_sport_reuse=0` 时行为与当前 main 完全一致（含「10 查询 → 10 端口」测试）。
+
+**.122 实测（2026-10-13，mipsel_24kc）：** 主要改善冷 **AAAA**——6 轮全部改善；冷 A 无稳定收益；TCP 受顺序效应影响大，无稳定结论。启用池后 500 QPS 累计 30 分钟：900,000/900,000 成功、零漏发、整体 P99 2.976 ms。协议、nft、队列/TCP 限制、池边界、interval 重叠、链路本地 IPv6 功能测试通过。默认保持 `udp_sport_reuse=0`（每查询新源端口）；启用会削弱源端口唯一性（上游随机 DNS ID 仍保留）。仅当慢速 MIPS 上冷 AAAA 延迟重要时建议启用。
+消融结论：恢复无上限 UDP 池（保留随机 ID）或整段回退 M4 可回到基线冷 P99；回退 N3 不能。
 

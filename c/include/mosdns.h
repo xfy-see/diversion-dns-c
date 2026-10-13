@@ -93,8 +93,21 @@ int md_forward(const md_upstream *us, size_t count, unsigned concurrent,
 void md_forward_worker_enable(void);
 void md_forward_worker_cleanup(void);
 /* Called by a worker after replying: closes used UDP sockets and pre-opens a
- * fresh single-use UDP socket per recently used upstream (M4 port randomness). */
+ * fresh single-use UDP socket per recently used upstream (M4 port randomness).
+ * When udp_sport_reuse is enabled, may also park/reuse quiet sockets within limits. */
 void md_forward_worker_idle(void);
+/* Opt-in limited UDP source-port reuse. Default is off: every cold UDP query gets a
+ * new kernel-random ephemeral port (M4). When enabled, each worker may park a small
+ * number of quiet sockets per upstream and reuse them until max_uses or ttl_ms, then
+ * rotate. A socket is never shared across concurrent in-flight queries. */
+typedef struct {
+    unsigned enabled;   /* 0 or 1 */
+    unsigned max_uses;  /* 1..256 queries per socket before rotate */
+    unsigned ttl_ms;    /* 100..60000 ms max age from open */
+    unsigned pool_size; /* 1..4 parked sockets per worker per upstream */
+} md_udp_sport_reuse;
+void md_forward_set_udp_sport_reuse(const md_udp_sport_reuse *cfg);
+void md_forward_get_udp_sport_reuse(md_udp_sport_reuse *cfg);
 
 /* nft 对象负责提取响应 Answer 中 IN 类 A/AAAA 并更新既有集合。
  * 创建只解析参数，Linux 写入在 apply 执行；销毁前调用方须确保所有

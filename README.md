@@ -14,7 +14,9 @@ v0.1.1 是稳定性版本：新增可选的 `nftset_fast` netlink 快速路径�
 
 修复批次在 PR [#7](https://github.com/xfy-see/diversion-dns-c/pull/7) / [#8](https://github.com/xfy-see/diversion-dns-c/pull/8)，**尚未合并、未发版**。行为说明见 [fixed-splitter 上游 UDP 已知限制](docs/fixed-splitter.md#上游-udp-已知限制012--m4) 与 [c/README.md](c/README.md)。
 
-M4 默认每次上游 UDP 使用新源端口。在 mipsel_24kc（.122，Linux 6.12.94）上，冷缓存 / 首次上游 UDP 相对 v0.1.1 约多 +4–5 ms P50、约 +5 ms P99（2026-10-13 六轮中位数消融：冷 A P99 约 7.3→~12 ms）；热路径与 aarch64（.131）无实质回归。conntrack 约每条冷查询 +1。所有者接受该代价；有限复用池留作后续 opt-in。
+M4 默认每次上游 UDP 使用新源端口。在 mipsel_24kc（.122，Linux 6.12.94）上，冷缓存 / 首次上游 UDP 相对 v0.1.1 约多 +4–5 ms P50、约 +5 ms P99（2026-10-13 六轮中位数消融：冷 A P99 约 7.3→~12 ms）；热路径与 aarch64（.131）无实质回归。conntrack 约每条冷查询 +1。所有者接受该默认代价；可用显式 opt-in `udp_sport_reuse=1`（见 [fixed-splitter](docs/fixed-splitter.md#上游-udp-已知限制012--m4)）启用有限复用以降冷延迟，并接受源端口唯一性被削弱。
+
+`udp_sport_reuse=1` 为默认关闭的 opt-in，主要改善冷 AAAA（.122 六轮全部改善；冷 A 无稳定收益；TCP 受顺序效应影响无稳定结论）；500 QPS × 30 分钟 900,000/900,000 成功、零漏发、P99 2.976 ms，功能测试通过。仅当慢速 MIPS 冷 AAAA 延迟重要时建议启用。
 
 ## v0.1.0（上一版本）
 
