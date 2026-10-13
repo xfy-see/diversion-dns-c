@@ -9,6 +9,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdatomic.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -469,8 +470,234 @@ static void udp_reuse_tests(void) {
     }
     md_forward_set_udp_sport_reuse(&off);
 }
+/* ---- md_dns_view：与旧的逐次解析接口做差分，保证"一次解析"不放宽校验 ---- */
+static bool same_rr(const md_rr *a, const md_rr *b) {
+    return a->ttl_offset == b->ttl_offset && a->data_offset == b->data_offset && a->type == b->type &&
+        a->class_ == b->class_ && a->data_len == b->data_len && a->ttl == b->ttl && a->section == b->section;
+}
+typedef struct { unsigned n; md_rr rr[64]; } rr_list;
+static int list_rr(const md_packet *p, const md_rr *rr, void *v) {
+    (void)p; rr_list *l = v; if (l->n < 64) l->rr[l->n] = *rr; l->n++; return 0;
+}
+static uint64_t view_rng = 0x9e3779b97f4a7c15u;
+static uint32_t view_rand(void) {
+    view_rng ^= view_rng << 13; view_rng ^= view_rng >> 7; view_rng ^= view_rng << 17;
+    return (uint32_t)view_rng;
+}
+static void view_add_rr(md_packet *p, unsigned section, const uint8_t *owner, size_t owner_len,
+                        uint16_t type, uint32_t ttl, const uint8_t *data, size_t len) {
+    memcpy(p->data + p->len, owner, owner_len); p->len += owner_len;
+    md_write16(p->data + p->len, type); md_write16(p->data + p->len + 2, 1);
+    md_write32(p->data + p->len + 4, ttl); md_write16(p->data + p->len + 8, (uint16_t)len);
+    p->len += 10; if (len) memcpy(p->data + p->len, data, len); p->len += len;
+    size_t at = 6 + section * 2; md_write16(p->data + at, (uint16_t)(md_read16(p->data + at) + 1));
+}
+/* 对同一报文比较：校验结论、问题段、RR 序列、TTL 规范化、extended RCODE、匹配。 */
+static void view_compare(const md_packet *q, const md_packet *m, md_dns_view *v) {
+    md_question lq; char err[MD_ERROR_SIZE];
+    bool legacy = !md_dns_question(m, &lq, err) && !md_dns_records(m, NULL, NULL, err);
+    bool viewed = !md_dns_view_parse(m, v, err);
+    assert(legacy == viewed);
+    assert(md_dns_response_matches(q, m) == (viewed && md_dns_question(q, &lq, NULL) == 0 &&
+           md_dns_view_matches(q, &lq, m, v)));
+    if (!viewed) { assert(!v->valid && md_dns_view_each(m, v, NULL, NULL, err)); return; }
+    assert(!md_dns_question(m, &lq, err));
+    assert(!strcmp(lq.name, v->q.name) && lq.type == v->q.type && lq.class_ == v->q.class_ &&
+           lq.flags == v->q.flags && lq.end == v->q.end && lq.udp_size == v->q.udp_size && lq.do_bit == v->q.do_bit);
+    rr_list a = {0}, b = {0};
+    assert(!md_dns_records(m, list_rr, &a, err) && !md_dns_view_each(m, v, list_rr, &b, err));
+    assert(a.n == b.n && a.n == v->count);
+    unsigned rcode = md_read16(m->data + 2) & 15, addresses = 0; bool signed_ = false;
+    for (unsigned i = 0; i < a.n && i < 64; i++) {
+        assert(same_rr(&a.rr[i], &b.rr[i]));
+        if (a.rr[i].type == 41) rcode |= (a.rr[i].ttl >> 24) << 4;
+        if (!a.rr[i].section && a.rr[i].class_ == 1 && (a.rr[i].type == 1 || a.rr[i].type == 28)) addresses++;
+        if (a.rr[i].type == 250 || (a.rr[i].type == 24 && a.rr[i].section == 2)) signed_ = true;
+    }
+    if (a.n <= 64) { assert(addresses == v->addresses && signed_ == v->signed_); }
+    assert(rcode == md_dns_view_rcode(m, v));
+    md_packet *x = malloc(sizeof(*x)), *y = malloc(sizeof(*y)); assert(x && y);
+    *x = *m; *y = *m;
+    int rx = md_dns_normalize_ttl(x, err), ry = md_dns_normalize_ttl_view(y, v, err);
+    /* Both fail or both succeed; on success the bytes are identical and the
+     * view re-validated the rewritten packet. Failure contents may differ
+     * (legacy stops mid-rewrite), but neither is then used. */
+    assert(rx == ry);
+    if (!ry) assert(x->len == y->len && !memcmp(x->data, y->data, x->len) && v->valid && v->len == y->len);
+    else assert(!v->valid || (y->len == m->len && !memcmp(y->data, m->data, m->len)));
+    free(x); free(y);
+}
+/* Regression: a compression pointer must target an earlier name start. A
+ * pointer into an RR's TYPE/CLASS/TTL/RDLENGTH, opaque RDATA, the question's
+ * QTYPE/QCLASS or the middle of a label makes the whole response invalid on
+ * every parse path (legacy, view, TTL normalisation), so nothing is learned.
+ * Previously TTL=0xC00C0000 made the TTL bytes a "pointer" and after TTL
+ * normalisation to 0 the referring owner silently became the root name. */
+static void ptr_target_tests(const md_packet *q, md_packet *m, md_dns_view *v) {
+    char err[MD_ERROR_SIZE]; md_question parsed;
+    const uint8_t ptr[] = {0xc0, 12}, a4[] = {192,0,2,1};
+    /* RR1 owner (2) + TYPE(2) CLASS(2) TTL(4) RDLENGTH(2) RDATA(4). */
+    struct { const char *what; size_t delta; } bad[] = {
+        {"TYPE", 2}, {"CLASS", 4}, {"TTL", 6}, {"TTL+2", 8}, {"RDLENGTH", 10}, {"RDATA", 12},
+    };
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        for (unsigned ttlptr = 0; ttlptr < 2; ttlptr++) {
+            assert(!md_dns_error(q, m, 0)); md_write16(m->data + 2, 0x8180);
+            size_t base = m->len;
+            /* With TTL=0xC00C0000 the TTL bytes look like a valid pointer to qname. */
+            view_add_rr(m, 0, ptr, 2, 1, ttlptr ? 0xC00C0000u : 300, a4, 4);
+            view_add_rr(m, 0, ptr, 2, 1, 300, a4, 4);
+            uint8_t o[2] = {(uint8_t)(0xc0 | ((base + bad[i].delta) >> 8)), (uint8_t)(base + bad[i].delta)};
+            view_add_rr(m, 0, o, 2, 1, 300, a4, 4);
+            md_packet copy = *m;
+            assert(md_dns_view_parse(m, v, err) && !v->valid && v->count == 0);
+            assert(md_dns_question(m, &parsed, err));
+            assert(md_dns_records(m, NULL, NULL, err));
+            assert(md_dns_normalize_ttl(m, err) && !memcmp(m->data, copy.data, m->len));
+            assert(!md_dns_response_matches(q, m));
+            view_compare(q, m, v);
+        }
+    }
+    /* Pointer into an rdata name start (CNAME target) is fine; into the
+     * middle of a label or into the question's QTYPE is not. */
+    assert(!md_dns_error(q, m, 0)); md_write16(m->data + 2, 0x8180);
+    size_t cname_at = m->len + 12; const uint8_t cname[] = {3,'w','w','w',0xc0,12};
+    view_add_rr(m, 0, ptr, 2, 5, 300, cname, sizeof(cname));
+    md_packet good = *m;
+    uint8_t o[2] = {(uint8_t)(0xc0 | (cname_at >> 8)), (uint8_t)cname_at};
+    view_add_rr(m, 0, o, 2, 1, 300, a4, 4);
+    assert(!md_dns_view_parse(m, v, err) && v->count == 2); view_compare(q, m, v);
+    *m = good; o[1] = (uint8_t)(cname_at + 1); view_add_rr(m, 0, o, 2, 1, 300, a4, 4);
+    assert(md_dns_view_parse(m, v, err)); view_compare(q, m, v);
+    size_t qtype = q->len - 4;
+    *m = good; o[0] = (uint8_t)(0xc0 | (qtype >> 8)); o[1] = (uint8_t)qtype; view_add_rr(m, 0, o, 2, 1, 300, a4, 4);
+    assert(md_dns_view_parse(m, v, err)); view_compare(q, m, v);
+    /* RFC 1035 single-name types (NS MD MF CNAME MB MG MR PTR): a later owner
+     * may point at the RDATA name; the middle of its label is still rejected.
+     * SRV/DNAME names (RFC 2782/6672) and RP (17, opaque per RFC 3597) are
+     * never compression targets. */
+    const uint16_t one_name[] = {2, 3, 4, 5, 7, 8, 9, 12, 39, 33, 17};
+    for (unsigned i = 0; i < sizeof(one_name) / sizeof(one_name[0]); i++) {
+        uint16_t t = one_name[i]; size_t pre = t == 33 ? 6 : 0;
+        uint8_t rd[16] = {0}; size_t rl = pre;
+        const uint8_t nm[] = {2,'m','b',0xc0,12}; memcpy(rd + rl, nm, sizeof(nm)); rl += sizeof(nm);
+        bool target = t != 39 && t != 33 && t != 17;
+        assert(!md_dns_error(q, m, 0)); md_write16(m->data + 2, 0x8180);
+        size_t nat = m->len + 12 + pre;
+        view_add_rr(m, 0, ptr, 2, t, 300, rd, rl);
+        md_packet base = *m;
+        assert(!md_dns_view_parse(m, v, err)); view_compare(q, m, v);
+        uint8_t po[2] = {(uint8_t)(0xc0 | (nat >> 8)), (uint8_t)nat};
+        view_add_rr(m, 0, po, 2, 1, 300, a4, 4);
+        assert(target ? !md_dns_view_parse(m, v, err) && v->count == 2 : md_dns_view_parse(m, v, err) != 0);
+        view_compare(q, m, v);
+        if (target) { char n2[MD_ERROR_SIZE]; assert(!md_dns_records(m, NULL, NULL, n2)); }
+        *m = base; po[1] = (uint8_t)(nat + 1); view_add_rr(m, 0, po, 2, 1, 300, a4, 4);
+        assert(md_dns_view_parse(m, v, err)); view_compare(q, m, v);
+    }
+    /* MINFO (14): both RMAILBX and EMAILBX are targets; label bodies are not. */
+    {
+        const uint8_t mi[] = {1,'r',0xc0,12, 1,'e',0xc0,12};
+        assert(!md_dns_error(q, m, 0)); md_write16(m->data + 2, 0x8180);
+        size_t r0 = m->len + 12, e0 = r0 + 4;
+        view_add_rr(m, 0, ptr, 2, 14, 300, mi, sizeof(mi));
+        md_packet base = *m;
+        size_t offs[] = {r0, e0, r0 + 1, e0 + 1};
+        for (unsigned k = 0; k < 4; k++) {
+            *m = base; uint8_t po[2] = {(uint8_t)(0xc0 | (offs[k] >> 8)), (uint8_t)offs[k]};
+            view_add_rr(m, 0, po, 2, 1, 300, a4, 4);
+            int rc = md_dns_view_parse(m, v, err);
+            assert(k < 2 ? rc == 0 && v->count == 2 : rc != 0); view_compare(q, m, v);
+        }
+        /* Truncated MINFO (one name only) is malformed. */
+        *m = base; m->len = 0; assert(!md_dns_error(q, m, 0)); md_write16(m->data + 2, 0x8180);
+        view_add_rr(m, 0, ptr, 2, 14, 300, mi, 4);
+        assert(md_dns_view_parse(m, v, err)); view_compare(q, m, v);
+    }
+    /* Qname pointing at its own first label (target not before the name). */
+    md_packet self = *q; self.data[12] = 0xc0; self.data[13] = 12;
+    assert(md_dns_question(&self, &parsed, err));
+}
+static void view_tests(void) {
+    md_dns_view *v = malloc(sizeof(*v)); assert(v);
+    md_packet q, r, *m = malloc(sizeof(*m)); char err[MD_ERROR_SIZE]; assert(m);
+    make_query(&q);
+    const uint8_t ptr[] = {0xc0, 12}, root[] = {0}, a4[] = {192,0,2,1};
+    const uint8_t a6[16] = {0x20,0x01,0x0d,0xb8,[15]=9};
+    /* Seeds: A/AAAA/CNAME with compression, authority SOA, OPT, TXT, TSIG. */
+    md_packet seeds[6]; unsigned nseeds = 0;
+    assert(!md_dns_error(&q, &r, 0)); md_write16(r.data + 2, 0x8180);
+    view_add_rr(&r, 0, ptr, 2, 1, 60, a4, 4); seeds[nseeds++] = r;
+    const uint8_t cname[] = {3,'w','w','w',0xc0,12};
+    view_add_rr(&r, 0, ptr, 2, 5, 0x80000000u, cname, sizeof(cname));
+    view_add_rr(&r, 0, ptr, 2, 28, 100000, a6, 16); seeds[nseeds++] = r;
+    uint8_t soa[2 + 2 + 20] = {0xc0,12,0xc0,12}; md_write32(soa + 4 + 16, 30);
+    view_add_rr(&r, 1, ptr, 2, 6, 300, soa, sizeof(soa));
+    uint8_t opt[4] = {0, 8, 0, 0};
+    view_add_rr(&r, 2, root, 1, 41, 0x01008000u, opt, 4); md_write16(r.data + r.len - 4 - 10 + 2, 1232);
+    seeds[nseeds++] = r;
+    const uint8_t txt[] = {3,'a','b','c',0};
+    assert(!md_dns_error(&q, &r, 3)); view_add_rr(&r, 0, ptr, 2, 16, 10, txt, sizeof(txt)); seeds[nseeds++] = r;
+    assert(!md_dns_error(&q, &r, 0)); view_add_rr(&r, 0, ptr, 2, 1, 99999, a4, 4);
+    view_add_rr(&r, 2, ptr, 2, 250, 0, a4, 4); seeds[nseeds++] = r;
+    for (unsigned s = 0; s < nseeds; s++) view_compare(&q, &seeds[s], v);
+    /* TSIG: TTL policy change is refused on both paths, packet unchanged. */
+    *m = seeds[4]; assert(!md_dns_view_parse(m, v, err) && v->signed_);
+    assert(md_dns_normalize_ttl_view(m, v, err) && !memcmp(m->data, seeds[4].data, m->len));
+    /* Random mutation differential (byte flips, truncation, extension, counts). */
+    for (unsigned i = 0; i < 300000; i++) {
+        *m = seeds[view_rand() % nseeds];
+        unsigned flips = 1 + view_rand() % 4;
+        for (unsigned f = 0; f < flips; f++) {
+            unsigned kind = view_rand() % 8;
+            if (kind < 5 && m->len) m->data[view_rand() % m->len] = (uint8_t)view_rand();
+            else if (kind == 5 && m->len > 12) m->len -= 1 + view_rand() % 4;
+            else if (kind == 6) { for (unsigned k = view_rand() % 6; k; k--) m->data[m->len++] = (uint8_t)view_rand(); }
+            else md_write16(m->data + 6 + 2 * (view_rand() % 3), (uint16_t)(view_rand() % 5));
+        }
+        view_compare(&q, m, v);
+    }
+    /* Pointer chains: backward pointer-only chain of 255 hops is accepted,
+     * 256 hops rejected. Every hop must land on an earlier name start, so the
+     * chain is built from owner names: RR k's owner points at RR k-1's owner. */
+    for (unsigned hops = 254; hops <= 256; hops++) {
+        assert(!md_dns_error(&q, m, 0)); md_write16(m->data + 2, 0x8180);
+        size_t prev = 12;
+        for (unsigned h = 1; h < hops; h++) {
+            size_t here = m->len;
+            uint8_t o[2] = {(uint8_t)(0xc0 | (prev >> 8)), (uint8_t)prev};
+            view_add_rr(m, 0, o, 2, 99, 1, NULL, 0); prev = here;
+        }
+        uint8_t owner[2] = {(uint8_t)(0xc0 | (prev >> 8)), (uint8_t)prev};
+        view_add_rr(m, 0, owner, 2, 1, 1, a4, 4);
+        int rc = md_dns_view_parse(m, v, err);
+        assert(hops <= 255 ? rc == 0 : rc != 0);
+        view_compare(&q, m, v);
+    }
+    ptr_target_tests(&q, m, v);
+    /* Stale views (length changed) are refused by every view consumer. */
+    *m = seeds[2]; assert(!md_dns_view_parse(m, v, err)); m->len--;
+    assert(md_dns_view_each(m, v, NULL, NULL, err) && md_dns_normalize_ttl_view(m, v, err));
+    assert(!md_dns_view_matches(&q, &(md_question){0}, m, v));
+    /* Large answers up to the theoretical maximum RR count of a 64 KiB packet. */
+    unsigned sizes[] = {256, 1000, 4000};
+    for (unsigned s = 0; s < 3; s++) {
+        assert(!md_dns_error(&q, m, 0)); md_write16(m->data + 2, 0x8180);
+        for (unsigned i = 0; i < sizes[s]; i++) view_add_rr(m, 0, ptr, 2, 1, 60, a4, 4);
+        assert(!md_dns_view_parse(m, v, err) && v->count == sizes[s] && v->addresses == sizes[s]);
+        assert(md_dns_response_matches(&q, m));
+    }
+    memset(m, 0, sizeof(*m)); md_write16(m->data + 2, 0x8180); md_write16(m->data + 4, 1);
+    m->len = 12; m->data[m->len++] = 0; md_write16(m->data + m->len, 1); md_write16(m->data + m->len + 2, 1); m->len += 4;
+    unsigned most = 0;
+    while (m->len + 11 <= MD_MAX_PACKET) { view_add_rr(m, 1, root, 1, 99, 1, NULL, 0); most++; }
+    assert(most == 5956 && most <= MD_DNS_VIEW_MAX_RR);
+    assert(!md_dns_view_parse(m, v, err) && v->count == most);
+    free(m); free(v);
+}
+
 int main(void) {
-    dns_tests(); address_tests(); upstream_tests(); retry_tests(); udp_reuse_tests();
+    dns_tests(); view_tests(); address_tests(); upstream_tests(); retry_tests(); udp_reuse_tests();
     puts("dns/upstream tests passed"); return 0;
 }
 

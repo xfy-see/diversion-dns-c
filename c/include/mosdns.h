@@ -49,6 +49,36 @@ int md_dns_error(const md_packet *q, md_packet *r, unsigned rcode);
 int md_dns_strip_opt(md_packet *p);
 void md_dns_limit_udp(const md_packet *q, md_packet *r);
 
+/* 一次解析的响应索引：md_dns_view_parse 做与 md_dns_question+md_dns_records
+ * 完全相同的整包校验，同时记录每条 RR 的偏移（报文 <=65535 字节，16 位足够）。
+ * 之后的 view 接口只遍历数组，不再解析报文。TTL 每次从报文现读，所以原地
+ * 改写 TTL / 事务 ID 后 view 仍有效；改变长度后必须重新 parse（len 校验拒绝）。
+ * 最小 RR 为 11 字节，65535 字节报文最多 5956 条，上限覆盖全部合法报文。 */
+#define MD_DNS_VIEW_MAX_RR 5957u
+typedef struct {
+    uint16_t owner_offset, ttl_offset, data_offset, type, class_, data_len;
+    uint8_t section;
+} md_dns_view_rr;
+typedef struct {
+    size_t len; md_question q;          /* q 与 md_dns_question 的输出一致 */
+    size_t opt_start, opt_end; uint32_t opt_ttl;
+    bool valid, has_opt, signed_;       /* signed_: TSIG 或 additional 中的 SIG(0) */
+    unsigned count, addresses;          /* addresses: Answer 中 IN A/AAAA 数量 */
+    md_dns_view_rr rr[MD_DNS_VIEW_MAX_RR];
+} md_dns_view;
+int md_dns_view_parse(const md_packet *p, md_dns_view *v, char *err);
+int md_dns_view_each(const md_packet *p, const md_dns_view *v, md_rr_fn fn, void *arg, char *err);
+void md_dns_view_copy(md_dns_view *dst, const md_dns_view *src);
+bool md_dns_view_matches(const md_packet *q, const md_question *qq, const md_packet *r, const md_dns_view *rv);
+unsigned md_dns_view_rcode(const md_packet *p, const md_dns_view *v);
+int md_dns_normalize_ttl_view(md_packet *p, md_dns_view *v, char *err);
+/* 当前线程的堆上 scratch view（线程退出释放）；分配失败返回 NULL。 */
+md_dns_view *md_dns_view_scratch(void);
+#ifdef MD_DNS_COUNT_PASSES
+/* 测试构建计数（见 dns.c）：请求/响应的问题段解析、整包 RR 遍历、view 构建、name()。 */
+extern _Atomic unsigned long md_dns_passes[6];
+#endif
+
 /* 规则在加载期构建，查询期只读；重复规则可去重。加载失败前已加入的规则
  * 仍保留在对象中，调用方应按需销毁，不能把失败视作事务回滚。 */
 typedef struct md_domain md_domain;
@@ -67,7 +97,13 @@ typedef struct md_cache md_cache;
 md_cache *md_cache_new(size_t capacity, uint32_t lazy_ttl);
 /* 0 miss, 1 fresh, 2 stale. now is monotonic seconds. */
 int md_cache_get(md_cache *c, const md_packet *q, md_packet *r, uint64_t now);
+/* 同 md_cache_get；命中时 r 已改写 TTL/ID 并完成一次整包校验，rv 为其 view。
+ * 校验失败按未命中处理（r->len=0）。rv 为 NULL 时只探测命中状态（r->len=0，
+ * 不交付响应），供事件循环为 CN 命中选 lane，避免 worker 处再解析一遍。 */
+int md_cache_get_view(md_cache *c, const md_packet *q, md_packet *r, md_dns_view *rv, uint64_t now);
 void md_cache_put(md_cache *c, const md_packet *q, const md_packet *r, uint64_t now);
+/* 同 md_cache_put，但复用调用方已为 r 构建的 view，不再解析响应。 */
+void md_cache_put_view(md_cache *c, const md_packet *q, const md_packet *r, const md_dns_view *rv, uint64_t now);
 /* begin 成功表示获得该 key 的刷新标记，必须由 end 配对释放；
  * false 还可能表示容量不足或 key 不支持缓存，不能只理解为重复刷新。 */
 bool md_cache_refresh_begin(md_cache *c, const md_packet *q);
@@ -88,6 +124,9 @@ int md_upstream_init(md_upstream *u, const char *addr, const char *dial_addr,
  * 各竞争者共享五秒截止时间。 */
 int md_forward(const md_upstream *us, size_t count, unsigned concurrent,
                const md_packet *q, md_packet *r, char *err);
+/* 同 md_forward；rv 非空时在返回且 r->len>0 时填入 r 的 view（接收时的唯一一次解析）。 */
+int md_forward_view(const md_upstream *us, size_t count, unsigned concurrent,
+                    const md_packet *q, md_packet *r, md_dns_view *rv, char *err);
 /* Server workers opt in once and clean up after their final synchronous query.
  * Unscoped/library calls keep fresh sockets. Allocation failure also stays fresh. */
 void md_forward_worker_enable(void);
@@ -116,6 +155,8 @@ typedef struct md_nft md_nft;
 md_nft *md_nft_new(const char *args, char *err);
 int md_nft_enable_fast(md_nft *n, char *err);
 int md_nft_apply(md_nft *n, const md_packet *r, char *err);
+/* 同 md_nft_apply，复用 r 的 view；view 已完成整包校验，收集阶段不再解析。 */
+int md_nft_apply_view(md_nft *n, const md_packet *r, const md_dns_view *rv, char *err);
 /* 只读检查兼容路径的目标集合，interval set 缺少 auto-merge 时向 stderr 告警；
  * 读取失败时静默，不改变内核状态，也不影响返回结果。 */
 void md_nft_audit(const md_nft *n);

@@ -455,13 +455,17 @@ done:
     return rc;
 }
 /* 返回 0 成功、-1 失败；NFT_INTERVAL 表示目标是 interval set，尚未写入任何内容。 */
-static int add_plain_target(const nft_target *t, const md_packet *r, uint64_t until, char *err) {
+/* v 非空时它已对 r 完成整包校验，只遍历描述符；NULL 时走旧的校验+回调两遍。 */
+static int nft_records(const md_packet *r, const md_dns_view *v, md_rr_fn fn, void *arg, char *err) {
+    return v ? md_dns_view_each(r, v, fn, arg, err) : md_dns_records(r, fn, arg, err);
+}
+static int add_plain_target(const nft_target *t, const md_packet *r, const md_dns_view *view, uint64_t until, char *err) {
     /* No fallback after send. Interval targets return before any batch is sent. */
     int rc = -1; uint8_t (*keys)[16] = calloc(MD_NL_MAX_KEYS, sizeof(*keys));
     uint8_t *wire = malloc(MD_NL_BUFFER_SIZE), *receive = malloc(MD_NL_BUFFER_SIZE);
     if (!keys || !wire || !receive) { snprintf(err, MD_ERROR_SIZE, "allocate bounded nft netlink transaction"); goto done; }
     nft_keys values = {t, keys, 0, until};
-    if (md_dns_records(r, collect_plain_key, &values, err)) goto done;
+    if (nft_records(r, view, collect_plain_key, &values, err)) goto done;
     if (!values.count) { snprintf(err, MD_ERROR_SIZE, "nft plain address collection failed"); goto done; }
     for (unsigned attempt = 0; ; attempt++) {
         rc = add_plain_attempt(t, &values, wire, receive, until, err);
@@ -514,7 +518,7 @@ static long overlap_element(const char *output, const size_t *column, size_t cou
  * 逐个剔除 nft 报告的冲突元素后重试（每次 1 次 exec，最多 NFT_OVERLAP_SKIPS 个），
  * 其余元素照常写入，DNS 回答正常返回；被跳过的前缀已与集合中现有区间重叠。 */
 #define NFT_OVERLAP_SKIPS 16u
-static int add_interval_target(const char *binary, const nft_target *t, const md_packet *r, uint64_t until, char *err) {
+static int add_interval_target(const char *binary, const nft_target *t, const md_packet *r, const md_dns_view *view, uint64_t until, char *err) {
     if (!binary) binary = nft_binary();
     if (!binary) { snprintf(err, MD_ERROR_SIZE, "nftset requires nft in /usr/sbin, /sbin, /usr/bin or /bin"); return -1; }
     int rc = -1; FILE *file = NULL;
@@ -522,7 +526,7 @@ static int add_interval_target(const char *binary, const nft_target *t, const md
     size_t *column = calloc(MD_NL_MAX_KEYS, sizeof(*column));
     char *output = malloc(NFT_OUTPUT_SIZE), *argv[] = {(char *)binary, "-f", "-", NULL};
     if (!v.text || !column || !output) { snprintf(err, MD_ERROR_SIZE, "allocate nft interval input"); goto done; }
-    if (md_dns_records(r, collect_prefix, &v, err)) goto done;
+    if (nft_records(r, view, collect_prefix, &v, err)) goto done;
     for (unsigned skipped = 0; v.count; ) {
         file = tmpfile();
         if (!file) { snprintf(err, MD_ERROR_SIZE, "create nft input: %s", strerror(errno)); goto done; }
@@ -552,14 +556,17 @@ done:
 }
 /* 先确认响应中有目标地址，再访问 nft 元数据。元数据只走 netlink GETSET：
  * 普通 set 直接用 netlink 批次写入（0 次 exec），interval set 用一次 nft -f -。 */
-static int add_target(const char *binary, const nft_target *t, const md_packet *r, uint64_t until, char *err) {
+static int add_target_view(const char *binary, const nft_target *t, const md_packet *r, const md_dns_view *view, uint64_t until, char *err) {
     if (!t->enabled) return 0;
     /* Collect before reading metadata: no A/AAAA answers means no nft access. */
     nft_prefixes count = {t, NULL, 0};
-    if (md_dns_records(r, count_address, &count, err)) return -1;
+    if (nft_records(r, view, count_address, &count, err)) return -1;
     if (!count.count) return 0;
-    int rc = add_plain_target(t, r, until, err);
-    return rc == NFT_INTERVAL ? add_interval_target(binary, t, r, until, err) : rc;
+    int rc = add_plain_target(t, r, view, until, err);
+    return rc == NFT_INTERVAL ? add_interval_target(binary, t, r, view, until, err) : rc;
+}
+static int __attribute__((unused)) add_target(const char *binary, const nft_target *t, const md_packet *r, uint64_t until, char *err) {
+    return add_target_view(binary, t, r, NULL, until, err);
 }
 #endif
 
@@ -620,21 +627,31 @@ void md_nft_audit(const md_nft *n) {
 /* IPv4 后 IPv6 共用排队与 I/O 的 5 秒预算；第一个失败立即返回。
  * 两种地址目标之间没有统一事务，IPv6 失败不会回滚已完成的 IPv4 写入。
  * 无论哪条路径出错，取得的串行令牌都由 leave 释放。 */
-int md_nft_apply(md_nft *n, const md_packet *r, char *err) {
-    if (!n || !r) { snprintf(err, MD_ERROR_SIZE, "invalid nftset input"); return -1; }
+int md_nft_apply_view(md_nft *n, const md_packet *r, const md_dns_view *view, char *err) {
+    if (!n || !r || !view) { snprintf(err, MD_ERROR_SIZE, "invalid nftset input"); return -1; }
 #ifndef __linux__
     snprintf(err, MD_ERROR_SIZE, "nftset execution is supported only on Linux"); return -1;
 #else
-    if (n->fast_enabled) return nft_fast_apply(n, r, err);
+    /* 任何 nft 访问之前确认 view 与 r 对应；view 本身来自整包校验。 */
+    if (md_dns_view_each(r, view, NULL, NULL, err)) return -1;
+    if (n->fast_enabled) return nft_fast_apply(n, r, view, err);
     uint64_t until = milliseconds() + 5000;
     if (nft_worker_enter(n, until, err)) return -1;
     /* nft 程序只在 interval set 需要时才查找（NULL 表示按固定路径查找）。 */
-    int rc = add_target(NULL, &n->v4, r, until, err);
-    if (!rc) rc = add_target(NULL, &n->v6, r, until, err);
+    int rc = add_target_view(NULL, &n->v4, r, view, until, err);
+    if (!rc) rc = add_target_view(NULL, &n->v6, r, view, until, err);
     char release_error[MD_ERROR_SIZE] = {0};
     if (nft_worker_leave(n, release_error) && !rc) { snprintf(err, MD_ERROR_SIZE, "%s", release_error); rc = -1; }
     return rc;
 #endif
+}
+/* 兼容入口：先在堆上完整校验一次（失败时零副作用），再走 view 路径。 */
+int md_nft_apply(md_nft *n, const md_packet *r, char *err) {
+    if (!n || !r) { snprintf(err, MD_ERROR_SIZE, "invalid nftset input"); return -1; }
+    md_dns_view *view = malloc(sizeof(*view));
+    if (!view) { snprintf(err, MD_ERROR_SIZE, "allocate DNS view"); return -1; }
+    int rc = md_dns_view_parse(r, view, err) ? -1 : md_nft_apply_view(n, r, view, err);
+    free(view); return rc;
 }
 /* 销毁前调用方须停止并等待所有使用者，包含排队线程；此处不取消任务。 */
 void md_nft_free(md_nft *n) {

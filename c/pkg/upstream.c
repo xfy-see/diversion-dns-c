@@ -158,6 +158,7 @@ typedef struct {
      * keep an independent allocation so they cannot overwrite live replies. */
     exchange exchanges[3];
     md_packet query; /* The upstream copy of the query (random ID, M4). */
+    md_dns_view view; /* 接收时唯一一次整包解析的结果，供匹配/RCODE/调用方复用。 */
     bool exchanges_in_use;
     /* M4 default: one fresh, never-used UDP socket per upstream (spare_uses==0).
      * Opt-in udp_sport_reuse may park a quiet used socket back with spare_uses>0
@@ -502,10 +503,9 @@ static int send_flags(void) {
     return 0;
 #endif
 }
-static int extended_rcode(const md_packet *p, const md_rr *rr, void *value) {
-    (void)p;
-    if (rr->type == 41) *(unsigned *)value |= (rr->ttl >> 24) << 4;
-    return 0;
+/* 整包校验与身份匹配一次完成；view 随后直接给出 extended RCODE 并交给调用方。 */
+static bool response_matches(const md_packet *q, const md_question *qq, const md_packet *r, md_dns_view *view) {
+    return !md_dns_view_parse(r, view, NULL) && md_dns_view_matches(q, qq, r, view);
 }
 static int resend_udp(exchange *x, const md_packet *q, char *err) {
     /* Retain the connected socket, ID, mark, and device for every retry. */
@@ -522,7 +522,9 @@ static int resend_udp(exchange *x, const md_packet *q, char *err) {
 /* 复用连接若在尚未发送任何字节时失效，可重建一次新连接；
  * 已部分发送的 TCP 查询不走这条重试路径。dirty 标记收到过异常内容，
  * 此后仍可等待有效响应，但完成后不能把连接放回池中。 */
-static int advance(exchange *x, short events, const md_packet *q, char *err) {
+/* qq 是 q 已校验的问题段；view 为 scratch，返回 1 时描述 x->packet。 */
+static int advance(exchange *x, short events, const md_packet *q, const md_question *qq,
+                   md_dns_view *view, char *err) {
     if (x->reused && x->state == SENDING && !x->done &&
         !(events & POLLOUT) && (events & (POLLERR | POLLNVAL | POLLHUP)))
         return begin_connection(x, x->upstream, x->tcp, false, err);
@@ -568,7 +570,7 @@ static int advance(exchange *x, short events, const md_packet *q, char *err) {
         if (n < 0) { if (again()) return 0; syserr(err, "receive upstream UDP"); stop(x); return -1; }
         if (msg.msg_flags & MSG_TRUNC) { x->dirty = true; return 0; }
         x->packet.len = (size_t)n;
-        if (!md_dns_response_matches(q, &x->packet)) { x->dirty = true; return 0; }
+        if (!response_matches(q, qq, &x->packet, view)) { x->dirty = true; return 0; }
         /* 只有匹配当前问题的 TC 响应触发 TCP 回退，沿用目标和 socket 路由约束。 */
         if (md_read16(x->packet.data + 2) & 0x0200u) {
             const md_upstream *u = x->upstream;
@@ -597,7 +599,7 @@ static int advance(exchange *x, short events, const md_packet *q, char *err) {
                 if (!x->packet.len) x->dirty = true;
             } else {
                 x->state = TCP_LENGTH;
-                if (md_dns_response_matches(q, &x->packet)) return 1;
+                if (response_matches(q, qq, &x->packet, view)) return 1;
                 x->dirty = true;
             }
         }
@@ -614,7 +616,12 @@ static int advance(exchange *x, short events, const md_packet *q, char *err) {
  * 首个 NOERROR/NXDOMAIN 胜出；其他 RCODE 暂存，等待竞争者成功或全部结束。 */
 int md_forward(const md_upstream *us, size_t count, unsigned concurrent,
                const md_packet *q, md_packet *r, char *err) {
+    return md_forward_view(us, count, concurrent, q, r, NULL, err);
+}
+int md_forward_view(const md_upstream *us, size_t count, unsigned concurrent,
+                    const md_packet *q, md_packet *r, md_dns_view *rv, char *err) {
     md_question parsed;
+    if (rv) { rv->valid = false; rv->count = 0; }
     if (!us || !count || !q || !r || md_dns_question(q, &parsed, err) || (parsed.flags & 0x8000u))
         return fail(err, "invalid forward query or empty upstream list");
     if (!concurrent) concurrent = 1;
@@ -624,8 +631,9 @@ int md_forward(const md_upstream *us, size_t count, unsigned concurrent,
     bool scoped = worker_tcp && !worker_tcp->exchanges_in_use;
     exchange *xs = scoped ? worker_tcp->exchanges : malloc(concurrent * sizeof(*xs));
     md_packet *uq = scoped ? &worker_tcp->query : malloc(sizeof(*uq));
-    if (!xs || !uq) {
-        if (!scoped) { free(xs); free(uq); }
+    md_dns_view *view = scoped ? &worker_tcp->view : malloc(sizeof(*view));
+    if (!xs || !uq || !view) {
+        if (!scoped) { free(xs); free(uq); free(view); }
         return fail(err, "out of memory for upstream exchanges");
     }
     if (scoped) worker_tcp->exchanges_in_use = true;
@@ -649,7 +657,7 @@ int md_forward(const md_upstream *us, size_t count, unsigned concurrent,
         begin(&xs[i], &us[(first + i) % count], us[(first + i) % count].tcp, last_error);
         /* A connected nonblocking socket can try sending immediately. A TCP
          * connect still waits for poll/SO_ERROR; EAGAIN keeps SENDING pending. */
-        if (xs[i].state == SENDING) advance(&xs[i], POLLOUT, uq, last_error);
+        if (xs[i].state == SENDING) advance(&xs[i], POLLOUT, uq, &parsed, view, last_error);
     }
     bool have_error_response = false;
     int result = -1;
@@ -674,11 +682,12 @@ int md_forward(const md_upstream *us, size_t count, unsigned concurrent,
         if (!n) continue; /* A one-second resend timer does not end the exchange. */
         for (unsigned i = 0; i < concurrent; i++) {
             if (!fds[i].revents || xs[i].state == DEAD) continue;
-            int status = advance(&xs[i], fds[i].revents, uq, last_error);
+            int status = advance(&xs[i], fds[i].revents, uq, &parsed, view, last_error);
             if (status == 1) {
-                unsigned rcode = md_read16(xs[i].packet.data + 2) & 15;
-                md_dns_records(&xs[i].packet, extended_rcode, &rcode, NULL);
+                unsigned rcode = md_dns_view_rcode(&xs[i].packet, view);
                 memcpy(r->data, xs[i].packet.data, xs[i].packet.len); r->len = xs[i].packet.len;
+                /* 只复制已用的 RR 描述符；错误响应暂存期间 scratch 会被后续包覆盖。 */
+                if (rv) md_dns_view_copy(rv, view);
                 md_write16(r->data, client_id);
                 if (rcode == 0 || rcode == 3) {
                     keep_response(&xs[i], fds[i].revents); result = 0; goto finished;
@@ -703,6 +712,6 @@ finished:
     /* 胜出且符合条件的连接已交回池；这里关闭所有其他仍在竞争的连接。 */
     for (unsigned i = 0; i < concurrent; i++) stop(&xs[i]);
     if (scoped) worker_tcp->exchanges_in_use = false;
-    else { free(xs); free(uq); }
+    else { free(xs); free(uq); free(view); }
     return result;
 }

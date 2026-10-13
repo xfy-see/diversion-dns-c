@@ -237,16 +237,18 @@ int main(int argc, char **argv) {
     record(&response, v6 ? 28 : 1, 1, unwanted); /* Authority must not learn. */
     record(&response, v6 ? 28 : 1, 1, unwanted); /* Additional must not learn. */
     int rc;
+    /* The production path hands nft the single parsed view of the response. */
+    md_dns_view *view = malloc(sizeof(*view)); assert(view && !md_dns_view_parse(&response, view, error));
     if(v6)setenv("FAST_V6","1",1);
     if(plain_mode()){
         /* H4: start just below the 32-bit sequence boundary, then force the
          * 64-bit block counter to wrap; every write must keep succeeding. */
         bool wrap=!strcmp(fake_mode(),"plain-sequence-wrap");
         if(wrap) atomic_store(&nft_sequence,(uint64_t)NFT_SEQ_BLOCKS-2);
-        rc=add_plain_target(v6?&n->v6:&n->v4,&response,milliseconds()+5000,error);
+        rc=add_plain_target(v6?&n->v6:&n->v4,&response,view,milliseconds()+5000,error);
         for(unsigned i=0;wrap&&!rc&&i<4;i++){
             if(i==2) atomic_store(&nft_sequence,UINT64_MAX);
-            rc=add_plain_target(v6?&n->v6:&n->v4,&response,milliseconds()+5000,error);
+            rc=add_plain_target(v6?&n->v6:&n->v4,&response,view,milliseconds()+5000,error);
         }
         if(wrap&&!rc) assert(seq_high&&seq_wrapped);
     }else if(fast_mode()){
@@ -259,12 +261,15 @@ int main(int argc, char **argv) {
         else if (!rc && !strcmp(fake_mode(), "fast-cohort-poison")) {
             md_packet *bad = malloc(sizeof(*bad)); assert(bad); *bad = response;
             bad->data[19 + 12 + (v6 ? 16 : 4) - 1] = 255;
-            nft_fast_waiter a = {.packet=&response, .until=milliseconds()+5000};
-            nft_fast_waiter b = {.packet=bad, .until=a.until};
+            /* bad stays a well-formed DNS answer; only the kernel rejects its key. */
+            md_dns_view *bad_view = malloc(sizeof(*bad_view));
+            assert(bad_view && !md_dns_view_parse(&response, view, error) && !md_dns_view_parse(bad, bad_view, error));
+            nft_fast_waiter a = {.packet=&response, .view=view, .until=milliseconds()+5000};
+            nft_fast_waiter b = {.packet=bad, .view=bad_view, .until=a.until};
             nft_fast_waiter *group[] = {&a, &b};
             nft_fast_process(n, group, 2, a.until);
             assert(a.rc == 0 && b.rc == -1 && b.error[0]);
-            free(bad);
+            free(bad); free(bad_view);
         }
         else if (!rc) {
             rc = md_nft_apply(n, &response, error);
@@ -277,7 +282,7 @@ int main(int argc, char **argv) {
             if (!rc && !strcmp(fake_mode(), "fast-large-answer")) assert(key_count == 256);
         }
     }else rc = add_target(argv[1], v6 ? &n->v6 : &n->v4, &response, milliseconds() + 5000, error);
-    md_nft_free(n);
+    md_nft_free(n); free(view);
     printf("{\"opens\":%u,\"closes\":%u,\"sends\":%u,\"generations\":%u,\"batches\":%u,\"keys\":%u,\"rc\":%d}\n",opens,closes,sends,generations,batches,key_count,rc);
     if (rc) { fprintf(stderr, "%s\n", error); return 4; }
     puts("nft CLI transaction completed"); return 0;
