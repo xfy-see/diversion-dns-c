@@ -572,6 +572,48 @@ static void ptr_target_tests(const md_packet *q, md_packet *m, md_dns_view *v) {
     size_t qtype = q->len - 4;
     *m = good; o[0] = (uint8_t)(0xc0 | (qtype >> 8)); o[1] = (uint8_t)qtype; view_add_rr(m, 0, o, 2, 1, 300, a4, 4);
     assert(md_dns_view_parse(m, v, err)); view_compare(q, m, v);
+    /* RFC 1035 single-name types (NS MD MF CNAME MB MG MR PTR): a later owner
+     * may point at the RDATA name; the middle of its label is still rejected.
+     * SRV/DNAME names (RFC 2782/6672) and RP (17, opaque per RFC 3597) are
+     * never compression targets. */
+    const uint16_t one_name[] = {2, 3, 4, 5, 7, 8, 9, 12, 39, 33, 17};
+    for (unsigned i = 0; i < sizeof(one_name) / sizeof(one_name[0]); i++) {
+        uint16_t t = one_name[i]; size_t pre = t == 33 ? 6 : 0;
+        uint8_t rd[16] = {0}; size_t rl = pre;
+        const uint8_t nm[] = {2,'m','b',0xc0,12}; memcpy(rd + rl, nm, sizeof(nm)); rl += sizeof(nm);
+        bool target = t != 39 && t != 33 && t != 17;
+        assert(!md_dns_error(q, m, 0)); md_write16(m->data + 2, 0x8180);
+        size_t nat = m->len + 12 + pre;
+        view_add_rr(m, 0, ptr, 2, t, 300, rd, rl);
+        md_packet base = *m;
+        assert(!md_dns_view_parse(m, v, err)); view_compare(q, m, v);
+        uint8_t po[2] = {(uint8_t)(0xc0 | (nat >> 8)), (uint8_t)nat};
+        view_add_rr(m, 0, po, 2, 1, 300, a4, 4);
+        assert(target ? !md_dns_view_parse(m, v, err) && v->count == 2 : md_dns_view_parse(m, v, err) != 0);
+        view_compare(q, m, v);
+        if (target) { char n2[MD_ERROR_SIZE]; assert(!md_dns_records(m, NULL, NULL, n2)); }
+        *m = base; po[1] = (uint8_t)(nat + 1); view_add_rr(m, 0, po, 2, 1, 300, a4, 4);
+        assert(md_dns_view_parse(m, v, err)); view_compare(q, m, v);
+    }
+    /* MINFO (14): both RMAILBX and EMAILBX are targets; label bodies are not. */
+    {
+        const uint8_t mi[] = {1,'r',0xc0,12, 1,'e',0xc0,12};
+        assert(!md_dns_error(q, m, 0)); md_write16(m->data + 2, 0x8180);
+        size_t r0 = m->len + 12, e0 = r0 + 4;
+        view_add_rr(m, 0, ptr, 2, 14, 300, mi, sizeof(mi));
+        md_packet base = *m;
+        size_t offs[] = {r0, e0, r0 + 1, e0 + 1};
+        for (unsigned k = 0; k < 4; k++) {
+            *m = base; uint8_t po[2] = {(uint8_t)(0xc0 | (offs[k] >> 8)), (uint8_t)offs[k]};
+            view_add_rr(m, 0, po, 2, 1, 300, a4, 4);
+            int rc = md_dns_view_parse(m, v, err);
+            assert(k < 2 ? rc == 0 && v->count == 2 : rc != 0); view_compare(q, m, v);
+        }
+        /* Truncated MINFO (one name only) is malformed. */
+        *m = base; m->len = 0; assert(!md_dns_error(q, m, 0)); md_write16(m->data + 2, 0x8180);
+        view_add_rr(m, 0, ptr, 2, 14, 300, mi, 4);
+        assert(md_dns_view_parse(m, v, err)); view_compare(q, m, v);
+    }
     /* Qname pointing at its own first label (target not before the name). */
     md_packet self = *q; self.data[12] = 0xc0; self.data[13] = 12;
     assert(md_dns_question(&self, &parsed, err));

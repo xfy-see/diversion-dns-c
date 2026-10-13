@@ -57,7 +57,8 @@ static int fail(char *err, const char *s) {
  * 压缩指针只能指向已标记的偏移，并且首跳必须落在当前名称起点之前。于是指向
  * 问题段 QTYPE/QCLASS、任何 RR 的 TYPE/CLASS/TTL/RDLENGTH、不透明 RDATA
  * （A/AAAA/TXT/OPT/未知类型、MX/SRV/SOA 的定长字段）或标签内部的指针全部
- * 被拒绝，整包按格式错误处理。之前若允许指入 TTL，TTL 规范化会改写被引用的
+ * 被拒绝，整包按格式错误处理。可作目标的 RDATA 名称仅限 RFC 3597 §4 列出的
+ * RFC 1035 类型（见 rdata()）。之前若允许指入 TTL，TTL 规范化会改写被引用的
  * 字节，使名称在缓存/nft 处理时变成另一个（例如根名 "."）。 */
 typedef struct { uint8_t bits[(MD_MAX_PACKET + 7) / 8]; } name_marks;
 static void marks_reset(name_marks *m, const md_packet *p) {
@@ -66,7 +67,7 @@ static void marks_reset(name_marks *m, const md_packet *p) {
 }
 #define MARK(m, o) ((m)->bits[(o) >> 3] |= (uint8_t)(1u << ((o) & 7)))
 #define MARKED(m, o) (((m)->bits[(o) >> 3] >> ((o) & 7)) & 1u)
-static int name(const md_packet *p, name_marks *m, size_t start, size_t *end, char *out, char *err) {
+static int name(const md_packet *p, name_marks *m, bool mark, size_t start, size_t *end, char *out, char *err) {
     size_t at = start, wire = 1, used = 0;
     unsigned hops = 0;
     bool jumped = false;
@@ -74,7 +75,7 @@ static int name(const md_packet *p, name_marks *m, size_t start, size_t *end, ch
     for (;;) {
         if (at >= p->len) return fail(err, "DNS name exceeds packet");
         unsigned n = p->data[at];
-        if (!jumped) MARK(m, at);
+        if (!jumped && mark) MARK(m, at);
         if ((n & 0xc0) == 0xc0) {
             if (at + 2 > p->len) return fail(err, "short DNS compression pointer");
             size_t target = ((size_t)(n & 0x3f) << 8) | p->data[at + 1];
@@ -116,7 +117,7 @@ static int question(const md_packet *p, name_marks *m, md_question *q, char *err
     memset(q, 0, sizeof(*q));
     q->flags = md_read16(p->data + 2);
     if (q->flags & 0x7800) return fail(err, "unsupported DNS opcode");
-    if (name(p, m, 12, &q->end, q->name, err)) return -1;
+    if (name(p, m, true, 12, &q->end, q->name, err)) return -1;
     if (q->end + 4 > p->len) return fail(err, "short DNS question");
     q->type = md_read16(p->data + q->end);
     q->class_ = md_read16(p->data + q->end + 2);
@@ -126,8 +127,8 @@ static int question(const md_packet *p, name_marks *m, md_question *q, char *err
 }
 
 /* 压缩名称可以引用记录外的旧字节，但此处名称的原始编码必须完整位于 RDATA 内。 */
-static int rdata_name(const md_packet *p, name_marks *m, size_t at, size_t limit, size_t *end, char *err) {
-    if (at >= limit || name(p, m, at, end, NULL, err)) return -1;
+static int rdata_name(const md_packet *p, name_marks *m, bool mark, size_t at, size_t limit, size_t *end, char *err) {
+    if (at >= limit || name(p, m, mark, at, end, NULL, err)) return -1;
     if (*end > limit) return fail(err, "DNS RDATA name exceeds record");
     return 0;
 }
@@ -138,21 +139,37 @@ static int rdata(const md_packet *p, name_marks *m, const md_rr *rr, char *err) 
     switch (rr->type) {
     case 1: if (rr->data_len != 4) return fail(err, "invalid DNS A length"); break;
     case 28: if (rr->data_len != 16) return fail(err, "invalid DNS AAAA length"); break;
-    case 2: case 5: case 12: case 39:
-        if (rdata_name(p, m, at, end, &next, err) || next != end)
+    /* RFC 3597 §4: only the RFC 1035 types NS MD MF CNAME SOA MB MG MR PTR
+     * MINFO MX may carry compressed names. Their RDATA names are validated and
+     * marked as legal compression targets. SRV (RFC 2782: target "MUST NOT"
+     * be compressed) and DNAME (RFC 6672) names are validated and, for
+     * interoperability, may still contain pointers, but are NOT marked as
+     * targets: an RFC 3597 compressor never points into them. RP, AFSDB, NAPTR
+     * and other later types stay opaque (no parse, never targets). */
+    case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12:
+        if (rdata_name(p, m, true, at, end, &next, err) || next != end)
+            return fail(err, "invalid DNS name record");
+        break;
+    case 39:
+        if (rdata_name(p, m, false, at, end, &next, err) || next != end)
             return fail(err, "invalid DNS name record");
         break;
     case 15:
-        if (rr->data_len < 3 || rdata_name(p, m, at + 2, end, &next, err) || next != end)
+        if (rr->data_len < 3 || rdata_name(p, m, true, at + 2, end, &next, err) || next != end)
             return fail(err, "invalid DNS MX record");
         break;
+    case 14: /* MINFO: RMAILBX, EMAILBX. */
+        if (rdata_name(p, m, true, at, end, &next, err) ||
+            rdata_name(p, m, true, next, end, &next, err) || next != end)
+            return fail(err, "invalid DNS MINFO record");
+        break;
     case 6:
-        if (rdata_name(p, m, at, end, &next, err) ||
-            rdata_name(p, m, next, end, &next, err) || next + 20 != end)
+        if (rdata_name(p, m, true, at, end, &next, err) ||
+            rdata_name(p, m, true, next, end, &next, err) || next + 20 != end)
             return fail(err, "invalid DNS SOA record");
         break;
     case 33:
-        if (rr->data_len < 7 || rdata_name(p, m, at + 6, end, &next, err) || next != end)
+        if (rr->data_len < 7 || rdata_name(p, m, false, at + 6, end, &next, err) || next != end)
             return fail(err, "invalid DNS SRV record");
         break;
     case 16: /* One or more length-prefixed TXT strings. */
@@ -183,7 +200,7 @@ static int records(const md_packet *p, name_marks *m, md_question *q, md_rr_fn f
         unsigned count = md_read16(p->data + 6 + section * 2);
         for (unsigned i = 0; i < count; i++) {
             size_t start = at, owner_end;
-            if (name(p, m, at, &owner_end, NULL, err)) return -1;
+            if (name(p, m, true, at, &owner_end, NULL, err)) return -1;
             at = owner_end;
             if (p->len - at < 10) return fail(err, "short DNS resource record");
             md_rr rr = { .type = md_read16(p->data + at),
@@ -197,7 +214,7 @@ static int records(const md_packet *p, name_marks *m, md_question *q, md_rr_fn f
             if (rr.type == 41) {
                 size_t root_end;
                 char owner[256];
-                if (section != 2 || have_opt || name(p, m, start, &root_end, owner, err) || strcmp(owner, "."))
+                if (section != 2 || have_opt || name(p, m, true, start, &root_end, owner, err) || strcmp(owner, "."))
                     return fail(err, "invalid or duplicate DNS OPT");
                 have_opt = true;
                 q->udp_size = rr.class_ < 512 ? 512 : rr.class_;
