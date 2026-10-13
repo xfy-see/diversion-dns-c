@@ -103,3 +103,9 @@ Linux ARM64 包用于目标设备的独立校验。CI/mock 回归不会改生产
 这是迁移前独立测量的记录，不是 GitHub 新构建产物的成绩。原始证据保留在原本地工作区，不能用初版或 CI 的编译成功代替实机结果。
 
 详细协作规则见 [AGENTS.md](AGENTS.md)。旧仓库的编译缓存清理记录和首轮 CI 下载验证结果另保留在本地 `migration/` 与 `validation/` 证据目录。
+
+## 自动化验收
+
+统一测试入口、场景矩阵与使用方式见 [自动化测试集](docs/test-suite.md)。
+运行 `python3 scripts/testsuite.py plan --profile release` 可查看交付覆盖清单；
+设备测试默认仅生成计划，使用独立端口、集合和资源限额，执行前需配置已验证产物及 SSH 主机密钥。

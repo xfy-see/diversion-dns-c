@@ -1,0 +1,83 @@
+name: Test suite automation
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  python:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Python runner, guards, metrics and network fixture regressions
+        run: |
+          python3 -m pip install --only-binary=:all: PyYAML==6.0.2
+          python3 -m unittest discover -s tests -p 'test_*.py' -v
+          python3 scripts/testsuite.py list --output catalog-validated.json
+          python3 scripts/testsuite.py plan --profile release --output release-plan.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: suite-plan-${{ github.sha }}
+          path: |
+            catalog-validated.json
+            release-plan.json
+  helpers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: '1.24.9'
+          cache: false
+      - name: Build standalone fixed-arrival helpers for test clients
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GO111MODULE: 'off'
+          GOMIPS: softfloat
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64 mipsle; do
+            mkdir -p "dist/$arch"
+            GOARCH="$arch" go build -trimpath -ldflags='-s -w' -o "dist/$arch/load" benchmarks/suite/load.go
+            GOARCH="$arch" go build -trimpath -ldflags='-s -w' -o "dist/$arch/fixture" benchmarks/suite/fixture.go
+          done
+          cp benchmarks/suite/*.go dist/
+          go version > dist/toolchain.txt
+          python3 - <<'PYTHON'
+          import hashlib,json,os,pathlib
+          root=pathlib.Path('dist')
+          files={p.relative_to(root).as_posix():hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob('*') if p.is_file()}
+          m=dict(schema_version=1,commit=os.environ['GITHUB_SHA'],run_id=int(os.environ['GITHUB_RUN_ID']),run_attempt=int(os.environ['GITHUB_RUN_ATTEMPT']),files=files)
+          (root/'manifest.json').write_text(json.dumps(m,indent=2)+'\n')
+          PYTHON
+      - name: Native helper wire smoke (UDP and TCP are separately supported by load)
+        run: |
+          set -euo pipefail
+          dist/amd64/fixture -addr 127.0.0.1:15531 > fixture.log 2>&1 &
+          fixture_pid=$!
+          trap 'kill "$fixture_pid" 2>/dev/null || true' EXIT
+          sleep 1
+          dist/amd64/load -addr 127.0.0.1:15531 -unique -rate 10 -seconds 1 -workers 2 > helper-smoke.json
+          python3 - <<'PYTHON'
+          import json,sys
+          sys.path.insert(0,'scripts')
+          from suite_metrics import measure
+          result=measure(json.load(open('helper-smoke.json')))
+          assert result['strict_qps_pass'],result
+          PYTHON
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: suite-helpers-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          path: dist/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
