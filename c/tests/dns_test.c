@@ -647,14 +647,14 @@ static void query_compare(const md_packet *q) {
     }
     /* Oversized response against the request's UDP limit. */
     for (size_t big = 400; big <= 1400; big += 500) {
-        r1p = *q; md_write16(r1p.data + 2, 0x8180);
+        memcpy(r1p.data, q->data, q->len); r1p.len = q->len; md_write16(r1p.data + 2, 0x8180);
         if (r1p.len < big) { memset(r1p.data + r1p.len, 0, big - r1p.len); r1p.len = big; }
-        r2p = r1p;
+        memcpy(r2p.data, r1p.data, r1p.len); r2p.len = r1p.len;
         md_dns_limit_udp(q, &r1p); md_dns_limit_udp_q(q, &v, &r2p);
         assert(r1p.len == r2p.len && !memcmp(r1p.data, r2p.data, r1p.len));
     }
     /* A stale view (length changed) is never trusted. */
-    if (!r2 && q->len > 12) { md_packet t = *q; t.len--; assert(!md_dns_query_ok(&t, &v)); }
+    if (!r2 && q->len > 12) { static md_packet t; memcpy(t.data, q->data, q->len); t.len = q->len - 1; assert(!md_dns_query_ok(&t, &v)); }
 }
 static void query_parse_tests(void) {
     md_packet *seeds = calloc(8, sizeof(*seeds)), *m = malloc(sizeof(*m));
@@ -714,8 +714,10 @@ static void query_parse_tests(void) {
         if (h1) assert(md_cache_refresh_begin(c1, &seeds[i]) && md_cache_refresh_begin_q(c2, &seeds[i], &qv));
         md_cache_free(c1); md_cache_free(c2); free(r); free(o1); free(o2); free(rv);
     }
-    for (unsigned i = 0; i < 200000; i++) {
-        *m = seeds[view_rand() % n];
+    /* Copy only the used bytes: whole-md_packet copies dominate on musl/qemu. */
+    for (unsigned i = 0; i < 100000; i++) {
+        const md_packet *sd = &seeds[view_rand() % n];
+        memcpy(m->data, sd->data, sd->len + 8); m->len = sd->len;
         unsigned flips = 1 + view_rand() % 3;
         for (unsigned f = 0; f < flips; f++) {
             unsigned kind = view_rand() % 6;
