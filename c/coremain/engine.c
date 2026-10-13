@@ -287,10 +287,12 @@ static int build_config(md_engine *e, const config *c, const char *path, char *e
     return 0;
 }
 
-static int finalize(md_engine *e, bool cn, md_packet *response, uint64_t deadline, char *err) {
+/* view 是 response 当前内容的整包校验结果（上游接收或缓存命中时各解析一次）；
+ * TTL 规范化只原地改 TTL，view 仍然有效，随后 nft 与缓存写入共用它。 */
+static int finalize(md_engine *e, bool cn, md_packet *response, md_dns_view *view, uint64_t deadline, char *err) {
     if (md_now() >= deadline) return fail(err, "query execution deadline exceeded");
-    if (response->len && md_dns_normalize_ttl(response, err)) return -1;
-    int rc = cn && e->nft && response->len ? md_nft_apply(e->nft, response, err) : 0;
+    if (response->len && md_dns_normalize_ttl_view(response, view, err)) return -1;
+    int rc = cn && e->nft && response->len ? md_nft_apply_view(e->nft, response, view, err) : 0;
     if (!rc && md_now() >= deadline) rc = fail(err, "query execution deadline exceeded");
     return rc;
 }
@@ -299,9 +301,15 @@ static int finalize(md_engine *e, bool cn, md_packet *response, uint64_t deadlin
 static int resolve(md_engine *e, bool cn, const md_packet *query, md_packet *response, uint64_t deadline, char *err) {
     if (md_now() >= deadline) return fail(err, "query execution deadline exceeded");
     upstream_group *group = &e->upstreams[cn ? 0 : 1];
-    int rc = md_forward(group->items, group->count, group->concurrent, query, response, err);
-    if (!rc) rc = finalize(e, cn, response, deadline, err);
-    if (response->len) md_cache_put(e->cache, query, response, md_now());
+    md_dns_view *view = md_dns_view_scratch();
+    if (!view) return fail(err, "out of memory for DNS view");
+    int rc = md_forward_view(group->items, group->count, group->concurrent, query, response, view, err);
+    /* md_forward_view 只交出已校验的响应；防御性地在 view 缺失时重新解析。 */
+    if (response->len && (!view->valid || view->len != response->len) && md_dns_view_parse(response, view, err)) {
+        response->len = 0; return -1;
+    }
+    if (!rc) rc = finalize(e, cn, response, view, deadline, err);
+    if (response->len) md_cache_put_view(e->cache, query, response, view, md_now());
     return rc;
 }
 static void *refresh_thread(void *opaque) {
@@ -359,8 +367,12 @@ unsigned md_engine_dispatch(md_engine *e, size_t entry, const md_packet *q, md_p
     md_question question; char err[MD_ERROR_SIZE];
     if (md_dns_question(q, &question, err)) return MD_LANE_CACHED;
     bool cn = md_domain_match(e->cn, question.name);
-    int hit = md_cache_get(e->cache, q, r, md_now());
-    if (hit == 1 && !cn && !finalize(e, false, r, md_now() + 5, err)) return MD_LANE_REPLY;
+    /* 只有国外新鲜命中在此回复：才需要解析（一次，finalize 复用）；
+     * CN 命中仅探测状态，由 worker 的 md_engine_query 解析唯一一次。 */
+    md_dns_view *view = cn ? NULL : md_dns_view_scratch();
+    if (!cn && !view) return MD_LANE_CACHED;
+    int hit = md_cache_get_view(e->cache, q, r, view, md_now());
+    if (hit == 1 && !cn && !finalize(e, false, r, view, md_now() + 5, err)) return MD_LANE_REPLY;
     r->len = 0;
     if (hit) return MD_LANE_CACHED;
     return cn ? MD_LANE_CN : MD_LANE_FOREIGN;
@@ -379,9 +391,11 @@ int md_engine_query(md_engine *e, size_t entry, const md_packet *q, md_packet *r
     md_question question;
     if (md_dns_question(q, &question, err)) return -1;
     bool cn = md_domain_match(e->cn, question.name);
-    int hit = md_cache_get(e->cache, q, r, md_now());
+    md_dns_view *view = md_dns_view_scratch();
+    if (!view) return fail(err, "out of memory for DNS view");
+    int hit = md_cache_get_view(e->cache, q, r, view, md_now());
     if (hit == 2) refresh_start(e, cn, q);
-    if (hit) return finalize(e, cn, r, deadline, err);
+    if (hit) return finalize(e, cn, r, view, deadline, err);
     int rc = resolve(e, cn, q, r, deadline, err);
     if (!rc && !r->len) return fail(err, "upstream completed without a response");
     return rc;

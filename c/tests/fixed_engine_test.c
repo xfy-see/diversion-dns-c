@@ -17,12 +17,18 @@
 static int test_forward(const md_upstream *, size_t, unsigned, const md_packet *, md_packet *, char *);
 static int test_nft_apply(md_nft *, const md_packet *, char *);
 static uint64_t test_now(void);
+static int test_forward_view(const md_upstream *, size_t, unsigned, const md_packet *, md_packet *, md_dns_view *, char *);
+static int test_nft_apply_view(md_nft *, const md_packet *, const md_dns_view *, char *);
 #define md_forward test_forward
+#define md_forward_view test_forward_view
 #define md_nft_apply test_nft_apply
+#define md_nft_apply_view test_nft_apply_view
 #define md_now test_now
 #include "../coremain/engine.c"
 #undef md_forward
+#undef md_forward_view
 #undef md_nft_apply
+#undef md_nft_apply_view
 #undef md_now
 
 static char test_directory[256], test_rules[512], test_config[512];
@@ -123,6 +129,17 @@ static int test_forward(const md_upstream *us, size_t count, unsigned concurrent
     }
     if (target_offset) md_write16(r->data + address_offset, (uint16_t)(0xc000 | target_offset));
     assert(md_dns_response_matches(q, r)); atomic_fetch_add(&test_clock, test_forward_advance); return 0;
+}
+/* The engine now hands forward/nft the single parsed view; the doubles keep
+ * their packet-only bodies and the view must describe the exact bytes. */
+static int test_forward_view(const md_upstream *us, size_t count, unsigned concurrent, const md_packet *q, md_packet *r, md_dns_view *v, char *err) {
+    int rc = test_forward(us, count, concurrent, q, r, err);
+    if (r->len) assert(!md_dns_view_parse(r, v, err));
+    return rc;
+}
+static int test_nft_apply_view(md_nft *n, const md_packet *r, const md_dns_view *v, char *err) {
+    assert(v && v->valid && v->len == r->len);
+    return test_nft_apply(n, r, err);
 }
 static int test_nft_record(const md_packet *packet, const md_rr *rr, void *unused) {
     (void)packet; (void)unused;

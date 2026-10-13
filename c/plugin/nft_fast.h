@@ -16,6 +16,7 @@
 struct nft_fast_waiter {
     struct nft_fast_waiter *next;
     const md_packet *packet;
+    const md_dns_view *view; /* packet 的整包校验结果；cohort 写者只遍历描述符 */
     uint64_t until;
     unsigned addresses;
     bool working, done;
@@ -226,7 +227,7 @@ invalid:
     return -1;
 }
 /* seen/limit count Answer IN A+AAAA in wire order, so an oversized answer
- * learns exactly its first `limit` addresses (the same records as nft_fast_count). */
+ * learns exactly its first `limit` addresses (the same records as md_dns_view.addresses). */
 typedef struct { nft_fast_state *s; const nft_target *t; size_t count; uint64_t until; unsigned seen, limit; } nft_fast_keys;
 static int nft_fast_collect(const md_packet *p, const md_rr *rr, void *arg) {
     nft_fast_keys *v = arg;
@@ -329,7 +330,7 @@ static int nft_fast_target(nft_fast_state *s, const nft_target *t, unsigned fami
     nft_fast_keys v = {s, t, 0, until, 0, 0};
     for (size_t i = 0; i < count; i++) {
         v.seen = 0; v.limit = NFT_FAST_ANSWER_KEYS;
-        if (md_dns_records(cohort[i]->packet, nft_fast_collect, &v, err)) return -1;
+        if (md_dns_view_each(cohort[i]->packet, cohort[i]->view, nft_fast_collect, &v, err)) return -1;
     }
     if (!v.count) return 0;
     /* Metadata must be read inside one stable generation. If another writer
@@ -438,15 +439,10 @@ static void nft_fast_process(md_nft *n, nft_fast_waiter **cohort, size_t count, 
         snprintf(cohort[i]->error, MD_ERROR_SIZE, "%s", rc && count > 1 ? member_error : message);
     }
 }
-static int nft_fast_count(const md_packet *p, const md_rr *rr, void *arg) {
-    (void)p;
-    unsigned *count = arg;
-    if (!rr->section && rr->class_ == 1 && (rr->type == 1 || rr->type == 28)) ++*count;
-    return 0;
-}
-static int nft_fast_apply(md_nft *n, const md_packet *r, char *err) {
-    nft_fast_waiter self = {.packet = r, .until = milliseconds() + 5000};
-    if (md_dns_records(r, nft_fast_count, &self.addresses, err)) return -1;
+static int nft_fast_apply(md_nft *n, const md_packet *r, const md_dns_view *view, char *err) {
+    nft_fast_waiter self = {.packet = r, .view = view, .until = milliseconds() + 5000};
+    /* view->addresses 统计 Answer 中 IN A/AAAA，与 nft_fast_collect 的 seen 口径一致。 */
+    self.addresses = view->addresses;
     /* No A/AAAA (NXDOMAIN, TXT, CNAME-only): nothing to learn, no netlink round trip. */
     if (!self.addresses) return 0;
     /* N2: learn the first 256 addresses and answer normally; SERVFAIL for a
