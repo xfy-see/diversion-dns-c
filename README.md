@@ -10,6 +10,12 @@
 
 v0.1.1 是稳定性版本：新增可选的 `nftset_fast` netlink 快速路径，修复并发写入 SERVFAIL、netlink 序列号耗尽、上游黑洞拖垮查询、musl 小线程栈段错误、TCP 慢客户端与 slowloris 等问题，并新增排队期限和 TCP 连接上限配置。`--cpu` 含义、最坏内存和 SERVFAIL 行为有变化，升级前请阅读发布说明。附件组成与 v0.1.0 相同（`0.1.1-r1` 双架构 APK、PCRE2/lite 验证包、SHA256、buildinfo）；`0.1.1-r1` 高于 `0.1.0-r1`。
 
+## 0.1.2（未发布）
+
+修复批次在 PR [#7](https://github.com/xfy-see/diversion-dns-c/pull/7) / [#8](https://github.com/xfy-see/diversion-dns-c/pull/8)，**尚未合并、未发版**。行为说明见 [fixed-splitter 上游 UDP 已知限制](docs/fixed-splitter.md#上游-udp-已知限制012--m4) 与 [c/README.md](c/README.md)。
+
+M4 默认每次上游 UDP 使用新源端口。在 mipsel_24kc（.122，Linux 6.12.94）上，冷缓存 / 首次上游 UDP 相对 v0.1.1 约多 +4–5 ms P50、约 +5 ms P99（2026-10-13 六轮中位数消融：冷 A P99 约 7.3→~12 ms）；热路径与 aarch64（.131）无实质回归。conntrack 约每条冷查询 +1。所有者接受该代价；有限复用池留作后续 opt-in。
+
 ## v0.1.0（上一版本）
 
 [下载 v0.1.0](https://github.com/xfy-see/diversion-dns-c/releases/tag/v0.1.0) · [发布说明与迁移边界](docs/release-v0.1.0.md)

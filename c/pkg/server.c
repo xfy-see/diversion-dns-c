@@ -219,6 +219,7 @@ static void *work(void *arg) {
         pthread_mutex_unlock(&p->lock);
         uint8_t byte = 1;
         ssize_t ignored = write(p->wake[1], &byte, 1); (void)ignored;
+        md_forward_worker_idle();
     }
     md_forward_worker_cleanup();
     return NULL;

@@ -60,6 +60,14 @@ splitmix64）的随机 16 位 DNS ID，不把客户端 ID 发给上游；回复�
 非工作线程使用新连接。没有 pipeline。UDP 每秒用同一 connected socket 和同一上游 ID
 重发，共享原 5 秒交换预算；TC 转 TCP 后停止 UDP 重发。
 
+**已知限制（M4，mipsel）：** 每次上游 UDP 查询使用全新 socket 与内核随机源端口（热路径可把
+`socket`/`connect` 挪到空闲时预开，但端口仍不复用）。在 mipsel_24kc（.122，Linux 6.12.94）
+上，冷缓存 / 首次上游 UDP 查询相对 v0.1.1 基线约多 **+4–5 ms P50**、约 **+5 ms P99**
+（2026-10-13 六轮中位数消融：冷 A P99 约 **7.3 → ~12 ms**）；热路径无明显回归。
+同机测得该路径上 conntrack 约每条冷查询增加 1 条。aarch64（.131）冷路径无实质回归。
+所有者决定默认保留每查询新源端口并接受该 MIPS 冷查询代价；可选的有时限/小容量复用池
+留作后续 opt-in，当前不实现。
+
 nft 普通集合仍有 generation 前后校验和完整 Netlink 成功回执；集合类型和 interval 标志
 都由 Netlink GETSET 读取，不再调用 `nft list set`（普通集合每次写入 0 次 exec，interval
 集合 1 次 `nft -f -`）。generation 冲突或批次 ERESTART 时新开 socket、退避 1–4 ms 后最多
@@ -233,5 +241,16 @@ Missing/wrong sets, malformed ACKs and exhausted deadlines fail closed, with no 
 fallback. Rule changes immediately after the final check remain outside any DNS/nft
 transaction; re-query after reload repairs cached answers. Existing connections can
 retain their route through the separate conntrack pinning rules.
+
+## Known limitation: M4 per-query UDP source ports (mipsel)
+
+With M4, each upstream UDP exchange uses a fresh socket and a kernel-chosen ephemeral
+source port (ports are never reused; idle pre-open only moves `socket`/`connect` off the
+hot path). On mipsel_24kc (.122, Linux 6.12.94), cold-cache / first-use upstream UDP
+queries pay roughly **+4–5 ms P50** and **~+5 ms P99** vs v0.1.1 (2026-10-13 six-run
+median ablation: cold A P99 about **7.3 → ~12 ms**). Hot path is unaffected. Conntrack
+grows about one entry per cold query on that path. aarch64 (.131) showed no material cold
+regression. Owner choice: keep per-query new source ports by default and accept the MIPS
+cold cost; a timed/limited reuse pool remains a possible future opt-in.
 
 Route lookups must include both static CN-IP and dynamic DNS-learned sets. Do not remove dnsmasq learning until these lookups and C writes have passed real A/AAAA, first-connection, reload and rollback tests.
