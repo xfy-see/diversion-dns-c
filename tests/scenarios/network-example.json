@@ -1,0 +1,221 @@
+{
+  "network": {
+    "dns": [
+      {
+        "id": "dns-udp4-a",
+        "server": null,
+        "port": 53,
+        "transport": "udp",
+        "family": 4,
+        "name": null,
+        "qtype": "A",
+        "expected_rcode": 0,
+        "require_address": true,
+        "required": true
+      },
+      {
+        "id": "dns-udp4-aaaa",
+        "server": null,
+        "port": 53,
+        "transport": "udp",
+        "family": 4,
+        "name": null,
+        "qtype": "AAAA",
+        "expected_rcode": 0,
+        "require_address": true,
+        "required": true
+      },
+      {
+        "id": "dns-udp6-a",
+        "server": null,
+        "port": 53,
+        "transport": "udp",
+        "family": 6,
+        "name": null,
+        "qtype": "A",
+        "expected_rcode": 0,
+        "require_address": true,
+        "required": true
+      },
+      {
+        "id": "dns-udp6-aaaa",
+        "server": null,
+        "port": 53,
+        "transport": "udp",
+        "family": 6,
+        "name": null,
+        "qtype": "AAAA",
+        "expected_rcode": 0,
+        "require_address": true,
+        "required": true
+      },
+      {
+        "id": "dns-tcp4-a",
+        "server": null,
+        "port": 53,
+        "transport": "tcp",
+        "family": 4,
+        "name": null,
+        "qtype": "A",
+        "expected_rcode": 0,
+        "require_address": true,
+        "required": true
+      },
+      {
+        "id": "dns-tcp4-aaaa",
+        "server": null,
+        "port": 53,
+        "transport": "tcp",
+        "family": 4,
+        "name": null,
+        "qtype": "AAAA",
+        "expected_rcode": 0,
+        "require_address": true,
+        "required": true
+      },
+      {
+        "id": "dns-tcp6-a",
+        "server": null,
+        "port": 53,
+        "transport": "tcp",
+        "family": 6,
+        "name": null,
+        "qtype": "A",
+        "expected_rcode": 0,
+        "require_address": true,
+        "required": true
+      },
+      {
+        "id": "dns-tcp6-aaaa",
+        "server": null,
+        "port": 53,
+        "transport": "tcp",
+        "family": 6,
+        "name": null,
+        "qtype": "AAAA",
+        "expected_rcode": 0,
+        "require_address": true,
+        "required": true
+      }
+    ],
+    "http": [
+      {
+        "id": "http-cn-ipv4",
+        "url": null,
+        "dns_server": null,
+        "dns_port": 53,
+        "dns_transport": "udp",
+        "dns_family": 4,
+        "answer_family": 4,
+        "required": true,
+        "timeout": 5,
+        "expected_status": [
+          200
+        ],
+        "max_bytes": 65536
+      },
+      {
+        "id": "http-cn-ipv6",
+        "url": null,
+        "dns_server": null,
+        "dns_port": 53,
+        "dns_transport": "udp",
+        "dns_family": 4,
+        "answer_family": 6,
+        "required": true,
+        "timeout": 5,
+        "expected_status": [
+          200
+        ],
+        "max_bytes": 65536
+      },
+      {
+        "id": "http-foreign-ipv4",
+        "url": null,
+        "dns_server": null,
+        "dns_port": 53,
+        "dns_transport": "udp",
+        "dns_family": 4,
+        "answer_family": 4,
+        "required": true,
+        "timeout": 5,
+        "expected_status": [
+          200
+        ],
+        "max_bytes": 65536
+      },
+      {
+        "id": "http-foreign-ipv6",
+        "url": null,
+        "dns_server": null,
+        "dns_port": 53,
+        "dns_transport": "udp",
+        "dns_family": 4,
+        "answer_family": 6,
+        "required": true,
+        "timeout": 5,
+        "expected_status": [
+          200
+        ],
+        "max_bytes": 65536
+      }
+    ],
+    "websocket": [
+      {
+        "id": "websocket-cn-ipv4",
+        "url": null,
+        "dns_server": null,
+        "dns_port": 53,
+        "dns_transport": "udp",
+        "dns_family": 4,
+        "answer_family": 4,
+        "required": true,
+        "timeout": 5,
+        "duration": 1800,
+        "ping_interval": 10
+      },
+      {
+        "id": "websocket-cn-ipv6",
+        "url": null,
+        "dns_server": null,
+        "dns_port": 53,
+        "dns_transport": "udp",
+        "dns_family": 4,
+        "answer_family": 6,
+        "required": true,
+        "timeout": 5,
+        "duration": 1800,
+        "ping_interval": 10
+      },
+      {
+        "id": "websocket-foreign-ipv4",
+        "url": null,
+        "dns_server": null,
+        "dns_port": 53,
+        "dns_transport": "udp",
+        "dns_family": 4,
+        "answer_family": 4,
+        "required": true,
+        "timeout": 5,
+        "duration": 1800,
+        "ping_interval": 10
+      },
+      {
+        "id": "websocket-foreign-ipv6",
+        "url": null,
+        "dns_server": null,
+        "dns_port": 53,
+        "dns_transport": "udp",
+        "dns_family": 4,
+        "answer_family": 6,
+        "required": true,
+        "timeout": 5,
+        "duration": 1800,
+        "ping_interval": 10
+      }
+    ],
+    "metadata": {
+      "description": "Fill literal DNS server addresses and explicit URLs. Empty endpoints report skip; this is a configuration template, not a passed test."
+    }
+  }
+}

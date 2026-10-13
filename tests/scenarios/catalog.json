@@ -1,0 +1,1505 @@
+{
+  "schema_version": 1,
+  "name": "diversion-dns-c scenario catalog",
+  "description": "场景定义与执行路由，不是测试报告；automated 表示已有可调用实现，不表示本提交或设备已通过。",
+  "profiles": {
+    "portable": {
+      "description": "同架构已验证 CI bundle 的 native/static/ASan+UBSan、DNS/domain/server/nft模拟回归"
+    },
+    "kernel": {
+      "description": "Linux root、新建自有 netns 的真实 nft 内核回归"
+    },
+    "network": {
+      "description": "显式配置的 DNS/HTTP/WebSocket 真实端点；不给默认公网目标"
+    },
+    "device-smoke": {
+      "description": "设备 adapter 的基本隔离运行；实际负载由显式配置决定"
+    },
+    "device-performance": {
+      "description": "五类冷热/UDP/TCP性能场景与资源/漏发/完整性证据"
+    },
+    "ablation": {
+      "description": "多版本正序3轮+倒序3轮的五场景消融与P99中位数"
+    },
+    "stability": {
+      "description": "WebSocket 同连接持续测试；DNS 同一服务进程分片到达率测试（分片之间有观测间隔）"
+    },
+    "release": {
+      "description": "交付覆盖清单；未具备设备/内核/公网条件或manual项必须记录未覆盖，不能宣称全通过"
+    }
+  },
+  "routes": {
+    "portable": "scripts/validate.py (one verified bundle group; deduplicate case aliases)",
+    "kernel": "existing c/tests/nft_kernel*_test.py inside owned Linux netns",
+    "probe": "scripts/suite_network.py using explicit dns/http/websocket configuration",
+    "device": "device adapter using verified binaries and isolated owned resources",
+    "audit": "artifact/device/methodology evidence assertions; never independent success without underlying evidence",
+    "manual": "record uncovered; do not mutate production"
+  },
+  "result_contract": {
+    "states": [
+      "pass",
+      "fail",
+      "skip",
+      "incomplete",
+      "planned"
+    ],
+    "success": "all selected executable requirements and assertions passed; incomplete coverage cannot be presented as a full release pass",
+    "functional_and_performance": "record separately",
+    "strict_qps": "planned == sent == succeeded; failed == 0; unsent == 0; scheduler-late and inflight-limit are both failures of strict arrival target",
+    "percentiles": "successful-response latency only; errors/timeouts/unsent remain separate counts; floor((N-1)*p), matching historical device harness, recorded in result",
+    "repeats": "median of six per-run P99 values, 3 forward + 3 reverse; retain per-run/raw values",
+    "dns_axes": "QTYPE A/AAAA and IP transport family 4/6 are separate axes",
+    "conntrack": "global count delta is not exact per-query socket creation count; enumerated five-tuple difference is auxiliary visibility only"
+  },
+  "cases": [
+    {
+      "id": "portable-wire",
+      "category": "portable",
+      "title": "DNS 报文、解析边界和回答匹配",
+      "runner": "portable",
+      "profiles": [
+        "portable",
+        "release"
+      ],
+      "assertions": [
+        "拒绝截断报头、压缩指针越界/循环、非法标签长度与多 question",
+        "匹配 ID、QNAME、QTYPE、QCLASS；错误回答不能成为有效结果",
+        "A/AAAA、EDNS 和截断标志按断言处理"
+      ],
+      "status": "automated",
+      "source_tests": [
+        "c/tests/dns_test.c"
+      ],
+      "execution_group": "verified-bundle-portable",
+      "evidence": [
+        "result.json",
+        "per-command stdout/stderr"
+      ],
+      "scope": "本机同架构已验证产物；loopback/fixture；不证明设备内核写集或公网分流"
+    },
+    {
+      "id": "portable-cache",
+      "category": "portable",
+      "title": "缓存隔离、TTL、负缓存与刷新",
+      "runner": "portable",
+      "profiles": [
+        "portable",
+        "release"
+      ],
+      "assertions": [
+        "A/AAAA 缓存键隔离，回复使用本客户端 ID",
+        "NXDOMAIN/SOA、标志位和禁用缓存保持预期语义",
+        "TTL 老化、过期异步刷新与内存所有权通过现有断言"
+      ],
+      "status": "automated",
+      "source_tests": [
+        "c/tests/cache_domain_test.c",
+        "c/tests/fixed_integration.py:test_negative_cache_flags_types_and_disabled_cache",
+        "c/tests/fixed_integration.py:test_lazy_refresh"
+      ],
+      "execution_group": "verified-bundle-portable",
+      "evidence": [
+        "result.json",
+        "per-command stdout/stderr"
+      ],
+      "scope": "本机同架构已验证产物；loopback/fixture；不证明设备内核写集或公网分流"
+    },
+    {
+      "id": "portable-domain",
+      "category": "portable",
+      "title": "域名规则、大小写和正则后端",
+      "runner": "portable",
+      "profiles": [
+        "portable",
+        "release"
+      ],
+      "assertions": [
+        "full/domain/keyword/regexp 命中和反例按共享 fixture 校验",
+        "PCRE2 no-Unicode 与 POSIX-lite 显式记录后端差异",
+        "已声明不支持的 Unicode/RE2 特性记录为跳过，不记通过"
+      ],
+      "status": "automated",
+      "source_tests": [
+        "c/tests/domain_fixture.py",
+        "tests/fixtures/matcher_domain.json"
+      ],
+      "execution_group": "verified-bundle-portable",
+      "evidence": [
+        "result.json",
+        "per-command stdout/stderr"
+      ],
+      "scope": "本机同架构已验证产物；loopback/fixture；不证明设备内核写集或公网分流"
+    },
+    {
+      "id": "portable-config",
+      "category": "portable",
+      "title": "配置校验与固定分流行为",
+      "runner": "portable",
+      "profiles": [
+        "portable",
+        "release"
+      ],
+      "assertions": [
+        "合法配置与已支持选项正确加载",
+        "非法 CLI、旧插件配置及错误规则被拒绝",
+        "check 不绑定 DNS 监听端口、不写 nftset"
+      ],
+      "status": "automated",
+      "source_tests": [
+        "c/tests/fixed_config_test.c",
+        "c/tests/fixed_engine_test.c",
+        "c/tests/fixed_integration.py:test_check_loads_rules_without_binding_or_nft_writes",
+        "c/tests/fixed_integration.py:test_invalid_cli_and_legacy_configuration"
+      ],
+      "execution_group": "verified-bundle-portable",
+      "evidence": [
+        "result.json",
+        "per-command stdout/stderr"
+      ],
+      "scope": "本机同架构已验证产物；loopback/fixture；不证明设备内核写集或公网分流"
+    },
+    {
+      "id": "portable-classification",
+      "category": "portable",
+      "title": "CN-site、境外和 CNAME 分流",
+      "runner": "portable",
+      "profiles": [
+        "portable",
+        "release"
+      ],
+      "assertions": [
+        "CN-site 和默认境外选择正确上游",
+        "CNAME 跨组目标维持实现约定，不凭 CNAME 地址误判原始域名",
+        "UDP/TCP 跨传输缓存回答一致"
+      ],
+      "status": "automated",
+      "source_tests": [
+        "c/tests/fixed_integration.py:test_split_cname_and_cross_transport_cache"
+      ],
+      "execution_group": "verified-bundle-portable",
+      "evidence": [
+        "result.json",
+        "per-command stdout/stderr"
+      ],
+      "scope": "本机同架构已验证产物；loopback/fixture；不证明设备内核写集或公网分流"
+    },
+    {
+      "id": "portable-udp",
+      "category": "portable",
+      "title": "UDP 大包、TCP fallback 与伪造回答",
+      "runner": "portable",
+      "profiles": [
+        "portable",
+        "release"
+      ],
+      "assertions": [
+        "上游 UDP TC=1 触发 TCP fallback",
+        "下游 UDP 满足客户端 EDNS 长度限制；TCP 可取完整回答",
+        "错误 ID、错误 question 和错误回答被过滤"
+      ],
+      "status": "automated",
+      "source_tests": [
+        "c/tests/fixed_integration.py:test_udp_truncation_tcp_fallback_and_wrong_response_filter",
+        "c/tests/fixed_integration.py:test_client_udp_limit_and_tcp_full_answer"
+      ],
+      "execution_group": "verified-bundle-portable",
+      "evidence": [
+        "result.json",
+        "per-command stdout/stderr"
+      ],
+      "scope": "本机同架构已验证产物；loopback/fixture；不证明设备内核写集或公网分流"
+    },
+    {
+      "id": "portable-tcp",
+      "category": "portable",
+      "title": "TCP 分帧、连接复用与并行客户端",
+      "runner": "portable",
+      "profiles": [
+        "portable",
+        "release"
+      ],
+      "assertions": [
+        "半包、分段长度前缀、pipeline 和重复连接保持完整回答",
+        "上游 TCP 与并行客户端正确工作",
+        "空闲超时不取消仍在进行中的查询"
+      ],
+      "status": "automated",
+      "source_tests": [
+        "c/tests/fixed_integration.py:test_repeated_connections_partial_frames_and_pipeline",
+        "c/tests/fixed_integration.py:test_tcp_upstream_and_parallel_clients",
+        "c/tests/fixed_integration.py:test_idle_timeout_does_not_cancel_active_query"
+      ],
+      "execution_group": "verified-bundle-portable",
+      "evidence": [
+        "result.json",
+        "per-command stdout/stderr"
+      ],
+      "scope": "本机同架构已验证产物；loopback/fixture；不证明设备内核写集或公网分流"
+    },
+    {
+      "id": "portable-failures",
+      "category": "portable",
+      "title": "超时、错误回答与畸形客户端恢复",
+      "runner": "portable",
+      "profiles": [
+        "portable",
+        "release"
+      ],
+      "assertions": [
+        "静默上游、仅错误回答及传输失败按预期返回或超时",
+        "畸形客户端报文之后服务仍能回答合法请求",
+        "服务 SIGTERM 在限定时间内退出"
+      ],
+      "status": "automated",
+      "source_tests": [
+        "c/tests/fixed_integration.py:test_upstream_timeout_wrong_only_and_transport_failure",
+        "c/tests/fixed_integration.py:test_malformed_client_does_not_stop_server",
+        "c/tests/fixed_integration.py:running"
+      ],
+      "execution_group": "verified-bundle-portable",
+      "evidence": [
+        "result.json",
+        "per-command stdout/stderr"
+      ],
+      "scope": "本机同架构已验证产物；loopback/fixture；不证明设备内核写集或公网分流"
+    },
+    {
+      "id": "portable-nft-contract",
+      "category": "portable",
+      "title": "nft CLI 与 netlink 模拟契约",
+      "runner": "portable",
+      "profiles": [
+        "portable",
+        "release"
+      ],
+      "assertions": [
+        "集合名注入、元数据格式、写入失败和超时按契约拒绝",
+        "普通 set、interval set 和 fast 路径 fork 次数符合当前源树契约",
+        "无地址回答不启动 nft；并发/容量/过期边界按驱动断言"
+      ],
+      "status": "automated",
+      "source_tests": [
+        "c/tests/nft_netlink_test.c",
+        "c/tests/nft_cli_test.py",
+        "c/tests/nft_cli_contract.json"
+      ],
+      "execution_group": "verified-bundle-portable",
+      "evidence": [
+        "result.json",
+        "per-command stdout/stderr"
+      ],
+      "scope": "本机同架构已验证产物；loopback/fixture；不证明设备内核写集或公网分流"
+    },
+    {
+      "id": "portable-sanitizers",
+      "category": "portable",
+      "title": "native 与 ASan/UBSan 产物回归",
+      "runner": "portable",
+      "profiles": [
+        "portable",
+        "release"
+      ],
+      "assertions": [
+        "逐一执行 manifest 中的 native/static/asan profile 并分别记录结果",
+        "任何非零退出、sanitizer 错误或完整性变化使组失败",
+        "本地不调用 C 编译器或构建工具"
+      ],
+      "status": "automated",
+      "source_tests": [
+        "scripts/validate.py"
+      ],
+      "execution_group": "verified-bundle-portable",
+      "evidence": [
+        "result.json",
+        "per-command stdout/stderr"
+      ],
+      "scope": "本机同架构已验证产物；loopback/fixture；不证明设备内核写集或公网分流"
+    },
+    {
+      "id": "artifact-identity",
+      "category": "artifact",
+      "title": "产物身份、源树与哈希校验",
+      "runner": "audit",
+      "profiles": [
+        "portable",
+        "kernel",
+        "device-smoke",
+        "device-performance",
+        "ablation",
+        "stability",
+        "release"
+      ],
+      "assertions": [
+        "执行前核对完整 commit、run_id、run_attempt、Git 源树和全部载荷 SHA256",
+        "GitHub 下载归档摘要与预期摘要一致，拒绝混合提交/残缺包",
+        "同架构运行；APK 对应设备 ELF/ABI；原始清单和校验回执存档"
+      ],
+      "status": "automated",
+      "entrypoint": "scripts/artifacts.py",
+      "scope": "入口前置条件；GitHub API 身份回执必须由下载步骤提供，离线内容校验不等于独立认证 CI 成功"
+    },
+    {
+      "id": "kernel-nft-transactions",
+      "category": "kernel",
+      "title": "真实内核 nftset 事务与生命周期",
+      "runner": "kernel",
+      "profiles": [
+        "kernel",
+        "release"
+      ],
+      "assertions": [
+        "永久元素保留；续期不能缩短已有较长租期",
+        "TTL 高位、上限、重启、flush 与 recreate 后重新学习正确",
+        "IPv4/IPv6 写集失败隔离并能恢复",
+        "超过 256 条地址回答仍 NOERROR，最多学习前 256 条",
+        "32 客户端批量写集与外部写入后地址完整"
+      ],
+      "status": "automated",
+      "entrypoint": "c/tests/nft_kernel_test.py",
+      "execution_group": "kernel-transactions",
+      "requirements": [
+        "Linux",
+        "root",
+        "new-owned-netns",
+        "empty-initial-nftables"
+      ],
+      "evidence": [
+        "result.json",
+        "commands",
+        "application logs"
+      ]
+    },
+    {
+      "id": "kernel-cli-external-writers",
+      "category": "kernel",
+      "title": "并发外部 nft 写入",
+      "runner": "kernel",
+      "profiles": [
+        "kernel",
+        "release"
+      ],
+      "assertions": [
+        "外部写者并发时记录所有 SERVFAIL、延迟及实际集合结果；阈值不得隐式放宽"
+      ],
+      "status": "automated",
+      "entrypoint": "c/tests/nft_kernel_cli_test.py",
+      "selector": "cli-external-writers",
+      "execution_group": "kernel-cli",
+      "requirements": [
+        "Linux",
+        "root",
+        "new-owned-netns",
+        "empty-initial-nftables"
+      ],
+      "evidence": [
+        "result.json",
+        "metrics",
+        "commands"
+      ]
+    },
+    {
+      "id": "kernel-foreign-blackhole-lanes",
+      "category": "kernel",
+      "title": "国外黑洞与国内/缓存队列隔离",
+      "runner": "kernel",
+      "profiles": [
+        "kernel",
+        "release"
+      ],
+      "assertions": [
+        "国外不响应时国内缓存命中维持可用；P99 满足显式门限"
+      ],
+      "status": "automated",
+      "entrypoint": "c/tests/nft_kernel_cli_test.py",
+      "selector": "foreign-blackhole-lanes",
+      "execution_group": "kernel-cli",
+      "requirements": [
+        "Linux",
+        "root",
+        "new-owned-netns",
+        "empty-initial-nftables"
+      ],
+      "evidence": [
+        "result.json",
+        "metrics",
+        "commands"
+      ]
+    },
+    {
+      "id": "kernel-small-thread-stack",
+      "category": "kernel",
+      "title": "musl 小线程栈",
+      "runner": "kernel",
+      "profiles": [
+        "kernel",
+        "release"
+      ],
+      "assertions": [
+        "已有 musl/小栈已编译产物完成查询且不崩溃；没有该产物时不宣称 musl 已验证"
+      ],
+      "status": "automated",
+      "entrypoint": "c/tests/nft_kernel_cli_test.py",
+      "selector": "small-thread-stack",
+      "execution_group": "kernel-cli",
+      "requirements": [
+        "Linux",
+        "root",
+        "new-owned-netns",
+        "empty-initial-nftables"
+      ],
+      "evidence": [
+        "result.json",
+        "metrics",
+        "commands"
+      ]
+    },
+    {
+      "id": "kernel-foreign-lane-recovery",
+      "category": "kernel",
+      "title": "过期队列与相同查询合并",
+      "runner": "kernel",
+      "profiles": [
+        "kernel",
+        "release"
+      ],
+      "assertions": [
+        "过期任务按设定停止排队；相同查询合并；健康上游在限定恢复窗口内回答"
+      ],
+      "status": "automated",
+      "entrypoint": "c/tests/nft_kernel_cli_test.py",
+      "selector": "foreign-lane-recovery",
+      "execution_group": "kernel-cli",
+      "requirements": [
+        "Linux",
+        "root",
+        "new-owned-netns",
+        "empty-initial-nftables"
+      ],
+      "evidence": [
+        "result.json",
+        "metrics",
+        "commands"
+      ]
+    },
+    {
+      "id": "kernel-tcp-slow-readers",
+      "category": "kernel",
+      "title": "慢 TCP 写出与缓存队列隔离",
+      "runner": "kernel",
+      "profiles": [
+        "kernel",
+        "release"
+      ],
+      "assertions": [
+        "慢读者不能占满回复后的队列名额；正常 UDP 缓存请求保持可用"
+      ],
+      "status": "automated",
+      "entrypoint": "c/tests/nft_kernel_cli_test.py",
+      "selector": "tcp-slow-readers",
+      "execution_group": "kernel-cli",
+      "requirements": [
+        "Linux",
+        "root",
+        "new-owned-netns",
+        "empty-initial-nftables"
+      ],
+      "evidence": [
+        "result.json",
+        "metrics",
+        "commands"
+      ]
+    },
+    {
+      "id": "kernel-tcp-connection-limits",
+      "category": "kernel",
+      "title": "TCP 慢连接与每 IP 限额",
+      "runner": "kernel",
+      "profiles": [
+        "kernel",
+        "release"
+      ],
+      "assertions": [
+        "读写超时、全局/每 IP 连接上限及空闲回收后新客户端可用"
+      ],
+      "status": "automated",
+      "entrypoint": "c/tests/nft_kernel_cli_test.py",
+      "selector": "tcp-connection-limits",
+      "execution_group": "kernel-cli",
+      "requirements": [
+        "Linux",
+        "root",
+        "new-owned-netns",
+        "empty-initial-nftables"
+      ],
+      "evidence": [
+        "result.json",
+        "metrics",
+        "commands"
+      ]
+    },
+    {
+      "id": "kernel-interval-overlap",
+      "category": "kernel",
+      "title": "interval set 重叠前缀",
+      "runner": "kernel",
+      "profiles": [
+        "kernel",
+        "release"
+      ],
+      "assertions": [
+        "重叠前缀不造成永久 SERVFAIL，不重叠前缀仍写入；跳过地址范围须记录"
+      ],
+      "status": "automated",
+      "entrypoint": "c/tests/nft_kernel_cli_test.py",
+      "selector": "interval-overlap",
+      "execution_group": "kernel-cli",
+      "requirements": [
+        "Linux",
+        "root",
+        "new-owned-netns",
+        "empty-initial-nftables"
+      ],
+      "evidence": [
+        "result.json",
+        "metrics",
+        "commands"
+      ]
+    },
+    {
+      "id": "kernel-upstream-id-spoof",
+      "category": "kernel",
+      "title": "上游随机 ID、随机端口与伪造过滤",
+      "runner": "kernel",
+      "profiles": [
+        "kernel",
+        "release"
+      ],
+      "assertions": [
+        "上游 ID 不直接沿用客户端 ID；受控样本记录端口变化",
+        "错误 ID/问题回答不可污染正确回答；端口样本多样性不等于随机性安全证明"
+      ],
+      "status": "automated",
+      "entrypoint": "c/tests/nft_kernel_cli_test.py",
+      "selector": "upstream-id-spoof",
+      "execution_group": "kernel-cli",
+      "requirements": [
+        "Linux",
+        "root",
+        "new-owned-netns",
+        "empty-initial-nftables"
+      ],
+      "evidence": [
+        "result.json",
+        "metrics",
+        "commands"
+      ]
+    },
+    {
+      "id": "network-dns-udp4-a",
+      "category": "network",
+      "title": "UDP / IPv4 传输查询 A",
+      "runner": "probe",
+      "profiles": [
+        "network",
+        "release"
+      ],
+      "assertions": [
+        "校验 DNS ID、question、rcode、记录类型和预期回答",
+        "必须记录实际连接的 DNS 服务器地址及传输族；A/AAAA 不代表 IP 传输族",
+        "失败/缺少端点单独记录，不用另一地址族结果代替"
+      ],
+      "status": "automated",
+      "operation": "dns",
+      "parameters": {
+        "transport": "udp",
+        "family": 4,
+        "qtype": "A"
+      },
+      "requirements": [
+        "explicit-targets"
+      ],
+      "scope": "只证明指定 DNS 入口的真实响应；不单独证明目的网站的路由/隧道出口"
+    },
+    {
+      "id": "network-dns-tcp4-a",
+      "category": "network",
+      "title": "TCP / IPv4 传输查询 A",
+      "runner": "probe",
+      "profiles": [
+        "network",
+        "release"
+      ],
+      "assertions": [
+        "校验 DNS ID、question、rcode、记录类型和预期回答",
+        "必须记录实际连接的 DNS 服务器地址及传输族；A/AAAA 不代表 IP 传输族",
+        "失败/缺少端点单独记录，不用另一地址族结果代替"
+      ],
+      "status": "automated",
+      "operation": "dns",
+      "parameters": {
+        "transport": "tcp",
+        "family": 4,
+        "qtype": "A"
+      },
+      "requirements": [
+        "explicit-targets"
+      ],
+      "scope": "只证明指定 DNS 入口的真实响应；不单独证明目的网站的路由/隧道出口"
+    },
+    {
+      "id": "network-dns-udp6-a",
+      "category": "network",
+      "title": "UDP / IPv6 传输查询 A",
+      "runner": "probe",
+      "profiles": [
+        "network",
+        "release"
+      ],
+      "assertions": [
+        "校验 DNS ID、question、rcode、记录类型和预期回答",
+        "必须记录实际连接的 DNS 服务器地址及传输族；A/AAAA 不代表 IP 传输族",
+        "失败/缺少端点单独记录，不用另一地址族结果代替"
+      ],
+      "status": "automated",
+      "operation": "dns",
+      "parameters": {
+        "transport": "udp",
+        "family": 6,
+        "qtype": "A"
+      },
+      "requirements": [
+        "explicit-targets"
+      ],
+      "scope": "只证明指定 DNS 入口的真实响应；不单独证明目的网站的路由/隧道出口"
+    },
+    {
+      "id": "network-dns-tcp6-a",
+      "category": "network",
+      "title": "TCP / IPv6 传输查询 A",
+      "runner": "probe",
+      "profiles": [
+        "network",
+        "release"
+      ],
+      "assertions": [
+        "校验 DNS ID、question、rcode、记录类型和预期回答",
+        "必须记录实际连接的 DNS 服务器地址及传输族；A/AAAA 不代表 IP 传输族",
+        "失败/缺少端点单独记录，不用另一地址族结果代替"
+      ],
+      "status": "automated",
+      "operation": "dns",
+      "parameters": {
+        "transport": "tcp",
+        "family": 6,
+        "qtype": "A"
+      },
+      "requirements": [
+        "explicit-targets"
+      ],
+      "scope": "只证明指定 DNS 入口的真实响应；不单独证明目的网站的路由/隧道出口"
+    },
+    {
+      "id": "network-dns-udp4-aaaa",
+      "category": "network",
+      "title": "UDP / IPv4 传输查询 AAAA",
+      "runner": "probe",
+      "profiles": [
+        "network",
+        "release"
+      ],
+      "assertions": [
+        "校验 DNS ID、question、rcode、记录类型和预期回答",
+        "必须记录实际连接的 DNS 服务器地址及传输族；A/AAAA 不代表 IP 传输族",
+        "失败/缺少端点单独记录，不用另一地址族结果代替"
+      ],
+      "status": "automated",
+      "operation": "dns",
+      "parameters": {
+        "transport": "udp",
+        "family": 4,
+        "qtype": "AAAA"
+      },
+      "requirements": [
+        "explicit-targets"
+      ],
+      "scope": "只证明指定 DNS 入口的真实响应；不单独证明目的网站的路由/隧道出口"
+    },
+    {
+      "id": "network-dns-tcp4-aaaa",
+      "category": "network",
+      "title": "TCP / IPv4 传输查询 AAAA",
+      "runner": "probe",
+      "profiles": [
+        "network",
+        "release"
+      ],
+      "assertions": [
+        "校验 DNS ID、question、rcode、记录类型和预期回答",
+        "必须记录实际连接的 DNS 服务器地址及传输族；A/AAAA 不代表 IP 传输族",
+        "失败/缺少端点单独记录，不用另一地址族结果代替"
+      ],
+      "status": "automated",
+      "operation": "dns",
+      "parameters": {
+        "transport": "tcp",
+        "family": 4,
+        "qtype": "AAAA"
+      },
+      "requirements": [
+        "explicit-targets"
+      ],
+      "scope": "只证明指定 DNS 入口的真实响应；不单独证明目的网站的路由/隧道出口"
+    },
+    {
+      "id": "network-dns-udp6-aaaa",
+      "category": "network",
+      "title": "UDP / IPv6 传输查询 AAAA",
+      "runner": "probe",
+      "profiles": [
+        "network",
+        "release"
+      ],
+      "assertions": [
+        "校验 DNS ID、question、rcode、记录类型和预期回答",
+        "必须记录实际连接的 DNS 服务器地址及传输族；A/AAAA 不代表 IP 传输族",
+        "失败/缺少端点单独记录，不用另一地址族结果代替"
+      ],
+      "status": "automated",
+      "operation": "dns",
+      "parameters": {
+        "transport": "udp",
+        "family": 6,
+        "qtype": "AAAA"
+      },
+      "requirements": [
+        "explicit-targets"
+      ],
+      "scope": "只证明指定 DNS 入口的真实响应；不单独证明目的网站的路由/隧道出口"
+    },
+    {
+      "id": "network-dns-tcp6-aaaa",
+      "category": "network",
+      "title": "TCP / IPv6 传输查询 AAAA",
+      "runner": "probe",
+      "profiles": [
+        "network",
+        "release"
+      ],
+      "assertions": [
+        "校验 DNS ID、question、rcode、记录类型和预期回答",
+        "必须记录实际连接的 DNS 服务器地址及传输族；A/AAAA 不代表 IP 传输族",
+        "失败/缺少端点单独记录，不用另一地址族结果代替"
+      ],
+      "status": "automated",
+      "operation": "dns",
+      "parameters": {
+        "transport": "tcp",
+        "family": 6,
+        "qtype": "AAAA"
+      },
+      "requirements": [
+        "explicit-targets"
+      ],
+      "scope": "只证明指定 DNS 入口的真实响应；不单独证明目的网站的路由/隧道出口"
+    },
+    {
+      "id": "network-http-cn-ipv4",
+      "category": "network",
+      "title": "cn HTTP(S) / IPv4 真实请求",
+      "runner": "probe",
+      "profiles": [
+        "network",
+        "release"
+      ],
+      "assertions": [
+        "使用明确的目标 URL、地址族、响应状态或内容断言",
+        "记录连接地址、耗时、响应和失败；禁止从系统代理成功推断路由成功"
+      ],
+      "status": "automated",
+      "operation": "http",
+      "parameters": {
+        "region": "cn",
+        "answer_family": 4
+      },
+      "requirements": [
+        "explicit-targets"
+      ],
+      "scope": "HTTP 应用请求，不等同人工浏览器渲染；路由/mark/出口归属需额外采证"
+    },
+    {
+      "id": "network-ws-cn-ipv4",
+      "category": "network",
+      "title": "cn WebSocket / IPv4 稳定性",
+      "runner": "probe",
+      "profiles": [
+        "network",
+        "stability",
+        "release"
+      ],
+      "assertions": [
+        "握手有效后按配置持续保活，记录断开/超时/往返时间",
+        "连接结束需统计持续时长和预期消息；不能仅以一次 HTTP 101 算稳定",
+        "没有可访问 IPv6 端点时明确未覆盖"
+      ],
+      "status": "automated",
+      "operation": "websocket",
+      "parameters": {
+        "region": "cn",
+        "duration": 1800,
+        "answer_family": 4
+      },
+      "requirements": [
+        "explicit-targets"
+      ],
+      "scope": "主动真实网络请求；默认目录/计划不会访问任何公网地址"
+    },
+    {
+      "id": "network-http-cn-ipv6",
+      "category": "network",
+      "title": "cn HTTP(S) / IPv6 真实请求",
+      "runner": "probe",
+      "profiles": [
+        "network",
+        "release"
+      ],
+      "assertions": [
+        "使用明确的目标 URL、地址族、响应状态或内容断言",
+        "记录连接地址、耗时、响应和失败；禁止从系统代理成功推断路由成功"
+      ],
+      "status": "automated",
+      "operation": "http",
+      "parameters": {
+        "region": "cn",
+        "answer_family": 6
+      },
+      "requirements": [
+        "explicit-targets"
+      ],
+      "scope": "HTTP 应用请求，不等同人工浏览器渲染；路由/mark/出口归属需额外采证"
+    },
+    {
+      "id": "network-ws-cn-ipv6",
+      "category": "network",
+      "title": "cn WebSocket / IPv6 稳定性",
+      "runner": "probe",
+      "profiles": [
+        "network",
+        "stability",
+        "release"
+      ],
+      "assertions": [
+        "握手有效后按配置持续保活，记录断开/超时/往返时间",
+        "连接结束需统计持续时长和预期消息；不能仅以一次 HTTP 101 算稳定",
+        "没有可访问 IPv6 端点时明确未覆盖"
+      ],
+      "status": "automated",
+      "operation": "websocket",
+      "parameters": {
+        "region": "cn",
+        "duration": 1800,
+        "answer_family": 6
+      },
+      "requirements": [
+        "explicit-targets"
+      ],
+      "scope": "主动真实网络请求；默认目录/计划不会访问任何公网地址"
+    },
+    {
+      "id": "network-http-foreign-ipv4",
+      "category": "network",
+      "title": "foreign HTTP(S) / IPv4 真实请求",
+      "runner": "probe",
+      "profiles": [
+        "network",
+        "release"
+      ],
+      "assertions": [
+        "使用明确的目标 URL、地址族、响应状态或内容断言",
+        "记录连接地址、耗时、响应和失败；禁止从系统代理成功推断路由成功"
+      ],
+      "status": "automated",
+      "operation": "http",
+      "parameters": {
+        "region": "foreign",
+        "answer_family": 4
+      },
+      "requirements": [
+        "explicit-targets"
+      ],
+      "scope": "HTTP 应用请求，不等同人工浏览器渲染；路由/mark/出口归属需额外采证"
+    },
+    {
+      "id": "network-ws-foreign-ipv4",
+      "category": "network",
+      "title": "foreign WebSocket / IPv4 稳定性",
+      "runner": "probe",
+      "profiles": [
+        "network",
+        "stability",
+        "release"
+      ],
+      "assertions": [
+        "握手有效后按配置持续保活，记录断开/超时/往返时间",
+        "连接结束需统计持续时长和预期消息；不能仅以一次 HTTP 101 算稳定",
+        "没有可访问 IPv6 端点时明确未覆盖"
+      ],
+      "status": "automated",
+      "operation": "websocket",
+      "parameters": {
+        "region": "foreign",
+        "duration": 1800,
+        "answer_family": 4
+      },
+      "requirements": [
+        "explicit-targets"
+      ],
+      "scope": "主动真实网络请求；默认目录/计划不会访问任何公网地址"
+    },
+    {
+      "id": "network-http-foreign-ipv6",
+      "category": "network",
+      "title": "foreign HTTP(S) / IPv6 真实请求",
+      "runner": "probe",
+      "profiles": [
+        "network",
+        "release"
+      ],
+      "assertions": [
+        "使用明确的目标 URL、地址族、响应状态或内容断言",
+        "记录连接地址、耗时、响应和失败；禁止从系统代理成功推断路由成功"
+      ],
+      "status": "automated",
+      "operation": "http",
+      "parameters": {
+        "region": "foreign",
+        "answer_family": 6
+      },
+      "requirements": [
+        "explicit-targets"
+      ],
+      "scope": "HTTP 应用请求，不等同人工浏览器渲染；路由/mark/出口归属需额外采证"
+    },
+    {
+      "id": "network-ws-foreign-ipv6",
+      "category": "network",
+      "title": "foreign WebSocket / IPv6 稳定性",
+      "runner": "probe",
+      "profiles": [
+        "network",
+        "stability",
+        "release"
+      ],
+      "assertions": [
+        "握手有效后按配置持续保活，记录断开/超时/往返时间",
+        "连接结束需统计持续时长和预期消息；不能仅以一次 HTTP 101 算稳定",
+        "没有可访问 IPv6 端点时明确未覆盖"
+      ],
+      "status": "automated",
+      "operation": "websocket",
+      "parameters": {
+        "region": "foreign",
+        "duration": 1800,
+        "answer_family": 6
+      },
+      "requirements": [
+        "explicit-targets"
+      ],
+      "scope": "主动真实网络请求；默认目录/计划不会访问任何公网地址"
+    },
+    {
+      "id": "cold-udp-a",
+      "category": "performance",
+      "title": "冷缓存 UDP A",
+      "runner": "device",
+      "profiles": [
+        "device-smoke",
+        "device-performance",
+        "ablation",
+        "release"
+      ],
+      "assertions": [
+        "每场景新测试进程并清空本次拥有的两个 nftset；不得清空正式 set 或系统 conntrack",
+        "冷缓存使用唯一名字，热缓存先预热；原始逐请求样本保留",
+        "分别报告 planned/sent/succeeded/failed/unsent 与漏发原因、P50/P99/max",
+        "严格 QPS 通过要求全部计划时隙按时发送且所有回答有效；unsent>0 不算严格通过",
+        "A/AAAA 学习的实际地址集合与预期值核对；TCP 冷查询不得用预热混合结果替代"
+      ],
+      "status": "automated",
+      "scenario": "cold-udp-a",
+      "parameters": {
+        "qps": 500,
+        "duration_seconds": 5,
+        "transport": "udp",
+        "qtype": "A",
+        "cache": "cold",
+        "nftset_fast": 1,
+        "workers": 32,
+        "fixture_ttl_seconds": 30
+      },
+      "evidence": [
+        "raw request samples",
+        "before/after device state",
+        "nftset membership",
+        "application logs"
+      ],
+      "scope": "受控 LAN fixture 的应用路径性能；不是公网 DNS 上游或浏览器速度"
+    },
+    {
+      "id": "cold-udp-aaaa",
+      "category": "performance",
+      "title": "冷缓存 UDP AAAA",
+      "runner": "device",
+      "profiles": [
+        "device-smoke",
+        "device-performance",
+        "ablation",
+        "release"
+      ],
+      "assertions": [
+        "每场景新测试进程并清空本次拥有的两个 nftset；不得清空正式 set 或系统 conntrack",
+        "冷缓存使用唯一名字，热缓存先预热；原始逐请求样本保留",
+        "分别报告 planned/sent/succeeded/failed/unsent 与漏发原因、P50/P99/max",
+        "严格 QPS 通过要求全部计划时隙按时发送且所有回答有效；unsent>0 不算严格通过",
+        "A/AAAA 学习的实际地址集合与预期值核对；TCP 冷查询不得用预热混合结果替代"
+      ],
+      "status": "automated",
+      "scenario": "cold-udp-aaaa",
+      "parameters": {
+        "qps": 500,
+        "duration_seconds": 5,
+        "transport": "udp",
+        "qtype": "AAAA",
+        "cache": "cold",
+        "nftset_fast": 1,
+        "workers": 32,
+        "fixture_ttl_seconds": 30
+      },
+      "evidence": [
+        "raw request samples",
+        "before/after device state",
+        "nftset membership",
+        "application logs"
+      ],
+      "scope": "受控 LAN fixture 的应用路径性能；不是公网 DNS 上游或浏览器速度"
+    },
+    {
+      "id": "cold-tcp-mixed",
+      "category": "performance",
+      "title": "冷缓存 TCP A/AAAA 混合",
+      "runner": "device",
+      "profiles": [
+        "device-smoke",
+        "device-performance",
+        "ablation",
+        "release"
+      ],
+      "assertions": [
+        "每场景新测试进程并清空本次拥有的两个 nftset；不得清空正式 set 或系统 conntrack",
+        "冷缓存使用唯一名字，热缓存先预热；原始逐请求样本保留",
+        "分别报告 planned/sent/succeeded/failed/unsent 与漏发原因、P50/P99/max",
+        "严格 QPS 通过要求全部计划时隙按时发送且所有回答有效；unsent>0 不算严格通过",
+        "A/AAAA 学习的实际地址集合与预期值核对；TCP 冷查询不得用预热混合结果替代"
+      ],
+      "status": "automated",
+      "scenario": "cold-tcp-mixed",
+      "parameters": {
+        "qps": 100,
+        "duration_seconds": 5,
+        "transport": "tcp",
+        "qtype": "mixed",
+        "cache": "cold",
+        "nftset_fast": 1,
+        "workers": 32,
+        "fixture_ttl_seconds": 30
+      },
+      "evidence": [
+        "raw request samples",
+        "before/after device state",
+        "nftset membership",
+        "application logs"
+      ],
+      "scope": "受控 LAN fixture 的应用路径性能；不是公网 DNS 上游或浏览器速度"
+    },
+    {
+      "id": "hot-tcp-mixed",
+      "category": "performance",
+      "title": "热缓存 TCP A/AAAA 混合",
+      "runner": "device",
+      "profiles": [
+        "device-smoke",
+        "device-performance",
+        "ablation",
+        "release"
+      ],
+      "assertions": [
+        "每场景新测试进程并清空本次拥有的两个 nftset；不得清空正式 set 或系统 conntrack",
+        "冷缓存使用唯一名字，热缓存先预热；原始逐请求样本保留",
+        "分别报告 planned/sent/succeeded/failed/unsent 与漏发原因、P50/P99/max",
+        "严格 QPS 通过要求全部计划时隙按时发送且所有回答有效；unsent>0 不算严格通过",
+        "主统计保留建连初始样本；剔除前 0.5 秒只能作为额外标注的诊断视图"
+      ],
+      "status": "automated",
+      "scenario": "hot-tcp-mixed",
+      "parameters": {
+        "qps": 100,
+        "duration_seconds": 5,
+        "transport": "tcp",
+        "qtype": "mixed",
+        "cache": "hot",
+        "nftset_fast": 1,
+        "workers": 32,
+        "fixture_ttl_seconds": 30
+      },
+      "evidence": [
+        "raw request samples",
+        "before/after device state",
+        "nftset membership",
+        "application logs"
+      ],
+      "scope": "受控 LAN fixture 的应用路径性能；不是公网 DNS 上游或浏览器速度"
+    },
+    {
+      "id": "hot-udp-mixed",
+      "category": "performance",
+      "title": "热缓存 UDP A/AAAA 混合及 TTL 刷新",
+      "runner": "device",
+      "profiles": [
+        "device-smoke",
+        "device-performance",
+        "ablation",
+        "release"
+      ],
+      "assertions": [
+        "每场景新测试进程并清空本次拥有的两个 nftset；不得清空正式 set 或系统 conntrack",
+        "冷缓存使用唯一名字，热缓存先预热；原始逐请求样本保留",
+        "分别报告 planned/sent/succeeded/failed/unsent 与漏发原因、P50/P99/max",
+        "严格 QPS 通过要求全部计划时隙按时发送且所有回答有效；unsent>0 不算严格通过",
+        "45 秒跨过 fixture TTL=30；完整窗口与前/后 10 秒各自报告，不删除刷新尖峰"
+      ],
+      "status": "automated",
+      "scenario": "hot-udp-mixed",
+      "parameters": {
+        "qps": 2000,
+        "duration_seconds": 45,
+        "transport": "udp",
+        "qtype": "mixed",
+        "cache": "hot",
+        "nftset_fast": 1,
+        "workers": 32,
+        "fixture_ttl_seconds": 30
+      },
+      "evidence": [
+        "raw request samples",
+        "before/after device state",
+        "nftset membership",
+        "application logs"
+      ],
+      "scope": "受控 LAN fixture 的应用路径性能；不是公网 DNS 上游或浏览器速度"
+    },
+    {
+      "id": "device-order-matrix",
+      "category": "methodology",
+      "title": "正序/倒序六轮、版本间可比性",
+      "runner": "audit",
+      "profiles": [
+        "device-performance",
+        "ablation",
+        "release"
+      ],
+      "assertions": [
+        "每个版本正序 3 次、倒序 3 次；各场景汇总六次 P99 的中位数",
+        "保留每轮 P50/P99/max、方向和原始请求；不能合并所有请求后冒充轮次中位数",
+        "版本固定相同 CPU/worker、规则、缓存、fixture、负载与协议参数",
+        "不同硬件/后端/构建 profile 的结果分组，缺轮不能报告为完整矩阵"
+      ],
+      "status": "automated",
+      "parameters": {
+        "forward_rounds": 3,
+        "reverse_rounds": 3
+      },
+      "scope": "汇总方法；必须由实际完成的矩阵提供证据"
+    },
+    {
+      "id": "device-resources",
+      "category": "resources",
+      "title": "资源、conntrack 与设备完整性",
+      "runner": "audit",
+      "profiles": [
+        "device-smoke",
+        "device-performance",
+        "ablation",
+        "stability",
+        "release"
+      ],
+      "assertions": [
+        "记录 boot_id、生产程序/配置哈希、内核/OOM、内存、FD 与 conntrack 可取得指标",
+        "发生异常重启、生产哈希变化、OOM 或 watchdog 中止时立即停止压力并标记中止",
+        "conntrack 报全局净变化和采样时刻；枚举差集不能称精确新连接数",
+        "不足权限/缺工具的指标标记 unavailable，不填 0"
+      ],
+      "status": "automated",
+      "scope": "自动设备 adapter 提供的指标以其结果为准；未采集的 FD/CPU 不可声称已检查"
+    },
+    {
+      "id": "device-cleanup",
+      "category": "isolation",
+      "title": "隔离、回退与正式 DNS 后验检查",
+      "runner": "audit",
+      "profiles": [
+        "device-smoke",
+        "device-performance",
+        "ablation",
+        "stability",
+        "release"
+      ],
+      "assertions": [
+        "仅使用本次拥有的临时目录、进程、端口、cgroup 和 nft table",
+        "finally/异常清理保留证据；生产二进制、配置和 boot_id 前后一致",
+        "清理后校验 boot_id 与生产文件摘要；若未额外请求正式 DNS，必须注明正式 DNS 后验请求未覆盖",
+        "不得安装实验 APK、接管正式 53 端口或修改正式路由"
+      ],
+      "status": "automated",
+      "scope": "测试环境清理和正式服务无改动校验；不是生产升级/降级回退演练"
+    },
+    {
+      "id": "sustained-dns",
+      "category": "stability",
+      "title": "同一 DNS 服务进程的 30 分钟分片负载观测",
+      "runner": "device",
+      "profiles": [
+        "stability"
+      ],
+      "assertions": [
+        "同一个 C 服务进程跨越各个负载分片，记录进程身份；分片间不重启或 flush",
+        "默认累计负载 1800 秒，以 60 秒客户端分片取样；分片间观测间隔如实记录",
+        "每片保留原始样本、时隙/成功率和资源证据，失败不能由其他片平均掩盖",
+        "分片间存在观测间隔，不能称连续无间断的 30 分钟固定到达率；客户端/TCP连接也不是单连接"
+      ],
+      "status": "automated",
+      "parameters": {
+        "duration_seconds": 1800,
+        "segment_seconds": 60,
+        "qps": 500
+      }
+    },
+    {
+      "id": "routing-cnx",
+      "category": "manual",
+      "title": "CN-site/CN-IP/境外路由与 WireGuard 出口",
+      "runner": "manual",
+      "profiles": [
+        "release"
+      ],
+      "assertions": [
+        "必须提供独立执行记录后才能计为通过",
+        "未执行时状态为 manual/uncovered，不能被其他场景自动覆盖"
+      ],
+      "status": "manual",
+      "reason": "同时覆盖 CN-site 国内地址、CN-site 境外地址、非 CN-site 国内 IP、纯境外目的地；记录实际目的 IP、nft 命中/mark、路由与出口。DNS 成功不能替代此证据。"
+    },
+    {
+      "id": "routing-vpn-lan-router",
+      "category": "manual",
+      "title": "LAN、路由器本机和外部 VPN 入口",
+      "runner": "manual",
+      "profiles": [
+        "release"
+      ],
+      "assertions": [
+        "必须提供独立执行记录后才能计为通过",
+        "未执行时状态为 manual/uncovered，不能被其他场景自动覆盖"
+      ],
+      "status": "manual",
+      "reason": "分别从三个来源建立新连接，验证 IPv4/IPv6 的直连/隧道出口及豁免。测试不能通过切换正式路由影响无关业务。"
+    },
+    {
+      "id": "package-install-upgrade",
+      "category": "manual",
+      "title": "APK 首装、升级、卸载与配置保留",
+      "runner": "manual",
+      "profiles": [
+        "release"
+      ],
+      "assertions": [
+        "必须提供独立执行记录后才能计为通过",
+        "未执行时状态为 manual/uncovered，不能被其他场景自动覆盖"
+      ],
+      "status": "manual",
+      "reason": "核对安装前后文件/服务权限、启动配置、包完整性、升级/卸载路径；需要具体设备和备份回退计划。"
+    },
+    {
+      "id": "degraded-recovery",
+      "category": "manual",
+      "title": "DNS 降级及恢复、隧道故障和 PPP 重拨",
+      "runner": "manual",
+      "profiles": [
+        "release"
+      ],
+      "assertions": [
+        "必须提供独立执行记录后才能计为通过",
+        "未执行时状态为 manual/uncovered，不能被其他场景自动覆盖"
+      ],
+      "status": "manual",
+      "reason": "注入故障后核对业务 DNS、DDNS 和 VPN，再恢复并验证；现有清理脚本不等于产品已实现自动恢复。"
+    },
+    {
+      "id": "reboot-persistence",
+      "category": "manual",
+      "title": "路由器重启与持久化",
+      "runner": "manual",
+      "profiles": [
+        "release"
+      ],
+      "assertions": [
+        "必须提供独立执行记录后才能计为通过",
+        "未执行时状态为 manual/uncovered，不能被其他场景自动覆盖"
+      ],
+      "status": "manual",
+      "reason": "重启后校验服务、端口、路由、nftset 重建和真实请求；本轮不自动重启路由器。"
+    },
+    {
+      "id": "conntrack-ablation",
+      "category": "manual",
+      "title": "socket 系统调用与 conntrack 成本分离",
+      "runner": "manual",
+      "profiles": [
+        "release"
+      ],
+      "assertions": [
+        "必须提供独立执行记录后才能计为通过",
+        "未执行时状态为 manual/uncovered，不能被其他场景自动覆盖"
+      ],
+      "status": "manual",
+      "reason": "设备追踪/受控 NOTRACK 对照须单独设计并获得范围授权；全局 conntrack 增长本身不能拆分耗时。"
+    },
+    {
+      "id": "browser-render",
+      "category": "manual",
+      "title": "浏览器实际页面加载",
+      "runner": "manual",
+      "profiles": [
+        "release"
+      ],
+      "assertions": [
+        "必须提供独立执行记录后才能计为通过",
+        "未执行时状态为 manual/uncovered，不能被其他场景自动覆盖"
+      ],
+      "status": "manual",
+      "reason": "需要真实浏览器渲染/资源瀑布/应用内容验收；HTTP GET 返回 200 不能称网页完整打开。"
+    },
+    {
+      "id": "ipv6-prefix-limit",
+      "category": "manual",
+      "title": "IPv6 /64 分布式慢连接限制",
+      "runner": "manual",
+      "profiles": [
+        "release"
+      ],
+      "assertions": [
+        "必须提供独立执行记录后才能计为通过",
+        "未执行时状态为 manual/uncovered，不能被其他场景自动覆盖"
+      ],
+      "status": "manual",
+      "reason": "现有每 IP 限额按完整地址，不把单地址通过推广到 /64 攻击覆盖；需隔离环境额外用例。"
+    },
+    {
+      "id": "randomness-audit",
+      "category": "manual",
+      "title": "源端口/ID 熵与安全审计",
+      "runner": "manual",
+      "profiles": [
+        "release"
+      ],
+      "assertions": [
+        "必须提供独立执行记录后才能计为通过",
+        "未执行时状态为 manual/uncovered，不能被其他场景自动覆盖"
+      ],
+      "status": "manual",
+      "reason": "采样 ID 与端口变化只验证行为，不是密码随机性证明；需要另行统计/安全设计审查。"
+    },
+    {
+      "id": "sustained-uninterrupted-dns",
+      "category": "stability",
+      "title": "无分片间隔的 30 分钟固定到达率",
+      "runner": "device",
+      "profiles": [
+        "stability"
+      ],
+      "assertions": [
+        "同一服务进程和客户端连续固定到达率 1800 秒",
+        "不以分片间暂停、重启或清空集合替代"
+      ],
+      "status": "planned",
+      "reason": "现有负载工具以最长 60 秒分片运行，分片之间需快照；无间断长时间调度尚未实现"
+    },
+    {
+      "id": "performance-foreign-control",
+      "category": "performance",
+      "title": "纯境外不写集路径性能对照",
+      "runner": "device",
+      "profiles": [
+        "device-performance",
+        "ablation",
+        "release"
+      ],
+      "assertions": [
+        "同一上游延迟下比较国内写集和境外不写集的冷热 A/AAAA UDP/TCP",
+        "确认境外回答不进入 CN set，保留路由规则和实际负载参数"
+      ],
+      "status": "planned",
+      "reason": "当前五场景以 CN-site + nftset_fast=1 为固定基准，尚未添加境外性能 fixture 及独立对照矩阵"
+    },
+    {
+      "id": "performance-nft-modes",
+      "category": "performance",
+      "title": "普通/interval 集合和 fast 开关性能矩阵",
+      "runner": "device",
+      "profiles": [
+        "device-performance",
+        "ablation",
+        "release"
+      ],
+      "assertions": [
+        "比较 nftset_fast=0 普通 set、nftset_fast=0 interval 与 nftset_fast=1 普通 set",
+        "功能正确性、地址成员和 fork/netlink 行为证据与性能数据分别记录"
+      ],
+      "status": "planned",
+      "reason": "现有内核/契约功能测试覆盖这些路径，但设备性能 adapter 尚未自动做三种配置矩阵"
+    },
+    {
+      "id": "performance-cache-workingset",
+      "category": "performance",
+      "title": "冷热混合、缓存关闭和超容量工作集",
+      "runner": "device",
+      "profiles": [
+        "device-performance",
+        "ablation",
+        "release"
+      ],
+      "assertions": [
+        "显式冷热比例、cache_size=0 及超过容量工作集",
+        "记录成功/漏发、P50/P99/max 与内存变化；验证缓存淘汰不污染回答"
+      ],
+      "status": "planned",
+      "reason": "现有性能场景仅纯冷和预热混合，不把它们替代真实混合命中率/淘汰压力实验"
+    },
+    {
+      "id": "performance-saturation-recovery",
+      "category": "performance",
+      "title": "阶梯加压、饱和与降载恢复",
+      "runner": "device",
+      "profiles": [
+        "device-performance",
+        "ablation",
+        "release"
+      ],
+      "assertions": [
+        "负载阶梯保持固定到达率，记录客户端漏发与服务端错误",
+        "降回基准负载后服务恢复且资源回落，不能以高峰后手动重启代替恢复"
+      ],
+      "status": "planned",
+      "reason": "当前固定负载矩阵尚未编排阶梯/恢复；需显式设备安全上限，不能无限加压"
+    }
+  ]
+}
