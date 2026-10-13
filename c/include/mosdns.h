@@ -92,6 +92,9 @@ int md_forward(const md_upstream *us, size_t count, unsigned concurrent,
  * Unscoped/library calls keep fresh sockets. Allocation failure also stays fresh. */
 void md_forward_worker_enable(void);
 void md_forward_worker_cleanup(void);
+/* Called by a worker after replying: closes used UDP sockets and pre-opens a
+ * fresh single-use UDP socket per recently used upstream (M4 port randomness). */
+void md_forward_worker_idle(void);
 
 /* nft 对象负责提取响应 Answer 中 IN 类 A/AAAA 并更新既有集合。
  * 创建只解析参数，Linux 写入在 apply 执行；销毁前调用方须确保所有
@@ -100,6 +103,9 @@ typedef struct md_nft md_nft;
 md_nft *md_nft_new(const char *args, char *err);
 int md_nft_enable_fast(md_nft *n, char *err);
 int md_nft_apply(md_nft *n, const md_packet *r, char *err);
+/* 只读检查兼容路径的目标集合，interval set 缺少 auto-merge 时向 stderr 告警；
+ * 读取失败时静默，不改变内核状态，也不影响返回结果。 */
+void md_nft_audit(const md_nft *n);
 void md_nft_free(md_nft *n);
 
 /* engine 拥有不可变分流配置、规则、缓存、nft 和监听器。

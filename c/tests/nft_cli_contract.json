@@ -1,29 +1,29 @@
 {
   "ipv4-plain": [
     0,
-    1
+    0
   ],
   "ipv4-interval": [
     0,
-    2
+    1
   ],
   "ipv6-plain": [
     0,
-    1
+    0
   ],
   "ipv6-interval": [
-    0,
-    2
-  ],
-  "underscore-name": [
-    0,
-    1
-  ],
-  "maximum-name": [
     0,
     1
   ],
   "no-answer-does-not-spawn": [
+    0,
+    0
+  ],
+  "underscore-name": [
+    0,
+    0
+  ],
+  "maximum-name": [
     0,
     0
   ],
@@ -61,14 +61,22 @@
   ],
   "update-nonzero-exit": [
     4,
-    2
+    1
   ],
   "reject-malformed-metadata": [
     4,
-    1
+    0
   ],
   "update-bounded-timeout": [
     4,
+    1
+  ],
+  "ipv4-interval-overlap-skipped": [
+    0,
+    2
+  ],
+  "ipv6-interval-overlap-skipped": [
+    0,
     2
   ],
   "fast-dedup-ipv4": [
@@ -216,11 +224,11 @@
     0
   ],
   "fast-large-answer-ipv4": [
-    4,
+    0,
     0
   ],
   "fast-large-answer-ipv6": [
-    4,
+    0,
     0
   ],
   "fast-cohort-ipv4": [

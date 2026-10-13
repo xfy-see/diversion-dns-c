@@ -257,10 +257,13 @@ static int build_config(md_engine *e, const config *c, const char *path, char *e
     if (config_number(c, NFT_FAST, 0, 0, 1, false, &fast, path, err)) return -1;
     if (fast && (!e->nft || md_nft_enable_fast(e->nft, err)))
         return config_error(err, path, key_line(c, NFT_FAST), e->nft ? err : "nftset_fast requires a target");
+    /* Read-only GETSET: warn (never fail) about interval targets lacking auto-merge. */
+    md_nft_audit(e->nft);
     e->cn = md_domain_new();
     if (!e->cn) return config_error(err, path, key_line(c, CN_FILE), "out of memory");
     /* check reads actual rule files and compiles PCRE2, but never opens a
-     * listener/upstream connection, probes nft, or changes kernel state.
+     * listener/upstream connection or changes kernel state; the only nft access
+     * is the read-only metadata warning above.
      * A named IPv6 scope is resolved against the host interface list. */
     for (size_t i = 0; i < c->keys[CN_FILE].count; i++) {
         const config_value *v = &c->keys[CN_FILE].values[i];

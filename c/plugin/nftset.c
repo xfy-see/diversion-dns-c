@@ -6,6 +6,7 @@
 #include "mosdns.h"
 #include <arpa/inet.h>
 #include <errno.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -269,44 +270,24 @@ static int run_nft(const char *binary, char *const argv[], int input,
     }
     return 0;
 }
-static bool token_equal(const char *start, size_t len, const char *token) {
-    return strlen(token) == len && !memcmp(start, token, len);
-}
-/* 每笔写入前读取实际集合类型和 interval 标志，不缓存可能过期的
- * 元数据。CLI 文本只解析所需 token，类型缺失或不符立即拒绝写入。 */
-static int inspect_set_text(const nft_target *target, bool *interval, const char *output, char *err) {
-    bool type_seen = false, want_type = false, in_flags = false; *interval = false;
-    const char *p = output;
-    while (*p) {
-        if (*p == '\n' || *p == ';' || *p == '}') in_flags = false;
-        if (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',' || *p == '{' || *p == '}' || *p == ';') { ++p; continue; }
-        const char *start = p;
-        while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r' && *p != ',' && *p != '{' && *p != '}' && *p != ';') ++p;
-        size_t len = (size_t)(p - start);
-        if (want_type) {
-            const char *expected = target->bytes == 4 ? "ipv4_addr" : "ipv6_addr";
-            if (!token_equal(start, len, expected)) { snprintf(err, MD_ERROR_SIZE, "nftset %s/%s/%s is not type %s", target->family, target->table, target->set, expected); return -1; }
-            type_seen = true; want_type = false;
-        } else if (token_equal(start, len, "type")) want_type = true;
-        else if (token_equal(start, len, "flags")) in_flags = true;
-        else if (in_flags && token_equal(start, len, "interval")) *interval = true;
-    }
-    if (!type_seen) { snprintf(err, MD_ERROR_SIZE, "nftset metadata missing address type"); return -1; }
-    return 0;
-}
 /* 64 KiB 输出缓冲放在堆上：musl 默认线程栈只有 128 KiB。 */
 #define NFT_OUTPUT_SIZE 65536u
-static int inspect_set(const char *binary, const nft_target *target, bool *interval, uint64_t until, char *err) {
-    char *output = malloc(NFT_OUTPUT_SIZE);
-    if (!output) { snprintf(err, MD_ERROR_SIZE, "allocate nft output buffer"); return -1; }
-    /* These are validated identifier tokens, not shell words. Literal quote
-     * characters in argv become quoted-string tokens rejected by nft 1.1.6
-     * in this command position. posix_spawn performs no shell expansion. */
-    char *argv[] = {(char *)binary, "-t", "-nn", "list", "set", (char *)target->family,
-                    (char *)target->table, (char *)target->set, NULL};
-    int rc = run_nft(binary, argv, -1, output, NFT_OUTPUT_SIZE, until, err);
-    if (!rc) rc = inspect_set_text(target, interval, output, err);
-    free(output); return rc;
+/* 数据路径的告警（跳过的元素等）按类别限速：每类最多每 10 秒一行，
+ * 并附上期间被抑制的条数，避免攻击者或异常回答刷屏日志。 */
+enum { NFT_WARN_OVERLAP, NFT_WARN_ANSWER_CAP, NFT_WARN_KINDS };
+static void nft_warn(unsigned kind, const char *format, ...) __attribute__((format(printf, 2, 3)));
+static void nft_warn(unsigned kind, const char *format, ...) {
+    static atomic_uint_fast64_t last[NFT_WARN_KINDS], suppressed[NFT_WARN_KINDS];
+    uint64_t now = milliseconds() + 10001, previous = atomic_load_explicit(&last[kind], memory_order_relaxed);
+    if ((previous && now - previous < 10000) ||
+        !atomic_compare_exchange_strong_explicit(&last[kind], &previous, now, memory_order_relaxed, memory_order_relaxed)) {
+        atomic_fetch_add_explicit(&suppressed[kind], 1, memory_order_relaxed); return;
+    }
+    char text[MD_ERROR_SIZE]; va_list args; va_start(args, format);
+    vsnprintf(text, sizeof(text), format, args); va_end(args);
+    uint64_t skipped = atomic_exchange_explicit(&suppressed[kind], 0, memory_order_relaxed);
+    if (skipped) fprintf(stderr, "nftset warning: %s (%llu similar warnings suppressed)\n", text, (unsigned long long)skipped);
+    else fprintf(stderr, "nftset warning: %s\n", text);
 }
 /* Wire helper constants are portable for memory tests; bind them to Linux UAPI. */
 _Static_assert(sizeof(struct nlmsghdr) == 16 && sizeof(struct nfgenmsg) == 4 && sizeof(struct nlattr) == 4, "netlink ABI layout");
@@ -410,21 +391,24 @@ static void nft_retry_backoff(unsigned attempt, uint64_t until) {
     struct timespec pause = {0, (long)delay * 1000000L};
     nanosleep(&pause, NULL);
 }
-/* 用 netlink GETSET 读取集合元数据，代替 generation 窗口内的第二次 nft CLI：
- * 窗口从一次 fork/exec（毫秒级）缩短到两次往返（微秒级），并发写者下
- * 不再几乎必然冲突。只接受键类型/长度匹配、非 interval/map 的普通集合。 */
-static int nft_nl_plain_metadata(int fd, uint32_t port, uint32_t seq, const nft_target *t,
-                                 uint8_t *receive, uint64_t until, char *err) {
-    uint8_t request[320]; md_nl_requests requests; size_t length; int kernel_errno = 0;
+/* 用 netlink GETSET 读取集合元数据（类型、键长、flags），不再 fork
+ * `nft list set`：GETSET 回复本身带 NFTA_SET_FLAGS，可以直接判断 interval。
+ * 只接受键类型/长度匹配、非 map/object/concat 的地址集合；interval 由
+ * *interval 报告，调用方改走 nft -f。automerge 可为 NULL。 */
+#define NFT_INTERVAL 2
+static int nft_nl_metadata(int fd, uint32_t port, uint32_t seq, const nft_target *t,
+                           uint8_t *receive, uint64_t until, bool *interval, bool *automerge, char *err) {
+    uint8_t request[320]; md_nl_requests requests; size_t length; int kernel_errno = 0; uint32_t flags = 0;
     uint8_t family = !strcmp(t->family, "inet") ? 1 : !strcmp(t->family, "ip") ? 2 : 10;
     if (md_nft_nl_getset_encode(request, sizeof(request), &requests, port, seq, family, t->table, t->set)) {
         snprintf(err, MD_ERROR_SIZE, "encode nft set metadata query"); return -1;
     }
     if (nft_nl_send(fd, request, requests.length, until, err) || nft_nl_receive(fd, receive, MD_NL_BUFFER_SIZE, &length, until, err)) return -1;
-    if (md_nft_nl_plain_set_consume(&requests, receive, length, family, t->table, t->set, t->bytes, &kernel_errno)) {
-        snprintf(err, MD_ERROR_SIZE, "nftset %s/%s/%s is not a plain %s set (changed during metadata check?)", t->family, t->table, t->set, t->bytes == 4 ? "ipv4_addr" : "ipv6_addr"); return -1;
+    if (md_nft_nl_set_inspect(&requests, receive, length, family, t->table, t->set, t->bytes, &kernel_errno, 2, &flags, automerge)) {
+        snprintf(err, MD_ERROR_SIZE, "nftset %s/%s/%s is not a supported %s set (changed during metadata check?)", t->family, t->table, t->set, t->bytes == 4 ? "ipv4_addr" : "ipv6_addr"); return -1;
     }
     if (kernel_errno) { snprintf(err, MD_ERROR_SIZE, "nft set metadata: %s", strerror(kernel_errno)); return -1; }
+    *interval = (flags & 4u) != 0;
     return 0;
 }
 /* 使用独立 netlink socket 和序列号范围，避免混入其他事务的 ACK。
@@ -441,10 +425,12 @@ static int add_plain_attempt(const nft_target *t, const nft_keys *values, uint8_
     if (bind(fd, (struct sockaddr *)&local, sizeof(local)) || getsockname(fd, (struct sockaddr *)&local, &size) || size != sizeof(local) || local.nl_family != AF_NETLINK || !local.nl_pid || local.nl_groups) {
         snprintf(err, MD_ERROR_SIZE, "bind private nft netlink port: %s", strerror(errno)); goto done;
     }
-    uint32_t before, after;
+    uint32_t before, after; bool interval = false;
     if (nft_nl_generation(fd, local.nl_pid, ticket, receive, until, &before, err) ||
-        nft_nl_plain_metadata(fd, local.nl_pid, ticket + 1, t, receive, until, err) ||
-        nft_nl_generation(fd, local.nl_pid, ticket + 2, receive, until, &after, err)) goto done;
+        nft_nl_metadata(fd, local.nl_pid, ticket + 1, t, receive, until, &interval, NULL, err)) goto done;
+    /* interval set：前缀/区间语义交给 nft -f，不再额外 fork `nft list set`。 */
+    if (interval) { snprintf(err, MD_ERROR_SIZE, "nftset %s/%s/%s is an interval set", t->family, t->table, t->set); rc = NFT_INTERVAL; goto done; }
+    if (nft_nl_generation(fd, local.nl_pid, ticket + 2, receive, until, &after, err)) goto done;
     if (before != after) { snprintf(err, MD_ERROR_SIZE, "nft ruleset generation changed during metadata check"); rc = NFT_RETRY; goto done; }
     md_nl_requests requests; uint8_t family = !strcmp(t->family, "inet") ? 1 : !strcmp(t->family, "ip") ? 2 : 10;
     if (md_nft_nl_batch_encode(wire, MD_NL_BUFFER_SIZE, &requests, local.nl_pid, ticket + 3, family, t->table, t->set, (const uint8_t (*)[16])values->keys, values->count, t->bytes, after)) { snprintf(err, MD_ERROR_SIZE, "encode bounded nft add batch"); goto done; }
@@ -468,8 +454,9 @@ done:
     if (fd >= 0) close(fd);
     return rc;
 }
+/* 返回 0 成功、-1 失败；NFT_INTERVAL 表示目标是 interval set，尚未写入任何内容。 */
 static int add_plain_target(const nft_target *t, const md_packet *r, uint64_t until, char *err) {
-    /* No fallback after send. Interval targets never enter this function. */
+    /* No fallback after send. Interval targets return before any batch is sent. */
     int rc = -1; uint8_t (*keys)[16] = calloc(MD_NL_MAX_KEYS, sizeof(*keys));
     uint8_t *wire = malloc(MD_NL_BUFFER_SIZE), *receive = malloc(MD_NL_BUFFER_SIZE);
     if (!keys || !wire || !receive) { snprintf(err, MD_ERROR_SIZE, "allocate bounded nft netlink transaction"); goto done; }
@@ -483,56 +470,96 @@ static int add_plain_target(const nft_target *t, const md_packet *r, uint64_t un
         nft_retry_backoff(attempt, until);
     }
 done:
-    free(keys); free(wire); free(receive); return rc ? -1 : 0;
+    free(keys); free(wire); free(receive); return rc == NFT_INTERVAL ? NFT_INTERVAL : rc ? -1 : 0;
 }
-typedef struct { const nft_target *target; FILE *file; bool interval; unsigned count; } nft_write;
-/* DNS RDATA 本身是网络序地址字节。interval 模式将主机位清零后
- * 输出规范前缀；普通模式输出原始完整地址，不对地址应用 mask。 */
-static int write_element(const md_packet *p, const md_rr *rr, void *arg) {
-    nft_write *v = arg;
+/* interval 元素按 mask 清零主机位后去重，保存为文本前缀。 */
+#define NFT_ELEMENT_TEXT (INET6_ADDRSTRLEN + 4)
+typedef struct { const nft_target *target; char (*text)[NFT_ELEMENT_TEXT]; size_t count; } nft_prefixes;
+static int collect_prefix(const md_packet *p, const md_rr *rr, void *arg) {
+    nft_prefixes *v = arg;
     if (rr->section || rr->class_ != 1 || rr->type != (v->target->bytes == 4 ? 1 : 28)) return 0;
     if (rr->data_len != v->target->bytes) return -1;
     uint8_t bytes[16]; memcpy(bytes, p->data + rr->data_offset, rr->data_len);
-    if (v->interval) {
-        unsigned bits = v->target->mask;
-        for (unsigned i = 0; i < v->target->bytes; ++i) {
-            if (bits >= 8) bits -= 8;
-            else { bytes[i] &= bits ? (uint8_t)(0xffu << (8 - bits)) : 0; bits = 0; }
-        }
+    unsigned bits = v->target->mask;
+    for (unsigned i = 0; i < v->target->bytes; ++i) {
+        if (bits >= 8) bits -= 8;
+        else { bytes[i] &= bits ? (uint8_t)(0xffu << (8 - bits)) : 0; bits = 0; }
     }
-    char address[INET6_ADDRSTRLEN];
+    char address[INET6_ADDRSTRLEN], text[NFT_ELEMENT_TEXT];
     if (!inet_ntop(v->target->bytes == 4 ? AF_INET : AF_INET6, bytes, address, sizeof(address))) return -1;
-    if (v->count++) fputs(", ", v->file);
-    fputs(address, v->file);
-    if (v->interval) fprintf(v->file, "/%u", v->target->mask);
-    return ferror(v->file) ? -1 : 0;
+    snprintf(text, sizeof(text), "%s/%u", address, v->target->mask);
+    for (size_t i = 0; i < v->count; ++i) if (!strcmp(v->text[i], text)) return 0;
+    if (v->count == MD_NL_MAX_KEYS) return -1;
+    memcpy(v->text[v->count++], text, sizeof(text)); return 0;
 }
-/* 先确认响应中有目标地址，再访问 nft 元数据。interval set 重写输入
- * 为完整的 add element 命令，通过 nft -f - 解析前缀及区间语义。 */
+static int count_address(const md_packet *p, const md_rr *rr, void *arg) {
+    (void)p; const nft_target *t = ((const nft_prefixes *)arg)->target;
+    if (!rr->section && rr->class_ == 1 && rr->type == (t->bytes == 4 ? 1 : 28)) ++((nft_prefixes *)arg)->count;
+    return 0;
+}
+/* nft 对 interval 冲突的诊断形如 "/dev/stdin:1:25-34: Error: interval overlaps
+ * with an existing one"（旧内核为 "File exists"）。按列号找到冲突元素的下标；
+ * 无法定位时返回 -1。column[i] 是第 i 个元素在第 1 行的起始列（从 1 开始）。 */
+static long overlap_element(const char *output, const size_t *column, size_t count) {
+    if (!strstr(output, "interval overlaps") && !strstr(output, "File exists")) return -1;
+    for (const char *p = strstr(output, ":1:"); p; p = strstr(p + 1, ":1:")) {
+        unsigned first = 0, last = 0;
+        if (sscanf(p, ":1:%u-%u:", &first, &last) != 2 || first > last) continue;
+        for (size_t i = 0; i < count; ++i)
+            if (column[i] == first) return (long)i;
+    }
+    return count == 1 ? 0 : -1;
+}
+/* 没有 auto-merge 的 interval set 里已有重叠前缀时，nft 拒绝整个批次。
+ * 逐个剔除 nft 报告的冲突元素后重试（每次 1 次 exec，最多 NFT_OVERLAP_SKIPS 个），
+ * 其余元素照常写入，DNS 回答正常返回；被跳过的前缀已与集合中现有区间重叠。 */
+#define NFT_OVERLAP_SKIPS 16u
+static int add_interval_target(const char *binary, const nft_target *t, const md_packet *r, uint64_t until, char *err) {
+    if (!binary) binary = nft_binary();
+    if (!binary) { snprintf(err, MD_ERROR_SIZE, "nftset requires nft in /usr/sbin, /sbin, /usr/bin or /bin"); return -1; }
+    int rc = -1; FILE *file = NULL;
+    nft_prefixes v = {t, calloc(MD_NL_MAX_KEYS, NFT_ELEMENT_TEXT), 0};
+    size_t *column = calloc(MD_NL_MAX_KEYS, sizeof(*column));
+    char *output = malloc(NFT_OUTPUT_SIZE), *argv[] = {(char *)binary, "-f", "-", NULL};
+    if (!v.text || !column || !output) { snprintf(err, MD_ERROR_SIZE, "allocate nft interval input"); goto done; }
+    if (md_dns_records(r, collect_prefix, &v, err)) goto done;
+    for (unsigned skipped = 0; v.count; ) {
+        file = tmpfile();
+        if (!file) { snprintf(err, MD_ERROR_SIZE, "create nft input: %s", strerror(errno)); goto done; }
+        fcntl(fileno(file), F_SETFD, FD_CLOEXEC);
+        int at = fprintf(file, "add element %s %s %s { ", t->family, t->table, t->set);
+        for (size_t i = 0; at > 0 && i < v.count; ++i) {
+            column[i] = (size_t)at + 1;
+            int n = fprintf(file, "%s%s", v.text[i], i + 1 < v.count ? ", " : "");
+            at = n < 0 ? -1 : at + n;
+        }
+        fputs(" }\n", file);
+        if (at < 0 || fflush(file) || ferror(file)) { snprintf(err, MD_ERROR_SIZE, "write nft input: %s", strerror(errno)); goto done; }
+        rewind(file);
+        rc = run_nft(binary, argv, fileno(file), output, NFT_OUTPUT_SIZE, until, err);
+        fclose(file); file = NULL;
+        if (!rc) break;
+        long bad = overlap_element(output, column, v.count);
+        if (bad < 0 || skipped >= NFT_OVERLAP_SKIPS || milliseconds() >= until) goto done;
+        nft_warn(NFT_WARN_OVERLAP, "skip %s for %s/%s/%s: overlaps an existing interval (add flags interval + auto-merge to this set)",
+                 v.text[bad], t->family, t->table, t->set);
+        memmove(v.text[bad], v.text[bad + 1], (v.count - (size_t)bad - 1) * NFT_ELEMENT_TEXT);
+        --v.count; ++skipped; rc = 0;
+    }
+done:
+    if (file) fclose(file);
+    free(v.text); free(column); free(output); return rc;
+}
+/* 先确认响应中有目标地址，再访问 nft 元数据。元数据只走 netlink GETSET：
+ * 普通 set 直接用 netlink 批次写入（0 次 exec），interval set 用一次 nft -f -。 */
 static int add_target(const char *binary, const nft_target *t, const md_packet *r, uint64_t until, char *err) {
     if (!t->enabled) return 0;
     /* Collect before reading metadata: no A/AAAA answers means no nft access. */
-    FILE *file = tmpfile();
-    if (!file) { snprintf(err, MD_ERROR_SIZE, "create nft input: %s", strerror(errno)); return -1; }
-    fcntl(fileno(file), F_SETFD, FD_CLOEXEC);
-    nft_write v = {t, file, false, 0};
-    if (md_dns_records(r, write_element, &v, err)) { fclose(file); return -1; }
-    if (!v.count) { fclose(file); return 0; }
-    bool interval;
-    if (inspect_set(binary, t, &interval, until, err)) { fclose(file); return -1; }
-    if (!interval) { fclose(file); return add_plain_target(t, r, until, err); }
-    rewind(file);
-    if (ftruncate(fileno(file), 0)) { snprintf(err, MD_ERROR_SIZE, "truncate nft input: %s", strerror(errno)); fclose(file); return -1; }
-    fprintf(file, "add element %s %s %s { ", t->family, t->table, t->set);
-    v.interval = interval; v.count = 0;
-    if (md_dns_records(r, write_element, &v, err)) { fclose(file); return -1; }
-    fputs(" }\n", file);
-    if (fflush(file) || ferror(file)) { snprintf(err, MD_ERROR_SIZE, "write nft input: %s", strerror(errno)); fclose(file); return -1; }
-    rewind(file);
-    char *output = malloc(NFT_OUTPUT_SIZE), *argv[] = {(char *)binary, "-f", "-", NULL};
-    if (!output) { snprintf(err, MD_ERROR_SIZE, "allocate nft output buffer"); fclose(file); return -1; }
-    int rc = run_nft(binary, argv, fileno(file), output, NFT_OUTPUT_SIZE, until, err);
-    free(output); fclose(file); return rc;
+    nft_prefixes count = {t, NULL, 0};
+    if (md_dns_records(r, count_address, &count, err)) return -1;
+    if (!count.count) return 0;
+    int rc = add_plain_target(t, r, until, err);
+    return rc == NFT_INTERVAL ? add_interval_target(binary, t, r, until, err) : rc;
 }
 #endif
 
@@ -558,6 +585,38 @@ int md_nft_enable_fast(md_nft *n, char *err) {
     n->fast_enabled = true; return 0;
 }
 
+#ifdef __linux__
+/* 只读检查：interval 目标缺少 auto-merge 时，已有重叠前缀会让写入被拒绝
+ * （运行时会跳过冲突元素，见 add_interval_target）。读不到（集合尚未创建、
+ * 无权限、非 Linux）时保持沉默，不影响启动或 check 的结果。 */
+static void nft_audit_target(const nft_target *t, uint8_t *receive) {
+    if (!t->enabled) return;
+    char err[MD_ERROR_SIZE];
+    int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, NETLINK_NETFILTER);
+    if (fd < 0) return;
+    struct sockaddr_nl local = {.nl_family = AF_NETLINK}; socklen_t size = sizeof(local);
+    bool interval = false, automerge = false;
+    if (!bind(fd, (struct sockaddr *)&local, sizeof(local)) && !getsockname(fd, (struct sockaddr *)&local, &size) &&
+        size == sizeof(local) && local.nl_pid &&
+        !nft_nl_metadata(fd, local.nl_pid, nft_sequence_ticket(), t, receive, milliseconds() + 1000, &interval, &automerge, err) &&
+        interval && !automerge)
+        fprintf(stderr, "nftset warning: %s %s %s is an interval set without auto-merge; answers whose prefixes overlap "
+                "existing elements will have those prefixes skipped. Recreate it with \"flags interval; auto-merge;\"\n",
+                t->family, t->table, t->set);
+    close(fd);
+}
+#endif
+void md_nft_audit(const md_nft *n) {
+#ifdef __linux__
+    if (!n || n->fast_enabled) return;
+    uint8_t *receive = malloc(MD_NL_BUFFER_SIZE);
+    if (!receive) return;
+    nft_audit_target(&n->v4, receive); nft_audit_target(&n->v6, receive);
+    free(receive);
+#else
+    (void)n;
+#endif
+}
 /* IPv4 后 IPv6 共用排队与 I/O 的 5 秒预算；第一个失败立即返回。
  * 两种地址目标之间没有统一事务，IPv6 失败不会回滚已完成的 IPv4 写入。
  * 无论哪条路径出错，取得的串行令牌都由 leave 释放。 */
@@ -567,12 +626,11 @@ int md_nft_apply(md_nft *n, const md_packet *r, char *err) {
     snprintf(err, MD_ERROR_SIZE, "nftset execution is supported only on Linux"); return -1;
 #else
     if (n->fast_enabled) return nft_fast_apply(n, r, err);
-    const char *binary = nft_binary();
-    if (!binary) { snprintf(err, MD_ERROR_SIZE, "nftset requires nft in /usr/sbin, /sbin, /usr/bin or /bin"); return -1; }
     uint64_t until = milliseconds() + 5000;
     if (nft_worker_enter(n, until, err)) return -1;
-    int rc = add_target(binary, &n->v4, r, until, err);
-    if (!rc) rc = add_target(binary, &n->v6, r, until, err);
+    /* nft 程序只在 interval set 需要时才查找（NULL 表示按固定路径查找）。 */
+    int rc = add_target(NULL, &n->v4, r, until, err);
+    if (!rc) rc = add_target(NULL, &n->v6, r, until, err);
     char release_error[MD_ERROR_SIZE] = {0};
     if (nft_worker_leave(n, release_error) && !rc) { snprintf(err, MD_ERROR_SIZE, "%s", release_error); rc = -1; }
     return rc;

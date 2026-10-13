@@ -126,7 +126,7 @@ static void address_tests(void) {
 #endif
 }
 
-typedef struct { int udp, tcp; unsigned mode, delay_ms; } fixture;
+typedef struct { int udp, tcp; unsigned mode, delay_ms; uint16_t seen_id; } fixture;
 static bool exact_read(int fd, uint8_t *p, size_t len) {
     while (len) { ssize_t n = recv(fd, p, len, 0); if (n <= 0) return false; p += n; len -= (size_t)n; }
     return true;
@@ -144,7 +144,7 @@ static void *serve_fixture(void *arg) {
     if (f->udp >= 0) {
         struct sockaddr_storage peer; socklen_t len = sizeof(peer);
         ssize_t n = recvfrom(f->udp, q.data, sizeof(q.data), 0, (struct sockaddr *)&peer, &len); assert(n > 0);
-        q.len = (size_t)n; assert(!md_dns_error(&q, &r, 0));
+        q.len = (size_t)n; assert(!md_dns_error(&q, &r, 0)); f->seen_id = md_read16(q.data);
         if (f->delay_ms) {
             struct timespec pause = {f->delay_ms / 1000, (long)(f->delay_ms % 1000) * 1000000};
             nanosleep(&pause, NULL);
@@ -157,6 +157,10 @@ static void *serve_fixture(void *arg) {
             add_a(&r, 0); md_write16(r.data, 0x4321);
             assert(sendto(f->udp, r.data, r.len, 0, (struct sockaddr *)&peer, len) == (ssize_t)r.len);
             md_write16(r.data, md_read16(q.data));
+            /* M4: the right ID with a different question (QTYPE AAAA) is ignored too. */
+            md_packet bad = r; md_question question;
+            assert(!md_dns_question(&bad, &question, NULL)); md_write16(bad.data + question.end - 4, 28);
+            assert(sendto(f->udp, bad.data, bad.len, 0, (struct sockaddr *)&peer, len) == (ssize_t)bad.len);
         }
         assert(sendto(f->udp, r.data, r.len, 0, (struct sockaddr *)&peer, len) == (ssize_t)r.len);
     }
@@ -165,6 +169,7 @@ static void *serve_fixture(void *arg) {
         int fd = accept(f->tcp, NULL, NULL); assert(fd >= 0);
         struct timeval timeout = {2, 0}; assert(!setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)));
         uint8_t prefix[2]; assert(exact_read(fd, prefix, 2)); q.len = md_read16(prefix); assert(exact_read(fd, q.data, q.len));
+        f->seen_id = md_read16(q.data);
         assert(!md_dns_error(&q, &r, 0)); add_a(&r, 0);
         if (f->mode == 2) { md_write16(r.data, 0x4321); write_frame(fd, &r, true); md_write16(r.data, md_read16(q.data)); }
         write_frame(fd, &r, true); close(fd);
@@ -186,6 +191,7 @@ static int bound_socket(int type, uint16_t *port) {
 }
 /* 可控 UDP/TCP 响应验证回退和多上游竞争；错误响应不能抢先压过有效答案。 */
 static void upstream_tests(void) {
+    unsigned client_ids_seen = 0;
     for (unsigned mode = 1; mode <= 3; mode++) {
         uint16_t port = 0;
         fixture f = { .udp = -1, .tcp = -1, .mode = mode };
@@ -199,9 +205,12 @@ static void upstream_tests(void) {
         assert(!md_forward(&u, 1, 1, &q, &r, err));
         assert(md_dns_response_matches(&q, &r) && md_read16(r.data + 6) == 1 && !(md_read16(r.data + 2) & 0x0200));
         assert(!pthread_join(thread, NULL));
+        /* M4: the upstream sees a random ID; the client gets its own ID back. */
+        assert(md_read16(r.data) == 0x1234); client_ids_seen += f.seen_id == 0x1234;
         if (f.udp >= 0) close(f.udp);
         if (f.tcp >= 0) close(f.tcp);
     }
+    assert(client_ids_seen <= 1); /* 3 random IDs: all-but-impossible to repeat 0x1234 twice. */
     /* The first response may be an EDNS error whose low RCODE looks like
      * NOERROR. Wait for the usable answer, and close the other exchange. */
     uint16_t ports[2] = {0, 0};

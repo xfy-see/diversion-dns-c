@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Exercise actual add_target with a grammar child and test-only netlink transport.
 
-Plain sets perform one real CLI inspection plus fake GETGEN/GETSET/GETGEN/batch ACK; interval
-sets retain the exact real subprocess argv/stdin path and never open a socket.
+Set metadata (type and INTERVAL flag) always comes from fake netlink GETSET; no
+`nft list set` is spawned. Plain sets then use fake GETGEN/GETSET/GETGEN/batch ACK
+(0 CLI calls); interval sets stop after GETGEN/GETSET and use the exact real
+`nft -f -` subprocess argv/stdin path (1 CLI call, plus one per skipped overlap).
 
 This catches the observed nft 1.1.6 quoted-identifier failure. It is not kernel
 or device evidence: the root task separately verifies real nft acceptance.
@@ -43,6 +45,15 @@ if args[:4]==['-t','-nn','list','set']:
  flags='flags interval;' if interval else 'flags timeout; timeout 30s;'
  print(f'table {family} {table} {{\n set {name} {{\n type {kind};\n {flags}\n }}\n}}')
 elif args==['-f','-']:
+ if failure=='overlap':
+  # M1: nft rejects a batch whose element overlaps an existing interval and
+  # points at that element (nft 1.1 wording and column range).
+  bad='198.51.100.0/24' if kind=='ipv4_addr' else '2001:db8:beef::/48'
+  if bad in body:
+   start=body.index(bad)+1
+   print(f'/dev/stdin:1:{start}-{start+len(bad)-1}: Error: interval overlaps with an existing one',file=sys.stderr)
+   print(body.rstrip('\n'),file=sys.stderr)
+   sys.exit(1)
  if failure=='nonzero-exit':
   print('injected nft update rejection',file=sys.stderr)
   sys.exit(7)
@@ -117,26 +128,36 @@ def main():
         (out/(label+'.stdout')).write_text(result.stdout);(out/(label+'.stderr')).write_text(result.stderr)
         assert result.returncode==expected_rc,(label,result.returncode,result.stderr)
         calls=[json.loads(row) for row in log.read_text().splitlines()] if log.exists() else []
-        if expected_rc==0 and mode!='nodata' and interval:
-            assert len(calls)==2 and calls[0]['argv'][4:]==['inet',table,name] and calls[1]['argv']==['-f','-'],calls
-            wanted=('2001:db8:abcd::/48' if interval else '2001:db8:abcd:1234::9') if mode=='ipv6' else ('192.0.2.0/24' if interval else '192.0.2.9')
-            assert calls[1]['stdin']==f'add element inet {table} {name} {{ {wanted} }}\n',calls
+        wanted=('2001:db8:abcd::/48' if interval else '2001:db8:abcd:1234::9') if mode=='ipv6' else ('192.0.2.0/24' if interval else '192.0.2.9')
+        # R3: metadata is one netlink GETGEN+GETSET on a private socket; an interval
+        # set stops there and spawns only `nft -f -`.
+        interval_stats={'opens':1,'closes':1,'sends':2,'generations':1,'batches':0,'keys':0,'rc':0 if expected_rc==0 else -1}
+        if expected_rc==0 and mode!='nodata' and interval and failure!='overlap':
+            assert len(calls)==1 and calls[0]['argv']==['-f','-'],calls
+            assert calls[0]['stdin']==f'add element inet {table} {name} {{ {wanted} }}\n',calls
         if expected_rc==0 and mode!='nodata' and not interval:
-            assert len(calls)==1 and all(x['argv'][4:]==['inet',table,name] and x['stdin']=='' for x in calls),calls
+            assert calls==[],calls
             stats=json.loads(result.stdout.splitlines()[0]);assert stats=={'opens':1,'closes':1,'sends':4,'generations':2,'batches':1,'keys':1,'rc':0},stats
-        if expected_rc==0 and interval:
-            stats=json.loads(result.stdout.splitlines()[0]);assert stats['opens']==stats['sends']==0,stats
+        if mode!='nodata' and interval and expected_rc in (0,4):
+            stats=json.loads(result.stdout.splitlines()[0]);assert stats==interval_stats,stats
         if expected_rc==3 or mode=='nodata':assert calls==[],calls
-        if failure:
+        if failure=='overlap':
+            # M1: the overlapping prefix is skipped (1 retry), the other prefix is
+            # written, and the DNS answer succeeds with a rate-limited warning.
+            other='2001:db8:beef::/48' if mode=='ipv6' else '198.51.100.0/24'
+            assert expected_rc==0 and len(calls)==2 and all(x['argv']==['-f','-'] for x in calls),calls
+            assert calls[0]['stdin']==f'add element inet {table} {name} {{ {wanted}, {other} }}\n',calls
+            assert calls[1]['stdin']==f'add element inet {table} {name} {{ {wanted} }}\n',calls
+            assert f'nftset warning: skip {other} ' in result.stderr,result.stderr
+        elif failure:
             assert expected_rc==4
             stats=json.loads(result.stdout.splitlines()[0])
-            assert stats=={'opens':0,'closes':0,'sends':0,'generations':0,'batches':0,'keys':0,'rc':-1},stats
-            assert calls[0]['argv']==['-t','-nn','list','set','inet',table,name] and calls[0]['stdin']=='',calls
+            assert stats==interval_stats,stats
             if failure=='malformed-metadata':
-                assert len(calls)==1 and 'metadata missing address type' in result.stderr,(calls,result.stderr)
+                assert calls==[] and 'is not a supported ipv4_addr set' in result.stderr,(calls,result.stderr)
             else:
-                assert len(calls)==2 and calls[1]['argv']==['-f','-'],calls
-                assert calls[1]['stdin']==f'add element inet {table} {name} {{ 192.0.2.0/24 }}\n',calls
+                assert len(calls)==1 and calls[0]['argv']==['-f','-'],calls
+                assert calls[0]['stdin']==f'add element inet {table} {name} {{ 192.0.2.0/24 }}\n',calls
                 if failure=='nonzero-exit':
                     assert 'nft command failed: injected nft update rejection' in result.stderr,result.stderr
                 else:
@@ -155,11 +176,13 @@ def main():
     # Actual CLI error paths, using the grammar child only: no nft executable,
     # netlink socket, production table, or kernel ruleset is accessed.
     case('update-nonzero-exit',interval=True,expected_rc=4,failure='nonzero-exit')
-    case('reject-malformed-metadata',expected_rc=4,failure='malformed-metadata')
+    case('reject-malformed-metadata',interval=True,expected_rc=4,failure='malformed-metadata')
     case('update-bounded-timeout',interval=True,expected_rc=4,failure='timeout')
+    case('ipv4-interval-overlap-skipped',interval=True,name='cn-site4',failure='overlap')
+    case('ipv6-interval-overlap-skipped',mode='ipv6',interval=True,name='cn_site6',failure='overlap')
     # Fast mode uses only fake netlink. Repeated requests verify successful ACK
     # dedup, expiration renewal, reset recovery and strict metadata/error handling.
-    for mode, expected_batches, expected_rc in [('fast-dedup', 1, 0), ('fast-reset', 2, 0), ('fast-renew', 2, 0), ('fast-existing', 0, 0), ('fast-interval', 0, 4), ('fast-error', 1, 4), ('fast-permanent', 0, 0), ('fast-permanent-reset', 0, 0), ('fast-old-kernel', 0, 4), ('fast-ttl-highbit', 1, 0), ('fast-ttl-cap', 1, 0), ('fast-race-before', 1, 0), ('fast-race-after', 1, 0), ('fast-race-flush', 2, 0), ('fast-race-forever', 0, 4), ('fast-restart', 2, 0), ('fast-sequence', 2, 0), ('fast-small-buffer', 5, 0), ('fast-large-answer', 0, 4), ('fast-cohort', None, 0), ('fast-cohort-poison', 3, 0)]:
+    for mode, expected_batches, expected_rc in [('fast-dedup', 1, 0), ('fast-reset', 2, 0), ('fast-renew', 2, 0), ('fast-existing', 0, 0), ('fast-interval', 0, 4), ('fast-error', 1, 4), ('fast-permanent', 0, 0), ('fast-permanent-reset', 0, 0), ('fast-old-kernel', 0, 4), ('fast-ttl-highbit', 1, 0), ('fast-ttl-cap', 1, 0), ('fast-race-before', 1, 0), ('fast-race-after', 1, 0), ('fast-race-flush', 2, 0), ('fast-race-forever', 0, 4), ('fast-restart', 2, 0), ('fast-sequence', 2, 0), ('fast-small-buffer', 5, 0), ('fast-large-answer', 1, 0), ('fast-cohort', None, 0), ('fast-cohort-poison', 3, 0)]:
         for kind in ('ipv4','ipv6'):
             local_env=env|{'FAKE_MODE':mode,'NFT_TEST_LOG':str(out/(mode+'-'+kind+'.unexpected-cli'))}
             result=subprocess.run([str(driver),str(child),kind,'diag','learn'],capture_output=True,text=True,timeout=8,env=local_env)
@@ -167,7 +190,7 @@ def main():
             assert result.returncode==expected_rc,(mode,kind,result.stdout,result.stderr)
             stats=json.loads(result.stdout.splitlines()[0]);assert expected_batches is None or stats['batches']==expected_batches,(mode,kind,stats)
             assert stats['opens']==stats['closes'],(mode,kind,stats)
-            assert stats['opens'] <= 3,(mode,kind,stats)
+            assert stats['opens'] <= 5,(mode,kind,stats)  # NFT_FAST_ATTEMPTS
             assert not Path(local_env['NFT_TEST_LOG']).exists(),'fast path invoked CLI'
             checks.append({'label':mode+'-'+kind,'exit':expected_rc,'calls':0,'passed':True,'device_or_kernel_evidence':False})
     # Compatible plain path driven directly over fake netlink: sequence wrap

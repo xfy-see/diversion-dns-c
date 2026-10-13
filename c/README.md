@@ -50,15 +50,33 @@ NXDOMAIN 缓存 30 秒、SERVFAIL 5 秒；无 Answer 的 NOERROR 受记录最小
 上限约束。正向 lazy 总保留期从最初存储时间计算，不是 TTL 加 stale 时长。stale 响应
 普通记录 TTL 为 5 秒，后台刷新仍走同一个已分类出口及 CN 最终处理路径。
 
-上游工作线程连接池继续每线程 8 槽、空闲 30 秒，按端点、传输、mark 和接口隔离。
-一个连接内不复用已用过的 DNS ID；异常或脏连接关闭。库调用和非工作线程使用新连接。
-没有 pipeline。UDP 每秒用同一 connected socket 和原 ID 重发，共享原 5 秒交换预算；
-TC 转 TCP 后停止 UDP 重发。
+每次上游交换使用来自内核 CSPRNG（`getrandom`，不可用时退回时钟/地址混合的
+splitmix64）的随机 16 位 DNS ID，不把客户端 ID 发给上游；回复必须匹配该 ID、问题
+（QNAME 大小写不敏感、QTYPE、QCLASS）且来自该上游的 connected socket，否则丢弃并继续
+等待；返回客户端前改回客户端 ID。UDP 不再入池：每次交换新开 connected socket，由内核
+随机分配源端口（随机 ID + 随机端口约 31 位熵）。TCP 工作线程连接池继续每线程 8 槽、
+空闲 30 秒，按端点、mark 和接口隔离；一个连接内不复用已用过的 DNS ID；异常或脏连接
+关闭；复用的空闲连接在收到任何响应字节前被对端关闭时，换一条新连接重试一次。库调用和
+非工作线程使用新连接。没有 pipeline。UDP 每秒用同一 connected socket 和同一上游 ID
+重发，共享原 5 秒交换预算；TC 转 TCP 后停止 UDP 重发。
 
-nft 普通集合仍有 generation 前后校验和完整 Netlink 成功回执；窗口内的集合元数据用 Netlink
-GETSET 读取（每次写入只调用一次 `nft list set` 判断 interval），generation 冲突或批次
-ERESTART 时新开 socket、退避 1–4 ms 后最多尝试 3 次；序列号在 32 位范围内回绕，不会耗尽。interval 集合仍走
-argv/stdin CLI，不启动 shell。不创建表/集合，不发送元素 TTL，使用集合默认 timeout。
+**已知限制（M4，mipsel）：** 每次上游 UDP 查询使用全新 socket 与内核随机源端口（热路径可把
+`socket`/`connect` 挪到空闲时预开，但端口仍不复用）。在 mipsel_24kc（.122，Linux 6.12.94）
+上，冷缓存 / 首次上游 UDP 查询相对 v0.1.1 基线约多 **+4–5 ms P50**、约 **+5 ms P99**
+（2026-10-13 六轮中位数消融：冷 A P99 约 **7.3 → ~12 ms**）；热路径无明显回归。
+同机测得该路径上 conntrack 约每条冷查询增加 1 条。aarch64（.131）冷路径无实质回归。
+所有者决定默认保留每查询新源端口并接受该 MIPS 冷查询代价；可选的有时限/小容量复用池
+留作后续 opt-in，当前不实现。
+
+nft 普通集合仍有 generation 前后校验和完整 Netlink 成功回执；集合类型和 interval 标志
+都由 Netlink GETSET 读取，不再调用 `nft list set`（普通集合每次写入 0 次 exec，interval
+集合 1 次 `nft -f -`）。generation 冲突或批次 ERESTART 时新开 socket、退避 1–4 ms 后最多
+尝试 3 次；序列号在 32 位范围内回绕，不会耗尽。interval 集合仍走 argv/stdin CLI，不启动
+shell。没有 `auto-merge` 的 interval 集合里已有重叠前缀时，nft 会拒绝整个批次：现在按 nft
+报告的位置跳过冲突元素（每次重试 1 次 exec，最多 16 个），其余元素照常写入，DNS 正常回答，
+并在 stderr 打印限速告警（每类最多 10 秒一行）。`check` 和 `start` 只读检查 interval 目标
+集合，缺少 `auto-merge` 时告警但不失败；建议用 `flags interval; auto-merge;` 重建。
+不创建表/集合，不发送元素 TTL，使用集合默认 timeout。
 配置 mask 作用于 interval 前缀，普通集合使用具体地址。FIFO 等待、检查和写入共享
 原有 5 秒预算；不明确的提交结果不自动重放。没有 Answer 地址不代表完全跳过 nft
 环境检查：CN 负回答仍可能因非 Linux 或没有标准路径的 `nft` 失败。
@@ -170,17 +188,23 @@ restricted syntax and printable-ASCII subject contract are documented in
 
 The fast writer batches up to 32 queued queries and 1024 address records, using
 socket-sized transactions of at most 512 keys. DNS success waits for all ACKs.
-Each response may contain at most 256 Answer IN A/AAAA records (duplicates count);
-larger answers fail before joining the queue. A failed cohort is retried member by
-member within fair shares of the original five-second deadlines, preserving healthy
-queries when another member has a bad target or update. It never returns a partial
-successful DNS answer. IPv4 and IPv6 writes are not one atomic transaction.
+Only the first 256 Answer IN A/AAAA records of a response (in wire order, duplicates
+count) are added; a larger answer is still returned normally and logs a rate-limited
+`nftset warning` (before 0.1.2 it was answered with SERVFAIL). A failed cohort is
+retried member by member within fair shares of the original five-second deadlines,
+preserving healthy queries when another member has a bad target or update. It never
+returns a partial successful DNS answer. When the nf_tables generation moves around a
+commit (another writer), the writer adopts the new generation and then reads every
+key of the cohort back with GETSETELEM; only keys that are missing or whose timeout is
+shorter than requested are written again (up to 5 attempts within the deadline). IPv4
+and IPv6 writes are not one atomic transaction.
 
 Linux 6.12 or newer is checked at configuration time on Linux. Older/backported
 kernels must use `nftset_fast=0` until their behavior is validated. Every request
-checks generation; races and kernel ERESTART trigger at most three attempts within
+checks generation; races and kernel ERESTART trigger at most five attempts within
 the original deadline. A post-ACK generation jump is revalidated, never blindly
-accepted: the external writer may have flushed the just-written mappings.
+accepted: the external writer may have flushed the just-written mappings, so every
+key is read back (present and timeout not shorter than requested) before success.
 
 Permanent existing elements are preserved, including after restart. A sufficiently
 long existing lease is reused; short leases are refreshed without shortening a
@@ -217,5 +241,16 @@ Missing/wrong sets, malformed ACKs and exhausted deadlines fail closed, with no 
 fallback. Rule changes immediately after the final check remain outside any DNS/nft
 transaction; re-query after reload repairs cached answers. Existing connections can
 retain their route through the separate conntrack pinning rules.
+
+## Known limitation: M4 per-query UDP source ports (mipsel)
+
+With M4, each upstream UDP exchange uses a fresh socket and a kernel-chosen ephemeral
+source port (ports are never reused; idle pre-open only moves `socket`/`connect` off the
+hot path). On mipsel_24kc (.122, Linux 6.12.94), cold-cache / first-use upstream UDP
+queries pay roughly **+4–5 ms P50** and **~+5 ms P99** vs v0.1.1 (2026-10-13 six-run
+median ablation: cold A P99 about **7.3 → ~12 ms**). Hot path is unaffected. Conntrack
+grows about one entry per cold query on that path. aarch64 (.131) showed no material cold
+regression. Owner choice: keep per-query new source ports by default and accept the MIPS
+cold cost; a timed/limited reuse pool remains a possible future opt-in.
 
 Route lookups must include both static CN-IP and dynamic DNS-learned sets. Do not remove dnsmasq learning until these lookups and C writes have passed real A/AAAA, first-connection, reload and rollback tests.

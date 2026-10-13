@@ -2,6 +2,9 @@
 /* 上游转发采用非阻塞 socket 和 poll 驱动状态机。连接池只在显式启用的
  * worker 线程内存在；普通库调用使用新连接，不依赖服务端线程生命周期。 */
 #define _GNU_SOURCE
+#ifdef __APPLE__
+#define _DARWIN_C_SOURCE /* arc4random_buf under -std=c11/_POSIX_C_SOURCE */
+#endif
 #include "mosdns.h"
 #include <arpa/inet.h>
 #include <errno.h>
@@ -15,6 +18,9 @@
 #include <time.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/random.h>
+#endif
 
 static int fail(char *err, const char *s) {
     if (err) snprintf(err, MD_ERROR_SIZE, "%s", s);
@@ -116,6 +122,8 @@ int md_upstream_init(md_upstream *u, const char *addr, const char *dial_addr,
 typedef enum { CONNECTING, SENDING, UDP_READING, TCP_LENGTH, TCP_BODY, DEAD } phase;
 #define WORKER_TCP_CAPACITY 8
 #define WORKER_TCP_IDLE_MS 30000
+#define WORKER_UDP_SPARES 8
+#define WORKER_UDP_DEAD 16
 /* 空闲 socket 归池所有，借出后由 exchange 持有 fd。每条连接记录已用 ID，
  * 复用同一 ID 前退休连接，避免旧响应被当成新查询的结果。 */
 typedef struct {
@@ -145,7 +153,19 @@ typedef struct {
     /* One synchronous forward at a time per worker. Reentrant/library calls
      * keep an independent allocation so they cannot overwrite live replies. */
     exchange exchanges[3];
+    md_packet query; /* The upstream copy of the query (random ID, M4). */
     bool exchanges_in_use;
+    /* M4 keeps one fresh, never-used UDP socket per upstream. Each socket still
+     * carries exactly one query (its own kernel-random ephemeral port), but
+     * socket/fcntl/connect and close of the used one run in
+     * md_forward_worker_idle() after the reply, not on the query's path. */
+    int spare_fd[WORKER_UDP_SPARES];
+    uint64_t spare_born[WORKER_UDP_SPARES];
+    md_upstream spare_key[WORKER_UDP_SPARES];
+    bool spare_wanted[WORKER_UDP_SPARES];
+    int dead_fd[WORKER_UDP_DEAD];
+    unsigned dead_count;
+    bool maintenance; /* Set only when a spare was taken or a UDP fd retired. */
 } worker_connections;
 /* 池和可复用报文缓冲都属于当前线程，不需要跨 worker 加锁。 */
 static _Thread_local worker_connections *worker_tcp;
@@ -156,6 +176,46 @@ static uint64_t milliseconds(void) {
     if (clock_gettime(CLOCK_MONOTONIC, &t)) return 0;
     return (uint64_t)t.tv_sec * 1000 + (uint64_t)t.tv_nsec / 1000000;
 }
+/* M4: every forwarded query gets a fresh unpredictable 16-bit DNS ID instead
+ * of the client's. Bytes come from the kernel CSPRNG (getrandom/arc4random) in
+ * small per-thread batches; if that is unavailable (very early boot, seccomp),
+ * fall back to a splitmix64 stream seeded from the monotonic and realtime
+ * clocks, the thread's stack address and a global counter. */
+static _Thread_local uint16_t random_pool[32];
+static _Thread_local unsigned random_left;
+static _Thread_local uint64_t random_state;
+static atomic_uint_fast64_t random_counter;
+static bool random_fill(void *buffer, size_t size) {
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    arc4random_buf(buffer, size); return true;
+#elif defined(__linux__)
+    uint8_t *p = buffer;
+    while (size) {
+        ssize_t n = getrandom(p, size, GRND_NONBLOCK);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        p += n; size -= (size_t)n;
+    }
+    return true;
+#else
+    (void)buffer; (void)size; return false;
+#endif
+}
+static uint16_t random_id(void) {
+    if (!random_left) {
+        if (random_fill(random_pool, sizeof(random_pool))) random_left = sizeof(random_pool) / sizeof(random_pool[0]);
+        else {
+            struct timespec a = {0, 0}, b = {0, 0};
+            clock_gettime(CLOCK_MONOTONIC, &a); clock_gettime(CLOCK_REALTIME, &b);
+            random_state ^= (uint64_t)a.tv_nsec ^ ((uint64_t)a.tv_sec << 32) ^ (uint64_t)b.tv_nsec * 0x9e3779b97f4a7c15u ^
+                (uint64_t)(uintptr_t)&a ^ atomic_fetch_add_explicit(&random_counter, 0x632be59bd9b4e019u, memory_order_relaxed);
+            uint64_t z = (random_state += 0x9e3779b97f4a7c15u);
+            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9u; z = (z ^ (z >> 27)) * 0x94d049bb133111ebu;
+            return (uint16_t)((z ^ (z >> 31)) >> 16);
+        }
+    }
+    return random_pool[--random_left];
+}
 static void retire(worker_connection *c) {
     if (c->fd >= 0) close(c->fd);
     c->fd = -1; c->busy = false;
@@ -163,14 +223,18 @@ static void retire(worker_connection *c) {
 void md_forward_worker_cleanup(void) {
     if (!worker_tcp) return;
     for (unsigned i = 0; i < WORKER_TCP_CAPACITY; i++) retire(&worker_tcp->slots[i]);
+    for (unsigned i = 0; i < WORKER_UDP_SPARES; i++) if (worker_tcp->spare_fd[i] >= 0) close(worker_tcp->spare_fd[i]);
+    for (unsigned i = 0; i < worker_tcp->dead_count; i++) close(worker_tcp->dead_fd[i]);
     free(worker_tcp); worker_tcp = NULL;
 }
 /* 分配失败时保持 NULL，后续转发自动退回临时 exchange 和新 socket。 */
 void md_forward_worker_enable(void) {
     md_forward_worker_cleanup();
     worker_tcp = calloc(1, sizeof(*worker_tcp));
-    if (worker_tcp)
+    if (worker_tcp) {
         for (unsigned i = 0; i < WORKER_TCP_CAPACITY; i++) worker_tcp->slots[i].fd = -1;
+        for (unsigned i = 0; i < WORKER_UDP_SPARES; i++) worker_tcp->spare_fd[i] = -1;
+    }
 }
 /* 池键包含目标、配置协议、mark 和设备，避免复用改变了路由约束的连接。 */
 static bool same_endpoint(const md_upstream *a, const md_upstream *b) {
@@ -223,7 +287,10 @@ static worker_connection *take_connection(const md_upstream *u, bool tcp, uint16
 }
 /* 失败和未胜出的 exchange 都关闭自己持有的 fd，并释放对应池槽。 */
 static void stop(exchange *x) {
-    if (x->fd >= 0) close(x->fd);
+    /* A used UDP socket is never reused; its close is deferred to idle time. */
+    if (x->fd >= 0 && !x->tcp && !x->cached && worker_tcp && worker_tcp->dead_count < WORKER_UDP_DEAD)
+        worker_tcp->dead_fd[worker_tcp->dead_count++] = x->fd, worker_tcp->maintenance = true;
+    else if (x->fd >= 0) close(x->fd);
     x->fd = -1; x->state = DEAD; x->udp_retry = 0;
     if (x->cached) { retire(x->cached); x->cached = NULL; }
     x->reused = x->dirty = false;
@@ -250,16 +317,67 @@ static int socket_options(int fd, const md_upstream *u, char *err) {
         return syserr(err, "set socket flags");
     return 0;
 }
+/* Hand out this upstream's pre-opened UDP socket (single use) and ask
+ * md_forward_worker_idle() to open its replacement. A spare that is stale,
+ * retargeted, or already holds a datagram is closed instead of used. */
+static int take_spare(const md_upstream *u) {
+    if (!worker_tcp) return -1;
+    unsigned free_slot = WORKER_UDP_SPARES;
+    for (unsigned i = 0; i < WORKER_UDP_SPARES; i++) {
+        if (!worker_tcp->spare_wanted[i]) { if (free_slot == WORKER_UDP_SPARES) free_slot = i; continue; }
+        if (!same_endpoint(&worker_tcp->spare_key[i], u)) continue;
+        int fd = worker_tcp->spare_fd[i];
+        worker_tcp->spare_fd[i] = -1; worker_tcp->maintenance = true;
+        if (fd < 0) return -1;
+        if (milliseconds() - worker_tcp->spare_born[i] < WORKER_TCP_IDLE_MS && quiet_socket(fd)) return fd;
+        close(fd); return -1;
+    }
+    if (free_slot < WORKER_UDP_SPARES) {
+        worker_tcp->spare_key[free_slot] = *u; worker_tcp->spare_wanted[free_slot] = true;
+        worker_tcp->maintenance = true;
+    }
+    return -1;
+}
+/* Cache hits and other replies that did not touch a UDP upstream return
+ * here after one flag test: no clock read, no syscall, no slot scan. */
+void md_forward_worker_idle(void) {
+    if (!worker_tcp || !worker_tcp->maintenance) return;
+    worker_tcp->maintenance = false;
+    uint64_t now = milliseconds();
+    for (unsigned i = 0; i < worker_tcp->dead_count; i++) close(worker_tcp->dead_fd[i]);
+    worker_tcp->dead_count = 0;
+    for (unsigned i = 0; i < WORKER_UDP_SPARES; i++) {
+        if (!worker_tcp->spare_wanted[i]) continue;
+        if (worker_tcp->spare_fd[i] >= 0) {
+            /* An upstream unused for the idle period loses its slot. */
+            if (now - worker_tcp->spare_born[i] >= WORKER_TCP_IDLE_MS) {
+                close(worker_tcp->spare_fd[i]); worker_tcp->spare_fd[i] = -1; worker_tcp->spare_wanted[i] = false;
+            }
+            continue;
+        }
+        const md_upstream *u = &worker_tcp->spare_key[i];
+        int fd = socket(u->address.ss_family, SOCK_DGRAM, 0);
+        if (fd < 0) continue;
+        if (socket_options(fd, u, NULL) || connect(fd, (const struct sockaddr *)&u->address, u->address_len)) {
+            close(fd); continue;
+        }
+        worker_tcp->spare_fd[i] = fd; worker_tcp->spare_born[i] = now;
+    }
+}
 /* 借用时把 fd 从池槽移到 exchange；成功后 keep_response 才将所有权交还。 */
+/* M4: only TCP connections are pooled. Every UDP exchange opens a fresh
+ * connected socket, so the kernel picks a new random ephemeral source port per
+ * query; together with the random ID an off-path spoofer must guess ~31 bits. */
 static int begin_connection(exchange *x, const md_upstream *u, bool tcp, bool allow_reuse, char *err) {
     stop(x); x->tcp = tcp; x->upstream = u; x->done = 0;
-    if ((x->cached = take_connection(u, tcp, x->query_id, allow_reuse))) {
+    if (tcp && (x->cached = take_connection(u, tcp, x->query_id, allow_reuse))) {
         x->cached->ids[x->query_id / 8] |= (uint8_t)(1u << (x->query_id % 8));
         if (x->cached->fd >= 0) {
             x->fd = x->cached->fd; x->cached->fd = -1;
             x->state = SENDING; x->reused = true; return 0;
         }
     }
+    if (!tcp && (x->fd = take_spare(u)) >= 0) { x->state = SENDING; return 0; }
     x->fd = socket(u->address.ss_family, tcp ? SOCK_STREAM : SOCK_DGRAM, 0);
     if (x->fd < 0) { syserr(err, "create upstream socket"); stop(x); return -1; }
     if (socket_options(x->fd, u, err)) { stop(x); return -1; }
@@ -369,6 +487,10 @@ static int advance(exchange *x, short events, const md_packet *q, char *err) {
         size_t wanted = prefix ? 2 : x->packet.len;
         ssize_t n = recv(x->fd, data + x->done, wanted - x->done, 0);
         if (n < 0) { if (again()) return 0; syserr(err, "receive upstream TCP"); stop(x); return -1; }
+        /* A pooled connection the upstream closed while idle can still accept
+         * our send; EOF before any response byte then gets one fresh connection.
+         * Random upstream IDs (M4) make such reuse common, so this is required. */
+        if (!n && x->reused && prefix && !x->done) return begin_connection(x, x->upstream, x->tcp, false, err);
         if (!n) { fail(err, "upstream TCP closed before a response"); stop(x); return -1; }
         x->done += (size_t)n;
         if (x->done == wanted) {
@@ -405,8 +527,18 @@ int md_forward(const md_upstream *us, size_t count, unsigned concurrent,
     /* 同步 worker 调用复用大报文缓冲；重入调用独立分配，避免覆盖尚在读取的响应。 */
     bool scoped = worker_tcp && !worker_tcp->exchanges_in_use;
     exchange *xs = scoped ? worker_tcp->exchanges : malloc(concurrent * sizeof(*xs));
-    if (!xs) return fail(err, "out of memory for upstream exchanges");
+    md_packet *uq = scoped ? &worker_tcp->query : malloc(sizeof(*uq));
+    if (!xs || !uq) {
+        if (!scoped) { free(xs); free(uq); }
+        return fail(err, "out of memory for upstream exchanges");
+    }
     if (scoped) worker_tcp->exchanges_in_use = true;
+    /* M4: upstreams see a random ID, never the client's. Responses must match
+     * that ID and the question (case-insensitive name, type, class) on the
+     * connected socket of that upstream; the client ID is restored below. */
+    uint16_t client_id = md_read16(q->data), upstream_id = random_id();
+    memcpy(uq->data, q->data, q->len); uq->len = q->len;
+    md_write16(uq->data, upstream_id);
     for (unsigned i = 0; i < concurrent; i++) {
         memset(&xs[i], 0, offsetof(exchange, packet));
         xs[i].packet.len = 0; xs[i].fd = -1; xs[i].state = DEAD;
@@ -417,11 +549,11 @@ int md_forward(const md_upstream *us, size_t count, unsigned concurrent,
     prepare_worker(us, count);
     char last_error[MD_ERROR_SIZE] = "all upstreams failed";
     for (unsigned i = 0; i < concurrent; i++) {
-        xs[i].query_id = md_read16(q->data);
+        xs[i].query_id = upstream_id;
         begin(&xs[i], &us[(first + i) % count], us[(first + i) % count].tcp, last_error);
         /* A connected nonblocking socket can try sending immediately. A TCP
          * connect still waits for poll/SO_ERROR; EAGAIN keeps SENDING pending. */
-        if (xs[i].state == SENDING) advance(&xs[i], POLLOUT, q, last_error);
+        if (xs[i].state == SENDING) advance(&xs[i], POLLOUT, uq, last_error);
     }
     bool have_error_response = false;
     int result = -1;
@@ -446,15 +578,15 @@ int md_forward(const md_upstream *us, size_t count, unsigned concurrent,
         if (!n) continue; /* A one-second resend timer does not end the exchange. */
         for (unsigned i = 0; i < concurrent; i++) {
             if (!fds[i].revents || xs[i].state == DEAD) continue;
-            int status = advance(&xs[i], fds[i].revents, q, last_error);
+            int status = advance(&xs[i], fds[i].revents, uq, last_error);
             if (status == 1) {
                 unsigned rcode = md_read16(xs[i].packet.data + 2) & 15;
                 md_dns_records(&xs[i].packet, extended_rcode, &rcode, NULL);
+                memcpy(r->data, xs[i].packet.data, xs[i].packet.len); r->len = xs[i].packet.len;
+                md_write16(r->data, client_id);
                 if (rcode == 0 || rcode == 3) {
-                    memcpy(r->data, xs[i].packet.data, xs[i].packet.len); r->len = xs[i].packet.len;
                     keep_response(&xs[i], fds[i].revents); result = 0; goto finished;
                 }
-                memcpy(r->data, xs[i].packet.data, xs[i].packet.len); r->len = xs[i].packet.len;
                 have_error_response = true; stop(&xs[i]);
             }
             /* Check readable replies first, then service a due retry. Invalid
@@ -463,7 +595,7 @@ int md_forward(const md_upstream *us, size_t count, unsigned concurrent,
             uint64_t retry_now = milliseconds();
             if (!status && xs[i].state == UDP_READING && (fds[i].revents & POLLOUT) &&
                 retry_now >= xs[i].udp_retry && retry_now < deadline)
-                resend_udp(&xs[i], q, last_error);
+                resend_udp(&xs[i], uq, last_error);
         }
     }
     if (have_error_response) result = 0;
@@ -475,6 +607,6 @@ finished:
     /* 胜出且符合条件的连接已交回池；这里关闭所有其他仍在竞争的连接。 */
     for (unsigned i = 0; i < concurrent; i++) stop(&xs[i]);
     if (scoped) worker_tcp->exchanges_in_use = false;
-    else free(xs);
+    else { free(xs); free(uq); }
     return result;
 }
