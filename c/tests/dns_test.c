@@ -360,7 +360,117 @@ static void retry_tests(void) {
     }
     assert(active == 3 && open_fds() == before);
 }
+/* Opt-in UDP source-port reuse: default keeps unique ports; enabled reuses then rotates. */
+typedef struct {
+    int udp;
+    atomic_bool stop;
+    unsigned count;
+    uint16_t ports[32];
+} port_fixture;
+static void *serve_ports(void *arg) {
+    port_fixture *f = arg;
+    while (!atomic_load(&f->stop)) {
+        struct pollfd pf = { .fd = f->udp, .events = POLLIN };
+        int ready = poll(&pf, 1, 50);
+        assert(ready >= 0);
+        if (!ready) continue;
+        md_packet q, r; struct sockaddr_in peer; socklen_t len = sizeof(peer);
+        ssize_t n = recvfrom(f->udp, q.data, sizeof(q.data), 0, (struct sockaddr *)&peer, &len);
+        assert(n > 0); q.len = (size_t)n;
+        assert(f->count < 32);
+        f->ports[f->count++] = ntohs(peer.sin_port);
+        assert(!md_dns_error(&q, &r, 0)); add_a(&r, 0);
+        assert(sendto(f->udp, r.data, r.len, 0, (struct sockaddr *)&peer, len) == (ssize_t)r.len);
+    }
+    return NULL;
+}
+static unsigned distinct_ports(const uint16_t *ports, unsigned n) {
+    unsigned d = 0;
+    for (unsigned i = 0; i < n; i++) {
+        unsigned j; for (j = 0; j < i; j++) if (ports[j] == ports[i]) break;
+        if (j == i) d++;
+    }
+    return d;
+}
+static void udp_reuse_tests(void) {
+    md_udp_sport_reuse off = {0, 16, 2000, 2};
+    md_forward_set_udp_sport_reuse(&off);
+    /* (a) Default: worker + idle still uses a unique source port per query. */
+    {
+        uint16_t port = 0; port_fixture f = { .udp = bound_socket(SOCK_DGRAM, &port) };
+        atomic_init(&f.stop, false);
+        pthread_t thread; assert(!pthread_create(&thread, NULL, serve_ports, &f));
+        char address[64], err[MD_ERROR_SIZE];
+        snprintf(address, sizeof(address), "127.0.0.1:%u", port);
+        md_upstream u; assert(!md_upstream_init(&u, address, NULL, 0, NULL, err));
+        md_forward_worker_enable();
+        for (unsigned i = 0; i < 10; i++) {
+            md_packet q, r; make_query(&q); md_write16(q.data, (uint16_t)(0x1000 + i));
+            assert(!md_forward(&u, 1, 1, &q, &r, err));
+            md_forward_worker_idle();
+        }
+        struct timespec settle = {0, 100000000}; assert(!nanosleep(&settle, NULL));
+        atomic_store(&f.stop, true); assert(!pthread_join(thread, NULL));
+        assert(f.count == 10 && distinct_ports(f.ports, f.count) == 10);
+        md_forward_worker_cleanup(); close(f.udp);
+    }
+    /* (b) Enabled: reuse within max_uses, then rotate to a new port. */
+    {
+        md_udp_sport_reuse on = {1, 4, 5000, 1};
+        md_forward_set_udp_sport_reuse(&on);
+        uint16_t port = 0; port_fixture f = { .udp = bound_socket(SOCK_DGRAM, &port) };
+        atomic_init(&f.stop, false);
+        pthread_t thread; assert(!pthread_create(&thread, NULL, serve_ports, &f));
+        char address[64], err[MD_ERROR_SIZE];
+        snprintf(address, sizeof(address), "127.0.0.1:%u", port);
+        md_upstream u; assert(!md_upstream_init(&u, address, NULL, 0, NULL, err));
+        md_forward_worker_enable();
+        for (unsigned i = 0; i < 8; i++) {
+            md_packet q, r; make_query(&q); md_write16(q.data, (uint16_t)(0x2000 + i));
+            assert(!md_forward(&u, 1, 1, &q, &r, err));
+            md_forward_worker_idle();
+        }
+        struct timespec settle = {0, 100000000}; assert(!nanosleep(&settle, NULL));
+        atomic_store(&f.stop, true); assert(!pthread_join(thread, NULL));
+        assert(f.count == 8);
+        unsigned distinct = distinct_ports(f.ports, f.count);
+        /* 8 queries / max_uses 4 => about 2 ports; allow a little slack for prewarm. */
+        assert(distinct >= 2 && distinct <= 3);
+        assert(f.ports[0] == f.ports[1] && f.ports[0] == f.ports[2] && f.ports[0] == f.ports[3]);
+        assert(f.ports[4] != f.ports[0]);
+        assert(f.ports[4] == f.ports[5] && f.ports[4] == f.ports[6] && f.ports[4] == f.ports[7]);
+        md_forward_worker_cleanup(); close(f.udp);
+    }
+    /* (c) Age expiry forces a new port even when uses remain. */
+    {
+        md_udp_sport_reuse on = {1, 100, 200, 1};
+        md_forward_set_udp_sport_reuse(&on);
+        uint16_t port = 0; port_fixture f = { .udp = bound_socket(SOCK_DGRAM, &port) };
+        atomic_init(&f.stop, false);
+        pthread_t thread; assert(!pthread_create(&thread, NULL, serve_ports, &f));
+        char address[64], err[MD_ERROR_SIZE];
+        snprintf(address, sizeof(address), "127.0.0.1:%u", port);
+        md_upstream u; assert(!md_upstream_init(&u, address, NULL, 0, NULL, err));
+        md_forward_worker_enable();
+        md_packet q, r; make_query(&q);
+        assert(!md_forward(&u, 1, 1, &q, &r, err)); md_forward_worker_idle();
+        assert(!md_forward(&u, 1, 1, &q, &r, err)); md_forward_worker_idle();
+        struct timespec wait = {0, 350000000}; assert(!nanosleep(&wait, NULL));
+        /* Force age sweep: maintenance may be false after idle, so take a dead path
+         * by setting maintenance via a no-op park miss — call idle after marking. */
+        md_forward_worker_idle();
+        assert(!md_forward(&u, 1, 1, &q, &r, err)); md_forward_worker_idle();
+        struct timespec settle = {0, 100000000}; assert(!nanosleep(&settle, NULL));
+        atomic_store(&f.stop, true); assert(!pthread_join(thread, NULL));
+        assert(f.count == 3);
+        assert(f.ports[0] == f.ports[1]);
+        assert(f.ports[2] != f.ports[0]);
+        md_forward_worker_cleanup(); close(f.udp);
+    }
+    md_forward_set_udp_sport_reuse(&off);
+}
 int main(void) {
-    dns_tests(); address_tests(); upstream_tests(); retry_tests();
+    dns_tests(); address_tests(); upstream_tests(); retry_tests(); udp_reuse_tests();
     puts("dns/upstream tests passed"); return 0;
 }
+

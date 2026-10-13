@@ -20,13 +20,16 @@ typedef enum {
     LISTEN_UDP, LISTEN_TCP, CN_FILE, CN_UPSTREAM, FOREIGN_UPSTREAM,
     CACHE_SIZE, CACHE_LAZY, CN_MARK, FOREIGN_MARK, CN_INTERFACE, FOREIGN_INTERFACE,
     CN_CONCURRENT, FOREIGN_CONCURRENT, TCP_IDLE, NFT4, NFT6, NFT_FAST,
-    QUEUE_TIMEOUT, TCP_READ, TCP_WRITE, TCP_MAX, TCP_MAX_IP, KEY_COUNT
+    QUEUE_TIMEOUT, TCP_READ, TCP_WRITE, TCP_MAX, TCP_MAX_IP,
+    UDP_SPORT_REUSE, UDP_SPORT_REUSE_MAX_USES, UDP_SPORT_REUSE_TTL_MS, UDP_SPORT_REUSE_POOL,
+    KEY_COUNT
 } config_key;
 static const char *const key_names[KEY_COUNT] = {
     "listen_udp", "listen_tcp", "cn_domain_file", "cn_upstream", "foreign_upstream",
     "cache_size", "cache_lazy_ttl", "cn_mark", "foreign_mark", "cn_interface", "foreign_interface",
     "cn_concurrent", "foreign_concurrent", "tcp_idle_timeout", "nftset_ipv4", "nftset_ipv6", "nftset_fast",
-    "queue_timeout_ms", "tcp_read_timeout", "tcp_write_timeout", "tcp_max_connections", "tcp_max_connections_per_ip"
+    "queue_timeout_ms", "tcp_read_timeout", "tcp_write_timeout", "tcp_max_connections", "tcp_max_connections_per_ip",
+    "udp_sport_reuse", "udp_sport_reuse_max_uses", "udp_sport_reuse_ttl_ms", "udp_sport_reuse_pool"
 };
 typedef struct { char *text; size_t line; } config_value;
 typedef struct { config_value values[CONFIG_LIST_MAX]; size_t count; } config_values;
@@ -271,6 +274,16 @@ static int build_config(md_engine *e, const config *c, const char *path, char *e
     }
     if (capacity && !e->check && !(e->cache = md_cache_new(capacity, lazy)))
         return config_error(err, path, key_line(c, CACHE_SIZE), "cannot allocate cache");
+    /* Opt-in UDP source-port reuse. Default off keeps M4 per-query new ports.
+     * Applied only after the rest of the config succeeds so a failed load cannot
+     * leave a previous process-wide setting from a partial parse. */
+    uint32_t reuse, max_uses, ttl_ms, pool;
+    if (config_number(c, UDP_SPORT_REUSE, 0, 0, 1, false, &reuse, path, err) ||
+        config_number(c, UDP_SPORT_REUSE_MAX_USES, 16, 1, 256, false, &max_uses, path, err) ||
+        config_number(c, UDP_SPORT_REUSE_TTL_MS, 2000, 100, 60000, false, &ttl_ms, path, err) ||
+        config_number(c, UDP_SPORT_REUSE_POOL, 2, 1, 4, false, &pool, path, err)) return -1;
+    md_udp_sport_reuse sport = { reuse, max_uses, ttl_ms, pool };
+    md_forward_set_udp_sport_reuse(&sport);
     return 0;
 }
 
