@@ -34,7 +34,7 @@ class CorpusVersionContracts(unittest.TestCase):
 
     def test_current_contract_from_verified_source(self):
         manifest = (ROOT / "c/tests/nft_cli_contract.json").read_bytes()
-        self.assertEqual(len(verify.nft_cases({"VERSION": b"0.1.1", "c/tests/nft_cli_contract.json": manifest})), 72)
+        self.assertEqual(len(verify.nft_cases({"VERSION": b"0.1.1", "c/tests/nft_cli_contract.json": manifest})), 82)
         with self.assertRaises(ValueError):
             verify.nft_cases({"VERSION": b"0.1.1", "c/plugin/nft_fast.h": b""})
 

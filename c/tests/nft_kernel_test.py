@@ -280,12 +280,12 @@ nftset_fast={fast}
         def present(qt):
             return {x if isinstance(x,str) else x.get('elem',x).get('val') for x in elements(qt)}
         for qt in [1,28]:
-            for count,start in [(257,100),(1000,20000)]:
-                answer = query(f'bulk-{count}-{start}',qt)
+            for count,first in [(257,100),(1000,20000)]:
+                answer = query(f'bulk-{count}-{first}',qt)
                 assert struct.unpack_from('!H',answer,6)[0] == count, (count, answer[:12].hex())
                 learned = present(qt)
-                assert all(address(start+i,qt) in learned for i in range(256)), (qt,count)
-                assert not any(address(start+i,qt) in learned for i in range(256,count)), (qt,count)
+                assert all(address(first+i,qt) in learned for i in range(256)), (qt,count)
+                assert not any(address(first+i,qt) in learned for i in range(256,count)), (qt,count)
             query('short',qt)
         passed('oversized-answer-first-256-learned-noerror')
         for qt in [1,28]:

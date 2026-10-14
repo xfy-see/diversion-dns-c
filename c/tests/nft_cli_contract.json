@@ -286,5 +286,45 @@
   "plain-interval-metadata-ipv6": [
     4,
     0
+  ],
+  "fast-window-ipv4": [
+    0,
+    0
+  ],
+  "fast-window-ipv6": [
+    0,
+    0
+  ],
+  "fast-window-renew-ipv4": [
+    0,
+    0
+  ],
+  "fast-window-renew-ipv6": [
+    0,
+    0
+  ],
+  "fast-window-error-ipv4": [
+    0,
+    0
+  ],
+  "fast-window-error-ipv6": [
+    0,
+    0
+  ],
+  "fast-both-ipv4": [
+    0,
+    0
+  ],
+  "fast-both-ipv6": [
+    0,
+    0
+  ],
+  "window-plain-ipv4": [
+    0,
+    0
+  ],
+  "window-plain-ipv6": [
+    0,
+    0
   ]
 }
