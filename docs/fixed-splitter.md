@@ -256,6 +256,10 @@ DNS 正常回答并打印限速告警（0.1.1 及以前回 SERVFAIL）；队列�
 逐次核对的旧行为。`DIVERSION_NFT_STATS=1` 时退出前向 stderr 打印 applies/skipped/
 transactions 计数（契约测试使用）。
 
+冷路径 fast 读回（GETSETELEM）按最多 8 个地址一批编码进同一 datagram，最后一批还附带
+finish 所需的 GETGEN：与原先「每地址一次往返，再单独 GETGEN」语义相同（内核按序处理），
+但系统调用与唤醒次数更少。单地址冷查询从「读回 + 世代」两趟变成一趟。
+
 同一 fast cohort 中同时有 IPv4 与 IPv6 待写地址、且总数不超过单个事务上限时，两族
 地址合并为一个 GENID 保护的事务（一次 begin/end、一次 ACK 往返、一次 generation
 复读）；任一集合被拒绝则整个事务不提交，随后按原逻辑重试/隔离。只含一族的 cohort

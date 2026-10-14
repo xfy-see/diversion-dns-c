@@ -326,5 +326,21 @@
   "window-plain-ipv6": [
     0,
     0
+  ],
+  "fast-pipeline-ipv4": [
+    0,
+    0
+  ],
+  "fast-pipeline-ipv6": [
+    0,
+    0
+  ],
+  "fast-pipeline-race-ipv4": [
+    0,
+    0
+  ],
+  "fast-pipeline-race-ipv6": [
+    0,
+    0
   ]
 }

@@ -37,6 +37,11 @@ struct nft_fast_state {
      * verify_ms: cohort start, before its generation read (conservative). */
     bool recent_stale;
     uint64_t verify_ms;
+    /* Pipelined readback scratch (per family) and the generation read by the
+     * GETGEN that rode on the last readback datagram (tail_gen_valid). */
+    uint64_t rb_existing[2][NFT_FAST_KEYS], rb_now[2][NFT_FAST_KEYS];
+    bool rb_need[2][NFT_FAST_KEYS], tail_gen_valid;
+    uint32_t tail_gen;
     uint8_t wire[NFT_FAST_WIRE], receive[MD_NL_BUFFER_SIZE];
 };
 static void nft_fast_invalidate(nft_fast_state *s) {
@@ -148,33 +153,35 @@ static int nft_fast_metadata(nft_fast_state *s, const nft_target *t, uint64_t un
  * KEY without EXPIRATION means permanent; never convert or shorten that entry.
  * ENOENT is an ordinary miss. UINT64_MAX is only a sentinel, never added to.
  */
-static int nft_fast_existing(nft_fast_state *s, const nft_target *t, const uint8_t key[16],
-                             uint64_t until, uint64_t *remaining, char *err) {
-    uint8_t request[384];
-    md_nl_requests req = {0};
-    req.wire = request;
-    req.port = s->port;
-    md_nl_writer w = {request, sizeof(request), 0};
-    size_t at, es, elem, k, length;
-    int e = 0;
-    *remaining = 0;
-    if (md_nl_message_start(&w, &req, 0xA0D, 1, nft_fast_seq(s), nft_fast_family(t), 0, &at) ||
+/* Encode one REQUEST-only GETSETELEM for `key` at out[0..). req describes only
+ * this message (wire = out), so ACK/echo checks stay per request. */
+static int nft_fast_elem_encode(nft_fast_state *s, const nft_target *t, const uint8_t key[16],
+                                uint8_t *out, size_t cap, md_nl_requests *req, size_t *length) {
+    memset(req, 0, sizeof(*req));
+    req->wire = out;
+    req->port = s->port;
+    md_nl_writer w = {out, cap, 0};
+    size_t at, es, elem, k;
+    uint32_t seq = nft_fast_seq(s);
+    if (md_nl_message_start(&w, req, 0xA0D, 1, seq, nft_fast_family(t), 0, &at) ||
         md_nl_attr(&w, 1, t->table, strlen(t->table) + 1) || md_nl_attr(&w, 2, t->set, strlen(t->set) + 1) ||
         md_nl_nested_start(&w, 3, &es) || md_nl_nested_start(&w, 1, &elem) ||
         md_nl_nested_start(&w, 1, &k) || md_nl_attr(&w, 1, key, t->bytes) ||
-        md_nl_nested_end(&w, k) || md_nl_nested_end(&w, elem) || md_nl_nested_end(&w, es)) {
-        snprintf(err, MD_ERROR_SIZE, "encode fast nft element/sequence");
-        return -1;
-    }
+        md_nl_nested_end(&w, k) || md_nl_nested_end(&w, elem) || md_nl_nested_end(&w, es)) return -1;
     md_nl_message_end(&w, at);
-    req.length = w.length;
-    if (nft_nl_send(s->fd, request, w.length, until, err) ||
-        nft_nl_receive(s->fd, s->receive, sizeof(s->receive), &length, until, err)) return -1;
-    uint8_t *p = s->receive;
-    if (length < 20 || md_nl_u32(p) != length || md_nl_u32(p+8) != md_nl_u32(request+8) ||
+    req->length = *length = w.length;
+    return 0;
+}
+/* Parse exactly one reply message p[0..length) to the request in req. */
+static int nft_fast_elem_reply(nft_fast_state *s, const nft_target *t, const uint8_t key[16],
+                               md_nl_requests *req, const uint8_t *p, size_t length,
+                               uint64_t *remaining, char *err) {
+    int e = 0;
+    *remaining = 0;
+    if (length < 20 || md_nl_u32(p) != length || md_nl_u32(p+8) != md_nl_u32(req->wire+8) ||
         md_nl_u32(p+12) != s->port) goto invalid;
     if (md_nl_u16(p+4) == 2) {
-        if (md_nl_ack_one(&req, p, length, &e)) goto invalid;
+        if (md_nl_ack_one(req, p, length, &e)) goto invalid;
         if (e == ENOENT) return 0;
         snprintf(err, MD_ERROR_SIZE, "fast nft element read: %s", strerror(e ? e : EPROTO));
         return -1;
@@ -232,6 +239,74 @@ invalid:
     snprintf(err, MD_ERROR_SIZE, "invalid fast nft element metadata");
     return -1;
 }
+/* Pipelined readback: one sendto carries up to NFT_FAST_PIPE REQUEST-only
+ * GETSETELEMs, optionally followed by one GETGEN. The kernel processes the
+ * messages of one datagram in order, so the result equals the previous
+ * one-round-trip-per-key sequence (and the trailing GETGEN equals the
+ * generation check that used to follow the last readback), with fewer
+ * syscalls and wakeups. Replies may arrive in one or several datagrams;
+ * every reply is matched by sequence number and checked like before.
+ * The chunk bound keeps all replies far below the socket receive buffer. */
+#define NFT_FAST_PIPE 8u
+static int nft_fast_existing_many(nft_fast_state *s, const nft_target *t, uint8_t (*keys)[16],
+                                  const size_t *index, size_t n, bool with_gen, uint64_t until,
+                                  uint64_t *remaining, uint32_t *generation, char *err) {
+    md_nl_requests req[NFT_FAST_PIPE + 1];
+    bool seen[NFT_FAST_PIPE + 1] = {0};
+    size_t used = 0, total = n + (with_gen ? 1u : 0u), got = 0;
+    if (with_gen && !generation) { snprintf(err, MD_ERROR_SIZE, "fast nft readback pipeline generation"); return -1; }
+    if (!n || n > NFT_FAST_PIPE) { snprintf(err, MD_ERROR_SIZE, "fast nft readback pipeline size"); return -1; }
+    for (size_t i = 0; i < n; i++) {
+        size_t length;
+        if (nft_fast_elem_encode(s, t, keys[index[i]], s->wire + used, sizeof(s->wire) - used, &req[i], &length)) {
+            snprintf(err, MD_ERROR_SIZE, "encode fast nft element/sequence");
+            return -1;
+        }
+        used += md_nl_align(length);
+    }
+    if (with_gen) {
+        uint32_t seq = nft_fast_seq(s);
+        if (!seq || md_nft_nl_getgen_encode(s->wire + used, sizeof(s->wire) - used, &req[n], s->port, seq)) {
+            snprintf(err, MD_ERROR_SIZE, "nft sequence exhausted");
+            return -1;
+        }
+        used += req[n].length;
+    }
+    if (nft_nl_send(s->fd, s->wire, used, until, err)) return -1;
+    while (got < total) {
+        size_t length;
+        if (nft_nl_receive(s->fd, s->receive, sizeof(s->receive), &length, until, err)) return -1;
+        const uint8_t *p = s->receive;
+        while (length) {
+            if (length < 20) goto invalid;
+            size_t len = md_nl_u32(p);
+            if (len < 20 || len > length) goto invalid;
+            size_t step = md_nl_align(len) <= length ? md_nl_align(len) : len;
+            uint32_t seq = md_nl_u32(p+8);
+            size_t j = 0;
+            for (; j < total; j++) if (md_nl_u32(req[j].wire + 8) == seq) break;
+            if (j == total || seen[j]) goto invalid;
+            if (j < n) {
+                if (nft_fast_elem_reply(s, t, keys[index[j]], &req[j], p, len, &remaining[j], err)) return -1;
+            } else {
+                int e = 0;
+                if (md_nft_nl_gen_consume(&req[j], p, step, generation, &e)) {
+                    snprintf(err, MD_ERROR_SIZE, "invalid nft generation reply");
+                    return -1;
+                }
+                if (e) { snprintf(err, MD_ERROR_SIZE, "nft generation query: %s", strerror(e)); return -1; }
+            }
+            seen[j] = true;
+            got++;
+            p += step;
+            length -= step;
+        }
+    }
+    return 0;
+invalid:
+    snprintf(err, MD_ERROR_SIZE, "invalid fast nft pipelined reply");
+    return -1;
+}
 /* seen/limit count Answer IN A+AAAA in wire order, so an oversized answer
  * learns exactly its first `limit` addresses (the same records as md_dns_view.addresses). */
 typedef struct { uint8_t (*keys)[16]; uint64_t *timeouts; const nft_target *t; size_t count; uint64_t until; unsigned seen, limit; } nft_fast_keys;
@@ -276,16 +351,23 @@ static int nft_fast_revalidate(nft_fast_state *s, const nft_fast_group *g, size_
  * the new generation; if any key is missing the cohort retries, and the retry's
  * per-key readback writes only the keys that are still missing or short. */
 static int nft_fast_confirm(nft_fast_state *s, const nft_fast_group *g, uint64_t until, char *err) {
-    size_t missing = 0, count = g->count;
-    for (size_t i = 0; i < count; i++) {
-        uint64_t existing = 0, now = milliseconds();
-        if (nft_fast_existing(s, g->t, g->keys[i], until, &existing, err)) return -1;
-        uint64_t expires = existing > UINT64_MAX - now ? UINT64_MAX : now + existing;
-        if (existing == UINT64_MAX || (existing && expires >= until + g->timeouts[i] - 14000)) {
-            nft_fast_remember(s, g->family, g->keys[i], g->t->bytes, expires);
-            continue;
+    size_t missing = 0, count = g->count, at = 0;
+    while (at < count) {
+        size_t index[NFT_FAST_PIPE], n = 0;
+        uint64_t now = milliseconds();
+        if (now >= until) { snprintf(err, MD_ERROR_SIZE, "fast nft readback deadline"); return -1; }
+        while (at < count && n < NFT_FAST_PIPE) index[n++] = at++;
+        uint64_t existing[NFT_FAST_PIPE];
+        if (nft_fast_existing_many(s, g->t, g->keys, index, n, false, until, existing, NULL, err)) return -1;
+        for (size_t k = 0; k < n; k++) {
+            uint64_t rem = existing[k];
+            uint64_t expires = rem > UINT64_MAX - now ? UINT64_MAX : now + rem;
+            if (rem == UINT64_MAX || (rem && expires >= until + g->timeouts[index[k]] - 14000)) {
+                nft_fast_remember(s, g->family, g->keys[index[k]], g->t->bytes, expires);
+                continue;
+            }
+            missing++;
         }
-        missing++;
     }
     if (!missing) return 0;
     snprintf(err, MD_ERROR_SIZE, "nft generation changed around commit; %zu of %zu keys not confirmed", missing, count);
@@ -348,7 +430,8 @@ static int nft_fast_commit(nft_fast_state *s, const nft_fast_group *g, size_t ng
             nft_fast_remember(s, g[j].family, g[j].keys[i], g[j].t->bytes, sent_at + g[j].timeouts[i]);
     return 0;
 }
-/* Collect, metadata and per-key readback for one family; no mutation. */
+/* Collect and metadata for one family, then mark the keys that need a kernel
+ * readback (not cached with enough lifetime); no mutation, no readback yet. */
 static int nft_fast_prepare(nft_fast_state *s, nft_fast_group *g, nft_fast_waiter **cohort, size_t count,
                             uint64_t until, char *err) {
     const nft_target *t = g->t;
@@ -367,23 +450,68 @@ static int nft_fast_prepare(nft_fast_state *s, nft_fast_group *g, nft_fast_waite
      * (bounded) instead of failing the whole attempt (N3). */
     for (unsigned tries = 0; !s->metadata[family]; tries++) {
         uint32_t seen = 0;
+        s->tail_gen_valid = false;
         if (nft_fast_metadata(s, t, until, err)) return -1;
         int rc = nft_fast_generation(s, until, &seen, err);
         if (rc && (rc != NFT_FAST_RETRY || tries + 1 >= NFT_FAST_ATTEMPTS)) return rc;
         if (rc) { nft_fast_invalidate(s); s->generation = seen; continue; }
         s->metadata[family] = true;
     }
-    size_t pending = 0;
     for (size_t i = 0; i < v.count; i++) {
-        uint64_t now = milliseconds();
-        if (now >= until) { snprintf(err, MD_ERROR_SIZE, "fast nft readback deadline"); return -1; }
         nft_fast_entry *entry = nft_fast_entry_for(s, family, g->keys[i], t->bytes);
         uint64_t needed = until + g->timeouts[i] - 14000;
         bool known = entry->bytes == t->bytes && !memcmp(entry->key, g->keys[i], t->bytes);
-        if (known && entry->expires >= needed) continue;
-        uint64_t existing = 0;
-        if (nft_fast_existing(s, t, g->keys[i], until, &existing, err)) return -1;
-        /* now precedes readback, so the cached deadline is conservative. */
+        s->rb_need[family][i] = !(known && entry->expires >= needed);
+    }
+    return 0;
+}
+/* Read back every marked key of every group, NFT_FAST_PIPE per datagram. The
+ * very last datagram also carries the GETGEN that nft_fast_finish needs, so a
+ * cold single-key cohort costs one round trip for readback + generation
+ * instead of two. Messages run in order in the kernel: the generation is read
+ * after every readback exactly as before. */
+static int nft_fast_readback(nft_fast_state *s, nft_fast_group *g, size_t ng, uint64_t until, char *err) {
+    size_t last = ng;
+    for (size_t j = 0; j < ng; j++)
+        for (size_t i = 0; i < g[j].count; i++) if (s->rb_need[g[j].family][i]) { last = j; break; }
+    s->tail_gen_valid = false;
+    if (last == ng) return 0;
+    for (size_t j = 0; j <= last; j++) {
+        unsigned family = g[j].family;
+        size_t index[NFT_FAST_PIPE], n = 0, remaining_marked = 0;
+        for (size_t i = 0; i < g[j].count; i++) remaining_marked += s->rb_need[family][i];
+        for (size_t i = 0; i < g[j].count; i++) {
+            if (!s->rb_need[family][i]) continue;
+            index[n++] = i;
+            remaining_marked--;
+            if (n < NFT_FAST_PIPE && remaining_marked) continue;
+            uint64_t now = milliseconds();
+            if (now >= until) { snprintf(err, MD_ERROR_SIZE, "fast nft readback deadline"); return -1; }
+            bool tail = j == last && !remaining_marked;
+            uint64_t existing[NFT_FAST_PIPE];
+            uint32_t gen = 0;
+            if (nft_fast_existing_many(s, g[j].t, g[j].keys, index, n, tail, until, existing, &gen, err)) return -1;
+            for (size_t k = 0; k < n; k++) {
+                s->rb_existing[family][index[k]] = existing[k];
+                s->rb_now[family][index[k]] = now; /* precedes readback: conservative */
+            }
+            if (tail) { s->tail_gen = gen; s->tail_gen_valid = true; }
+            n = 0;
+        }
+    }
+    return 0;
+}
+/* Apply readback results exactly as the per-key loop did: cache keys that are
+ * present with enough lifetime (or permanent), never shorten a longer one, and
+ * move the keys that need a write to keys[0..pending). */
+static void nft_fast_settle(nft_fast_state *s, nft_fast_group *g, uint64_t until) {
+    const nft_target *t = g->t;
+    unsigned family = g->family;
+    size_t pending = 0;
+    for (size_t i = 0; i < g->count; i++) {
+        if (!s->rb_need[family][i]) continue;
+        uint64_t needed = until + g->timeouts[i] - 14000;
+        uint64_t existing = s->rb_existing[family][i], now = s->rb_now[family][i];
         uint64_t expires = existing > UINT64_MAX - now ? UINT64_MAX : now + existing;
         if (existing == UINT64_MAX || expires >= needed) {
             nft_fast_remember(s, family, g->keys[i], t->bytes, expires);
@@ -394,16 +522,19 @@ static int nft_fast_prepare(nft_fast_state *s, nft_fast_group *g, nft_fast_waite
          * be confirmed again if another writer commits. */
         if (pending != i) {
             uint8_t key[16]; uint64_t timeout = g->timeouts[pending];
+            bool need = s->rb_need[family][pending];
+            uint64_t ex = s->rb_existing[family][pending], at = s->rb_now[family][pending];
             memcpy(key, g->keys[pending], 16);
             memcpy(g->keys[pending], g->keys[i], 16);
             g->timeouts[pending] = g->timeouts[i];
+            s->rb_need[family][pending] = true;
             memcpy(g->keys[i], key, 16);
             g->timeouts[i] = timeout;
+            s->rb_need[family][i] = need; s->rb_existing[family][i] = ex; s->rb_now[family][i] = at;
         }
         pending++;
     }
     g->pending = pending;
-    return 0;
 }
 /* Even an all-readback/all-cache hit validates the generation before
  * success. External flush can occur without any writes from this cohort.
@@ -415,7 +546,17 @@ static int nft_fast_prepare(nft_fast_state *s, nft_fast_group *g, nft_fast_waite
 static int nft_fast_finish(nft_fast_state *s, nft_fast_group *g, size_t ng, uint64_t until, char *err) {
     bool moved = false;
     uint32_t seen = 0;
-    int rc = nft_fast_generation(s, until, &seen, err);
+    int rc;
+    if (s->tail_gen_valid) {
+        /* The GETGEN that followed the last readback in the same datagram. */
+        s->tail_gen_valid = false;
+        seen = s->tail_gen;
+        rc = 0;
+        if (seen != s->generation) {
+            snprintf(err, MD_ERROR_SIZE, "nft generation changed; revalidate all mappings");
+            rc = NFT_FAST_RETRY;
+        }
+    } else rc = nft_fast_generation(s, until, &seen, err);
     if (rc == NFT_FAST_RETRY) {
         moved = true;
         if (nft_fast_revalidate(s, g, ng, seen, until, err)) return -1;
@@ -458,12 +599,15 @@ static void nft_fast_note_recent(md_nft *n, nft_fast_state *s, const nft_fast_gr
 static int nft_fast_targets(md_nft *n, nft_fast_state *s, nft_fast_waiter **cohort, size_t count,
                             uint64_t until, char *err) {
     nft_fast_group g[2] = {{&n->v4, 0, s->keys, s->timeouts, 0, 0}, {&n->v6, 1, s->keys6, s->timeouts6, 0, 0}};
+    s->tail_gen_valid = false;
     int rc = nft_fast_prepare(s, &g[0], cohort, count, until, err);
     if (!rc) rc = nft_fast_prepare(s, &g[1], cohort, count, until, err);
     if (rc) return rc;
     nft_fast_group active[2];
     size_t ng = 0;
     for (size_t j = 0; j < 2; j++) if (g[j].count) active[ng++] = g[j];
+    if (ng && (rc = nft_fast_readback(s, active, ng, until, err))) return rc;
+    for (size_t j = 0; j < ng; j++) nft_fast_settle(s, &active[j], until);
     if (!ng) { nft_fast_note_recent(n, s, active, 0); return 0; }
     rc = nft_fast_finish(s, active, ng, until, err);
     if (!rc) nft_fast_note_recent(n, s, active, ng);

@@ -42,3 +42,5 @@ artifact 的 `<arch>/diagload`）。工作负载与 `load.go` 相同（名字、
 `DIVERSION_OWNED_NETNS=1`），复刻 `suite_device.py` 的设备配置与五个场景及 500 QPS 稳定性负载，
 在回环上使用 CI 产物中的 static 程序与 suite-helpers。绝不连接任何路由器。x86/回环结果不能
 代表 MIPS 设备的绝对数值，只用于定位相对瓶颈。
+
+冷 A/AAAA 路径上，nft fast 的逐地址 GETSETELEM 读回与 GETGEN 可合并进同一 datagram（见 `nft_fast_existing_many`）；分析冷尾延迟时应统计 netlink send 次数，而不只看 `nft_io` 墙钟。
