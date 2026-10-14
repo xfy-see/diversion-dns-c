@@ -357,7 +357,7 @@ def _verify_apk(folder, commit, run_id, attempt, arch, checkout):
     require(state["status"] == "passed" and "error" not in state and state["unsigned"] is True
             and state["signing_keys_created"] is False and state["same_sdk_application_matches_apk"] is True,
             "APK build failed, signed, created keys or mismatched tested application")
-    require(state["application_version"] in ("0.1.0", "0.1.1") and state["package_version"] == state["application_version"] + "-r1",
+    require(state["application_version"] in ("0.1.0", "0.1.1", "0.1.2") and state["package_version"] == state["application_version"] + "-r1",
             "buildinfo release version differs")
     apk_name = "diversion-dns-c-lite-" + state["package_version"] + "_" + arch + "_" + commit[:12] + ".apk"
     require(state["apk"]["filename"] == apk_name, "release APK filename differs")
