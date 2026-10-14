@@ -1,7 +1,7 @@
 """The one-version publishers have no network or executable side effects in tests.
 
 Shared publisher contracts run against both the archived v0.1.0 publisher and
-the v0.1.1 publisher, which must keep the same checks.
+the v0.1.2 publisher, which must keep the same checks.
 """
 import importlib.util
 import io
@@ -28,14 +28,14 @@ def load_publisher(name, version):
 
 
 pub = load_publisher("publish_010", "0.1.0")
-pub011 = load_publisher("publish_011", "0.1.1")
+pub012 = load_publisher("publish_012", "0.1.2")
 
 
 class VersionContracts(unittest.TestCase):
     def test_application_recipe_and_metadata_share_version(self):
-        self.assertEqual((ROOT / "VERSION").read_text(), "0.1.1\n")
-        self.assertIn('puts("mosdns-c 0.1.1 fixed-splitter")', (ROOT / "c/main.c").read_text())
-        self.assertIn("PKG_VERSION:=0.1.1\nPKG_RELEASE:=1\n", (ROOT / "packaging/openwrt/Makefile").read_text())
+        self.assertEqual((ROOT / "VERSION").read_text(), "0.1.2\n")
+        self.assertIn('puts("mosdns-c 0.1.2 fixed-splitter")', (ROOT / "c/main.c").read_text())
+        self.assertIn("PKG_VERSION:=0.1.2\nPKG_RELEASE:=1\n", (ROOT / "packaging/openwrt/Makefile").read_text())
         self.assertIn("application_version", (ROOT / "scripts/artifacts.py").read_text())
 
     def test_only_main_push_release_job_gets_write_permission(self):
@@ -224,16 +224,16 @@ class ArtifactDownloadContracts(ArtifactDownloadContractsMixin, unittest.TestCas
     pub = pub
 
 
-class GitHubReadContracts011(GitHubReadContractsMixin, unittest.TestCase):
-    pub = pub011
+class GitHubReadContracts012(GitHubReadContractsMixin, unittest.TestCase):
+    pub = pub012
 
 
-class PublishSequenceContracts011(PublishSequenceContractsMixin, unittest.TestCase):
-    pub = pub011
+class PublishSequenceContracts012(PublishSequenceContractsMixin, unittest.TestCase):
+    pub = pub012
 
 
-class ArtifactDownloadContracts011(ArtifactDownloadContractsMixin, unittest.TestCase):
-    pub = pub011
+class ArtifactDownloadContracts012(ArtifactDownloadContractsMixin, unittest.TestCase):
+    pub = pub012
 
 
 def main_env(**override):
@@ -242,35 +242,35 @@ def main_env(**override):
             "GITHUB_EVENT_NAME": "push", **override}
 
 
-class Release011Contracts(unittest.TestCase):
-    """v0.1.1-only contracts: names, workflow job, version gate and fail-closed paths."""
+class Release012Contracts(unittest.TestCase):
+    """v0.1.2-only contracts: names, workflow job, version gate and fail-closed paths."""
 
     def test_version_derived_names_match_source(self):
-        self.assertEqual((pub011.VERSION, pub011.TAG, pub011.PACKAGE_VERSION), ("0.1.1", "v0.1.1", "0.1.1-r1"))
-        self.assertEqual((ROOT / "VERSION").read_text().strip(), pub011.VERSION)
-        self.assertEqual(pub011.CLI_VERSION, "mosdns-c 0.1.1 fixed-splitter")
-        self.assertIn(f'puts("{pub011.CLI_VERSION}")', (ROOT / "c/main.c").read_text())
-        self.assertEqual(pub011.NOTES.as_posix(), "docs/release-v0.1.1.md")
-        self.assertEqual(pub011.WORK.as_posix(), ".build/release-v0.1.1")
+        self.assertEqual((pub012.VERSION, pub012.TAG, pub012.PACKAGE_VERSION), ("0.1.2", "v0.1.2", "0.1.2-r1"))
+        self.assertEqual((ROOT / "VERSION").read_text().strip(), pub012.VERSION)
+        self.assertEqual(pub012.CLI_VERSION, "mosdns-c 0.1.2 fixed-splitter")
+        self.assertIn(f'puts("{pub012.CLI_VERSION}")', (ROOT / "c/main.c").read_text())
+        self.assertEqual(pub012.NOTES.as_posix(), "docs/release-v0.1.2.md")
+        self.assertEqual(pub012.WORK.as_posix(), ".build/release-v0.1.2")
         self.assertEqual((pub.TAG, pub.VERSION), ("v0.1.0", "0.1.0"))
 
     def test_release_notes_exist_and_list_every_asset(self):
-        notes = (ROOT / pub011.NOTES).read_text()
-        self.assertTrue(notes.startswith("# diversion-dns-c v0.1.1\n"))
-        self.assertIn(pub011.CLI_VERSION, notes)
+        notes = (ROOT / pub012.NOTES).read_text()
+        self.assertTrue(notes.startswith("# diversion-dns-c v0.1.2\n"))
+        self.assertIn(pub012.CLI_VERSION, notes)
         self.assertNotIn("/workspace/", notes)
-        names = pub011.expected_asset_names()
+        names = pub012.expected_asset_names()
         self.assertEqual(len(names), 17)
         for name in names:
             self.assertIn(name, notes)
         self.assertFalse(any("0.1.0" in name for name in names))
-        self.assertIn("diversion-dns-c-lite-0.1.1-r1_mipsel_24kc.apk", names)
-        self.assertIn("posix-lite-static-linux-arm64-v0.1.1.tar.gz", names)
-        self.assertIn("verification-aarch64_cortex-a53-v0.1.1.tar.gz", names)
+        self.assertIn("diversion-dns-c-lite-0.1.2-r1_mipsel_24kc.apk", names)
+        self.assertIn("posix-lite-static-linux-arm64-v0.1.2.tar.gz", names)
+        self.assertIn("verification-aarch64_cortex-a53-v0.1.2.tar.gz", names)
 
     def test_publisher_mirrors_every_archived_check(self):
         old = (ROOT / "scripts/publish-v0.1.0.py").read_text().splitlines()
-        new = (ROOT / "scripts/publish-v0.1.1.py").read_text()
+        new = (ROOT / "scripts/publish-v0.1.2.py").read_text()
         lines = set(new.splitlines())
         allowed = {  # rewritten only to derive names from VERSION
             '"""One-version, main-only release. Verify exact CI bytes; never overwrite a tag.',
@@ -286,43 +286,39 @@ class Release011Contracts(unittest.TestCase):
         self.assertIn('"draft": True, "prerelease": False', new)
         self.assertIn('"draft": False, "prerelease": False, "make_latest": "true"', new)
 
-    def test_release_011_job_mirrors_release_010(self):
+    def test_release_jobs_preserve_archived_checks(self):
         workflow = (ROOT / ".github/workflows/build.yml").read_text()
-        release010 = workflow.split("  release-010:\n", 1)[1].split("  release-011:\n", 1)[0]
-        release011 = workflow.split("  release-011:\n", 1)[1]
-        self.assertIn("run: python3 scripts/publish-v0.1.0.py", release010)
-        self.assertIn("group: stable-release-v0.1.0", release010)
-        self.assertIn("run: python3 scripts/publish-v0.1.1.py", release011)
-        self.assertIn("group: stable-release-v0.1.1", release011)
-        self.assertIn("name: release-v0.1.1-verification-${{ github.sha }}", release011)
-        self.assertIn("path: .build/release-v0.1.1/assets/", release011)
-        self.assertEqual(release010.replace("0.1.0", "0.1.1").strip(), release011.strip())
-        self.assertEqual(workflow.count("contents: write"), 3)  # delivery, release-010, release-011
+        blocks = [workflow.split("  release-" + label + ":\n", 1)[1].split("  release-", 1)[0].strip()
+                  for label in ("010", "011", "012")]
+        self.assertEqual(blocks[0].replace("0.1.0", "0.1.1"), blocks[1])
+        self.assertEqual(blocks[1].replace("0.1.1", "0.1.2"), blocks[2])
+        self.assertIn("run: python3 scripts/publish-v0.1.2.py", blocks[2])
+        self.assertEqual(workflow.count("contents: write"), 4)
 
     def test_other_source_version_skips_before_any_github_read(self):
-        for version in ("0.1.0", "0.1.2", "0.2.0"):
+        for version in ("0.1.0", "0.1.1", "0.2.0"):
             with self.subTest(version=version), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 (root / "VERSION").write_text(version + "\n")
-                with mock.patch.dict(os.environ, main_env()), mock.patch.object(pub011, "ROOT", root), \
-                        mock.patch.object(pub011, "run", return_value=("a" * 40).encode()) as run, \
-                        mock.patch.object(pub011, "api") as api, mock.patch.object(pub011, "absent") as absent, \
+                with mock.patch.dict(os.environ, main_env()), mock.patch.object(pub012, "ROOT", root), \
+                        mock.patch.object(pub012, "run", return_value=("a" * 40).encode()) as run, \
+                        mock.patch.object(pub012, "api") as api, mock.patch.object(pub012, "absent") as absent, \
                         mock.patch("builtins.print") as printed:
-                    pub011.main()
+                    pub012.main()
                 api.assert_not_called()
                 absent.assert_not_called()
                 self.assertEqual(run.call_count, 1)
-                printed.assert_called_once_with("v0.1.1 publisher skipped for a different source version")
+                printed.assert_called_once_with("v0.1.2 publisher skipped for a different source version")
 
     def test_missing_release_notes_fail_before_any_github_read(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            (root / "VERSION").write_text("0.1.1\n")
-            with mock.patch.dict(os.environ, main_env()), mock.patch.object(pub011, "ROOT", root), \
-                    mock.patch.object(pub011, "run", return_value=("a" * 40).encode()), \
-                    mock.patch.object(pub011, "api") as api, mock.patch.object(pub011, "absent") as absent:
+            (root / "VERSION").write_text("0.1.2\n")
+            with mock.patch.dict(os.environ, main_env()), mock.patch.object(pub012, "ROOT", root), \
+                    mock.patch.object(pub012, "run", return_value=("a" * 40).encode()), \
+                    mock.patch.object(pub012, "api") as api, mock.patch.object(pub012, "absent") as absent:
                 with self.assertRaisesRegex(ValueError, "release notes"):
-                    pub011.main()
+                    pub012.main()
             api.assert_not_called()
             absent.assert_not_called()
 
@@ -331,19 +327,19 @@ class Release011Contracts(unittest.TestCase):
             if path.startswith("releases?"):
                 return []
             raise AssertionError(path)
-        with mock.patch.object(pub011, "api", side_effect=api), mock.patch.object(pub011, "absent", return_value=False):
-            with self.assertRaisesRegex(ValueError, "partial/conflicting v0.1.1 tag/release exists"):
-                pub011.existing_release()
+        with mock.patch.object(pub012, "api", side_effect=api), mock.patch.object(pub012, "absent", return_value=False):
+            with self.assertRaisesRegex(ValueError, "partial/conflicting v0.1.2 tag/release exists"):
+                pub012.existing_release()
         env = main_env()
-        with mock.patch.dict(os.environ, env), mock.patch.object(pub011, "run", return_value=("a" * 40).encode()) as run, \
-                mock.patch.object(pub011, "api", side_effect=api), mock.patch.object(pub011, "absent", return_value=False):
+        with mock.patch.dict(os.environ, env), mock.patch.object(pub012, "run", return_value=("a" * 40).encode()) as run, \
+                mock.patch.object(pub012, "api", side_effect=api), mock.patch.object(pub012, "absent", return_value=False):
             with self.assertRaisesRegex(ValueError, "review without overwriting"):
-                pub011.main()
+                pub012.main()
             self.assertEqual(run.call_count, 1)  # only `git rev-parse HEAD`; no tag/release POST
 
     def existing(self, names, published=True):
         commit = "c" * 40
-        release = {"id": 7, "tag_name": "v0.1.1", "draft": not published, "prerelease": False,
+        release = {"id": 7, "tag_name": "v0.1.2", "draft": not published, "prerelease": False,
                    "published_at": "2026-10-11T00:00:00Z" if published else None, "target_commitish": commit,
                    "html_url": "https://github.com/release"}
         assets = [{"id": i, "name": name, "state": "uploaded", "size": 1, "digest": "sha256:" + "1" * 64}
@@ -351,7 +347,7 @@ class Release011Contracts(unittest.TestCase):
         def api(path):
             if path.startswith("releases?"):
                 return [release, dict(release, id=8, tag_name="v0.1.0")]
-            if path == "git/ref/tags/v0.1.1":
+            if path == "git/ref/tags/v0.1.2":
                 return {"object": {"type": "commit", "sha": commit}}
             if path == "releases/7/assets?per_page=100":
                 return assets
@@ -359,30 +355,41 @@ class Release011Contracts(unittest.TestCase):
         return api
 
     def test_existing_release_with_wrong_asset_names_is_refused(self):
-        names = pub011.expected_asset_names()
-        for changed in ({n.replace("0.1.1", "0.1.0") for n in names},
+        names = pub012.expected_asset_names()
+        for changed in ({n.replace("0.1.2", "0.1.0") for n in names},
                         names - {"SHA256SUMS"}, names | {"extra.bin"}):
-            with self.subTest(size=len(changed)), mock.patch.object(pub011, "api", side_effect=self.existing(changed)), \
-                    mock.patch.object(pub011, "absent", return_value=False), mock.patch.object(pub011, "run") as run:
+            with self.subTest(size=len(changed)), mock.patch.object(pub012, "api", side_effect=self.existing(changed)), \
+                    mock.patch.object(pub012, "absent", return_value=False), mock.patch.object(pub012, "run") as run:
                 with self.assertRaisesRegex(ValueError, "assets incomplete"):
-                    pub011.existing_release()
+                    pub012.existing_release()
                 run.assert_not_called()
-        with mock.patch.object(pub011, "api", side_effect=self.existing(names, published=False)), \
-                mock.patch.object(pub011, "absent", return_value=False):
+        with mock.patch.object(pub012, "api", side_effect=self.existing(names, published=False)), \
+                mock.patch.object(pub012, "absent", return_value=False):
             with self.assertRaisesRegex(ValueError, "draft or prerelease exists"):
-                pub011.existing_release()
+                pub012.existing_release()
 
     def test_main_moved_before_any_download_fails_closed(self):
         def api(path):
             if path == "git/ref/heads/main":
                 return {"object": {"sha": "b" * 40}}
             raise AssertionError(path)
-        with mock.patch.dict(os.environ, main_env()), mock.patch.object(pub011, "run", return_value=("a" * 40).encode()) as run, \
-                mock.patch.object(pub011, "existing_release", return_value=None), mock.patch.object(pub011, "api", side_effect=api):
+        with mock.patch.dict(os.environ, main_env()), mock.patch.object(pub012, "run", return_value=("a" * 40).encode()) as run, \
+                mock.patch.object(pub012, "existing_release", return_value=None), mock.patch.object(pub012, "api", side_effect=api):
             with self.assertRaisesRegex(ValueError, "main moved"):
-                pub011.main()
+                pub012.main()
             self.assertEqual(run.call_count, 1)
 
+
+
+# Archived v0.1.1 runtime contracts still run against its unchanged publisher.
+pub011 = load_publisher("publish_011", "0.1.1")
+class GitHubReadContracts011(GitHubReadContractsMixin, unittest.TestCase):
+    pub = pub011
+class ArtifactDownloadContracts011(ArtifactDownloadContractsMixin, unittest.TestCase):
+    pub = pub011
+
+class PublishSequenceContracts011(PublishSequenceContractsMixin, unittest.TestCase):
+    pub = pub011
 
 if __name__ == "__main__":
     unittest.main()

@@ -4,19 +4,15 @@
 
 原始问题名匹配 CN 规则后，走共享缓存及唯一 CN/foreign 上游组；CN 回答包含缓存命中都经过原有 nft 最终处理。保留数字 UDP/TCP 上游、TCP 持久连接、TTL/LRU/lazy 缓存、Linux mark/接口绑定和 domain/full/keyword/regexp。没有跨组 fallback、热重载、服务安装或系统 DNS 接管。GPL-3.0-or-later；未参与构建的历史 libyaml 源码和原 MIT 许可证保留。
 
-## v0.1.1 正式版本
+## v0.1.2
 
-[下载 v0.1.1](https://github.com/xfy-see/diversion-dns-c/releases/tag/v0.1.1) · [发布说明与升级注意](docs/release-v0.1.1.md)
+[下载 v0.1.2](https://github.com/xfy-see/diversion-dns-c/releases/tag/v0.1.2) · [发布说明与升级注意](docs/release-v0.1.2.md)
 
-v0.1.1 是稳定性版本：新增可选的 `nftset_fast` netlink 快速路径，修复并发写入 SERVFAIL、netlink 序列号耗尽、上游黑洞拖垮查询、musl 小线程栈段错误、TCP 慢客户端与 slowloris 等问题，并新增排队期限和 TCP 连接上限配置。`--cpu` 含义、最坏内存和 SERVFAIL 行为有变化，升级前请阅读发布说明。附件组成与 v0.1.0 相同（`0.1.1-r1` 双架构 APK、PCRE2/lite 验证包、SHA256、buildinfo）；`0.1.1-r1` 高于 `0.1.0-r1`。
+v0.1.2 包含上游 UDP 随机 ID/源端口、DNS 解析复用、nft 并发回读与批处理、热命中跳过窗口及首次 TCP 停顿优化。`udp_sport_reuse` 默认关闭，`nftset_hit_window_ms` 默认 1000。功能实测与性能指标分别报告：冷查询 P99 尚无稳定提升结论，严格速率存在未通过轮次，详见发布说明。
 
-## 0.1.2（未发布）
+双架构 `0.1.2-r1` APK 仍未签名，只包含程序，不自动配置服务或接管 DNS。正式发布以对应 Release 已公开且校验信息齐备为准；本源码分支本身不证明已经发布。
 
-修复批次在 PR [#7](https://github.com/xfy-see/diversion-dns-c/pull/7) / [#8](https://github.com/xfy-see/diversion-dns-c/pull/8)，**尚未合并、未发版**。行为说明见 [fixed-splitter 上游 UDP 已知限制](docs/fixed-splitter.md#上游-udp-已知限制012--m4) 与 [c/README.md](c/README.md)。
-
-M4 默认每次上游 UDP 使用新源端口。在 mipsel_24kc（.122，Linux 6.12.94）上，冷缓存 / 首次上游 UDP 相对 v0.1.1 约多 +4–5 ms P50、约 +5 ms P99（2026-10-13 六轮中位数消融：冷 A P99 约 7.3→~12 ms）；热路径与 aarch64（.131）无实质回归。conntrack 约每条冷查询 +1。所有者接受该默认代价；可用显式 opt-in `udp_sport_reuse=1`（见 [fixed-splitter](docs/fixed-splitter.md#上游-udp-已知限制012--m4)）启用有限复用以降冷延迟，并接受源端口唯一性被削弱。
-
-`udp_sport_reuse=1` 为默认关闭的 opt-in，主要改善冷 AAAA（.122 六轮全部改善；冷 A 无稳定收益；TCP 受顺序效应影响无稳定结论）；500 QPS × 30 分钟 900,000/900,000 成功、零漏发、P99 2.976 ms，功能测试通过。仅当慢速 MIPS 冷 AAAA 延迟重要时建议启用。
+上一正式版本：[v0.1.1](https://github.com/xfy-see/diversion-dns-c/releases/tag/v0.1.1) · [历史发布说明](docs/release-v0.1.1.md)。
 
 ## v0.1.0（上一版本）
 
@@ -60,9 +56,9 @@ python3 scripts/migrate-site-config.py docs/go-profiles-site-only.yaml -o /tmp/s
 | Linux ARM64 static | 固定 Zig 0.14.1、PCRE2 10.48，静态 musl 程序和全部测试程序 |
 | Linux x86_64 static | 同样固定依赖的静态 musl 程序和全部测试程序 |
 
-同一工作流还显式构建并验证 POSIX-lite：native/sanitizer 覆盖 macOS ARM64 和 Linux x86_64，静态 musl 覆盖 Linux ARM64/x86_64。它们分别保存在 `experimental-lite-*` Actions 产物中，并在 manifest 内记录 backend；默认产物仍为 PCRE2，lite 不进入原有 CI 预发布；正式版本（v0.1.0、v0.1.1）另行收录经过同源验证的 lite 包。OpenWrt APK 另走 [SDK 实验流程](packaging/openwrt/README.md)。
+同一工作流还显式构建并验证 POSIX-lite：native/sanitizer 覆盖 macOS ARM64 和 Linux x86_64，静态 musl 覆盖 Linux ARM64/x86_64。它们分别保存在 `experimental-lite-*` Actions 产物中，并在 manifest 内记录 backend；默认产物仍为 PCRE2，lite 不进入原有 CI 预发布；正式版本（v0.1.0、v0.1.1、v0.1.2）另行收录经过同源验证的 lite 包。OpenWrt APK 另走 [SDK 实验流程](packaging/openwrt/README.md)。
 
-每个正式版本由各自的一次性发布 job（`release-010`、`release-011`）发布，只在 `VERSION` 与该版本一致时运行；它还等待双 APK job，并独立验证下载内容；已有 tag/release 一律不覆盖。
+每个正式版本由各自的一次性发布 job（`release-010`、`release-011`、`release-012`）发布，只在 `VERSION` 与该版本一致时运行；它还等待双 APK job，并独立验证下载内容；已有 tag/release 一律不覆盖。
 
 main 分支的四个编译/测试 job 成功后，delivery job 会生成 `ci-<commit>-run<id>-attempt<n>` 预发布版本。四个同源 `.tar.gz` 下载包与 `SHA256SUMS` 可以直接从 GitHub Releases 下载，无需 Actions 登录；它们保留 Actions 包内同一份文件。
 
