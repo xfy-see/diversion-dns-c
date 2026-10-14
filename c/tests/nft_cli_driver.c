@@ -148,6 +148,10 @@ static ssize_t __attribute__((unused)) fake_receive(int fd,struct msghdr *m,int 
 
 /* 直接纳入被测实现以调用内部 add_target；宏替换仅存在于测试 driver。 */
 #include NFT_SOURCE
+/* 诊断计时（DIVERSION_TRACE）定义在 util.c，driver 不链接它；此处恒为关闭。 */
+bool md_trace_enabled;
+_Thread_local md_trace *md_trace_cur;
+uint64_t md_now_ns(void) { return 0; }
 #ifdef __APPLE__
 #undef pthread_condattr_setclock
 #undef pthread_cond_timedwait
