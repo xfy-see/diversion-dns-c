@@ -189,7 +189,10 @@ static int bound_socket(int type, uint16_t *port) {
     struct sockaddr_in address = { .sin_family = AF_INET, .sin_port = htons(*port) };
     assert(inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) == 1);
     int bound = bind(fd, (struct sockaddr *)&address, sizeof(address));
-    if (bound) perror("fixture bind");
+    if (bound) {
+        fprintf(stderr, "fixture bind type=%d requested_port=%u fd=%d: ", type, (unsigned)*port, fd);
+        perror("bind");
+    }
     assert(!bound);
     socklen_t len = sizeof(address); assert(!getsockname(fd, (struct sockaddr *)&address, &len)); *port = ntohs(address.sin_port);
     struct timeval timeout = {2, 0}; assert(!setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)));
@@ -332,6 +335,7 @@ static void *serve_retry(void *arg) {
 /* 丢请求、丢响应、损坏回复及超时分别验证重传时序与 fd 清理；不是吞吐基准。 */
 static void retry_tests(void) {
     for (retry_mode mode = DROP_QUERY; mode <= LATE_TCP; mode++) {
+        fprintf(stderr, "retry fixture start mode=%u\n", (unsigned)mode);
         unsigned before = open_fds();
         uint16_t port = 0;
         retry_fixture fixture = { .tcp = -1, .mode = mode };
@@ -370,6 +374,7 @@ static void retry_tests(void) {
         uint16_t port = 0;
         fixtures[i] = (retry_fixture){ .tcp = -1, .mode = RACE_RETRY };
         atomic_init(&fixtures[i].stop, false);
+        fprintf(stderr, "race retry fixture index=%u requested_port=%u\n", i, (unsigned)port);
         fixtures[i].udp = bound_socket(SOCK_DGRAM, &port);
         char address[64], err[MD_ERROR_SIZE]; snprintf(address, sizeof(address), "127.0.0.1:%u", port);
         assert(!md_upstream_init(&us[i], address, NULL, 0, NULL, err));
