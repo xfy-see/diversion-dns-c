@@ -179,7 +179,13 @@ static void *serve_fixture(void *arg) {
 }
 static int bound_socket(int type, uint16_t *port) {
     int fd = socket(AF_INET, type, 0); assert(fd >= 0);
-    int one = 1; assert(!setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)));
+    /* UDP upstream fixtures must own distinct endpoints. SO_REUSEADDR permits
+     * two live UDP listeners to share an address/port on Linux, so competing
+     * upstreams can be delivered to one fixture and look like a source-port
+     * change. Only TCP needs address reuse for its TIME_WAIT lifecycle. */
+    if (type == SOCK_STREAM) {
+        int one = 1; assert(!setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)));
+    }
     struct sockaddr_in address = { .sin_family = AF_INET, .sin_port = htons(*port) };
     assert(inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) == 1);
     int bound = bind(fd, (struct sockaddr *)&address, sizeof(address));
@@ -189,6 +195,18 @@ static int bound_socket(int type, uint16_t *port) {
     struct timeval timeout = {2, 0}; assert(!setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)));
     if (type == SOCK_STREAM) assert(!listen(fd, 2));
     return fd;
+}
+/* A second reusable UDP listener must not be able to steal this endpoint.
+ * This fails with the former SO_REUSEADDR-on-both fixture on Linux. */
+static void fixture_exclusive_test(void) {
+    uint16_t port = 0;
+    int owner = bound_socket(SOCK_DGRAM, &port);
+    int other = socket(AF_INET, SOCK_DGRAM, 0); assert(other >= 0);
+    int one = 1; assert(!setsockopt(other, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)));
+    struct sockaddr_in address = { .sin_family = AF_INET, .sin_port = htons(port) };
+    assert(inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) == 1);
+    assert(bind(other, (struct sockaddr *)&address, sizeof(address)) == -1 && errno == EADDRINUSE);
+    close(other); close(owner);
 }
 /* 可控 UDP/TCP 响应验证回退和多上游竞争；错误响应不能抢先压过有效答案。 */
 static void upstream_tests(void) {
@@ -266,6 +284,13 @@ static void *serve_retry(void *arg) {
         f->received[f->queries++] = monotonic_ms();
         if (f->queries == 1) { first = q; f->source_port = peer.sin_port; }
         else {
+            if (peer.sin_port != f->source_port) {
+                struct sockaddr_in local; socklen_t local_len = sizeof(local);
+                assert(!getsockname(f->udp, (struct sockaddr *)&local, &local_len));
+                fprintf(stderr, "retry fixture mode=%u local=%u queries=%u first_peer=%u peer=%u first_id=%u id=%u\n",
+                        (unsigned)f->mode, ntohs(local.sin_port), f->queries,
+                        ntohs(f->source_port), ntohs(peer.sin_port), md_read16(first.data), md_read16(q.data));
+            }
             assert(peer.sin_port == f->source_port);
             assert(q.len == first.len && !memcmp(q.data, first.data, q.len));
         }
@@ -808,7 +833,7 @@ static void view_tests(void) {
 }
 
 int main(void) {
-    dns_tests(); view_tests(); query_parse_tests(); address_tests(); upstream_tests(); retry_tests(); udp_reuse_tests();
+    fixture_exclusive_test(); dns_tests(); view_tests(); query_parse_tests(); address_tests(); upstream_tests(); retry_tests(); udp_reuse_tests();
     puts("dns/upstream tests passed"); return 0;
 }
 
