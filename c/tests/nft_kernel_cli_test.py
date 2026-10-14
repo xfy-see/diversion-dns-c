@@ -182,6 +182,8 @@ set am6 {{ type ipv6_addr; flags interval; auto-merge; }}
     cn_up, foreign_up = Upstream(), Upstream()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); sock.bind(('127.0.0.1', 0)); port = sock.getsockname()[1]; sock.close()
 
+    # Historical scenarios keep the Stage 1 hit-skip window off (every answer reaches nft);
+    # nft_kernel_test.py's window phase covers the default window on this path.
     def config(name, extra='', sets=('learn4,ipv4_addr,32', 'learn6,ipv6_addr,128')):
         path = out/(name+'.conf')
         path.write_text(f'''listen_udp=127.0.0.1:{port}
@@ -193,6 +195,7 @@ cache_size=4096
 nftset_ipv4=inet,{table},{sets[0]}
 nftset_ipv6=inet,{table},{sets[1]}
 nftset_fast=0
+nftset_hit_window_ms=0
 {extra}''')
         return path
 

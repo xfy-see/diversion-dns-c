@@ -43,10 +43,20 @@ typedef struct nft_fast_state nft_fast_state;
 typedef struct nft_fast_waiter nft_fast_waiter;
 typedef struct nft_waiter { struct nft_waiter *next; } nft_waiter;
 #endif
+/* 热命中跳过窗口的记录：key 为原始地址（interval 目标也按原始地址记录，
+ * 同一地址必然落在同一前缀里）。verified 为该地址最近一次确认存在（写入成功
+ * 或核对通过）之前的时刻；expires 为已知的内核到期时刻，UINT64_MAX 表示未知/
+ * 永久（兼容路径不发送元素 timeout，只按窗口判断）。 */
+#define NFT_RECENT_SLOTS 1024u
+#define NFT_RECENT_MAX_ADDRESSES 64u
+typedef struct { uint8_t key[16]; unsigned bytes; uint64_t verified, expires; } nft_recent;
 struct md_nft {
     nft_target v4, v6;
     bool fast_enabled;
+    unsigned hit_window_ms;
 #ifdef __linux__
+    pthread_mutex_t recent_lock;
+    nft_recent recent[2][NFT_RECENT_SLOTS];
     /* This mutex protects only the FIFO and active token, not nft I/O. */
     pthread_mutex_t lock;
     pthread_cond_t ready;
@@ -107,6 +117,11 @@ md_nft *md_nft_new(const char *args, char *err) {
 #ifdef __linux__
     int initialized = pthread_mutex_init(&n->lock, NULL);
     if (initialized) { snprintf(err, MD_ERROR_SIZE, "initialize nftset mutex: %s", strerror(initialized)); free(n); return NULL; }
+    initialized = pthread_mutex_init(&n->recent_lock, NULL);
+    if (initialized) {
+        pthread_mutex_destroy(&n->lock);
+        snprintf(err, MD_ERROR_SIZE, "initialize nftset mutex: %s", strerror(initialized)); free(n); return NULL;
+    }
     /* 条件变量和整笔请求的截止时间都使用 CLOCK_MONOTONIC，
      * 排队耗时也计入 5 秒预算。 */
     pthread_condattr_t attr;
@@ -120,6 +135,7 @@ md_nft *md_nft_new(const char *args, char *err) {
     }
     if (initialized) {
         if (cond_created) pthread_cond_destroy(&n->ready);
+        pthread_mutex_destroy(&n->recent_lock);
         pthread_mutex_destroy(&n->lock); free(n);
         snprintf(err, MD_ERROR_SIZE, "initialize nftset condition: %s", strerror(initialized)); return NULL;
     }
@@ -138,6 +154,7 @@ static const char *nft_binary(void) {
         if (!access(paths[i], X_OK)) return paths[i];
     return NULL;
 }
+static atomic_uint_fast64_t nft_stat_applies, nft_stat_skipped, nft_stat_transactions;
 static uint64_t milliseconds(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return (uint64_t)t.tv_sec * 1000 + (uint64_t)t.tv_nsec / 1000000;
@@ -435,6 +452,7 @@ static int add_plain_attempt(const nft_target *t, const nft_keys *values, uint8_
     md_nl_requests requests; uint8_t family = !strcmp(t->family, "inet") ? 1 : !strcmp(t->family, "ip") ? 2 : 10;
     if (md_nft_nl_batch_encode(wire, MD_NL_BUFFER_SIZE, &requests, local.nl_pid, ticket + 3, family, t->table, t->set, (const uint8_t (*)[16])values->keys, values->count, t->bytes, after)) { snprintf(err, MD_ERROR_SIZE, "encode bounded nft add batch"); goto done; }
     if (nft_nl_send(fd, wire, requests.length, until, err)) goto done;
+    atomic_fetch_add(&nft_stat_transactions, 1);
     /* 一个 recvmsg 可以包含多个 ACK；必须检查整包中的边界错误，
      * 收齐所有要求 ACK 的添加请求后，才报告本批次成功。 */
     do {
@@ -541,6 +559,7 @@ static int add_interval_target(const char *binary, const nft_target *t, const md
         if (at < 0 || fflush(file) || ferror(file)) { snprintf(err, MD_ERROR_SIZE, "write nft input: %s", strerror(errno)); goto done; }
         rewind(file);
         rc = run_nft(binary, argv, fileno(file), output, NFT_OUTPUT_SIZE, until, err);
+        atomic_fetch_add(&nft_stat_transactions, 1);
         fclose(file); file = NULL;
         if (!rc) break;
         long bad = overlap_element(output, column, v.count);
@@ -571,8 +590,92 @@ static int __attribute__((unused)) add_target(const char *binary, const nft_targ
 #endif
 
 #ifdef __linux__
+/* ---- 热命中跳过窗口 ----
+ * 只在本进程刚写入/核对过同一批地址时跳过内核访问。查表在独立的
+ * recent_lock 下进行（不经过 FIFO/串行令牌，也不取得 nft I/O）。 */
+static unsigned nft_recent_slot(const uint8_t *key, unsigned bytes) {
+    uint32_t h = 2166136261u;
+    for (unsigned i = 0; i < bytes; i++) h = (h ^ key[i]) * 16777619u;
+    return h & (NFT_RECENT_SLOTS - 1u);
+}
+static void nft_recent_clear(md_nft *n) {
+    pthread_mutex_lock(&n->recent_lock);
+    memset(n->recent, 0, sizeof(n->recent));
+    pthread_mutex_unlock(&n->recent_lock);
+}
+/* 调用方持有 recent_lock。 */
+static void nft_recent_put(md_nft *n, unsigned family, const uint8_t *key, unsigned bytes, uint64_t verified, uint64_t expires) {
+    nft_recent *e = &n->recent[family][nft_recent_slot(key, bytes)];
+    memset(e->key, 0, 16); memcpy(e->key, key, bytes);
+    e->bytes = bytes; e->verified = verified; e->expires = expires;
+}
+typedef struct { md_nft *n; uint64_t now; unsigned seen, limit, matched; bool fast; } nft_recent_scan;
+/* 返回非 0 即未命中（停止遍历）。快速路径与 nft_fast_collect 口径一致：只看前
+ * 256 条 Answer IN A/AAAA；需要的剩余寿命与快速路径跳过写入的判据一致
+ * （5 秒期限 + TTL+15 秒 - 14 秒余量），TTL 经 md_dns_ttl 同样封顶。 */
+static int nft_recent_check(const md_packet *p, const md_rr *rr, void *arg) {
+    nft_recent_scan *v = arg;
+    if (rr->section || rr->class_ != 1 || (rr->type != 1 && rr->type != 28) || ++v->seen > v->limit) return 0;
+    const nft_target *t = rr->type == 1 ? &v->n->v4 : &v->n->v6;
+    if (!t->enabled) return 0;
+    if (rr->data_len != t->bytes) return -1;
+    const uint8_t *key = p->data + rr->data_offset;
+    const nft_recent *e = &v->n->recent[rr->type == 1 ? 0 : 1][nft_recent_slot(key, t->bytes)];
+    if (e->bytes != t->bytes || memcmp(e->key, key, t->bytes)) return -1;
+    if (v->now < e->verified || v->now - e->verified >= v->n->hit_window_ms) return -1;
+    if (v->fast && e->expires != UINT64_MAX) {
+        uint64_t needed = v->now + 5000 + (uint64_t)md_dns_ttl(rr->ttl) * 1000 + 15000 - 14000;
+        if (e->expires < needed) return -1;
+    }
+    v->matched++;
+    return 0;
+}
+static bool nft_recent_skip(md_nft *n, const md_packet *r, const md_dns_view *view) {
+    if (!n->hit_window_ms || !view->addresses || view->addresses > NFT_RECENT_MAX_ADDRESSES) return false;
+    char scratch[MD_ERROR_SIZE];
+    nft_recent_scan v = {n, milliseconds(), 0, n->fast_enabled ? 256u : UINT32_MAX, 0, n->fast_enabled};
+    pthread_mutex_lock(&n->recent_lock);
+    int rc = md_dns_view_each(r, view, nft_recent_check, &v, scratch);
+    pthread_mutex_unlock(&n->recent_lock);
+    return !rc && v.matched;
+}
+/* 兼容路径：两个目标都写入成功后，记录本响应全部目标地址（寿命未知）。 */
+typedef struct { md_nft *n; uint64_t verified; } nft_recent_note;
+static int nft_recent_note_rr(const md_packet *p, const md_rr *rr, void *arg) {
+    nft_recent_note *v = arg;
+    if (rr->section || rr->class_ != 1 || (rr->type != 1 && rr->type != 28)) return 0;
+    const nft_target *t = rr->type == 1 ? &v->n->v4 : &v->n->v6;
+    if (!t->enabled || rr->data_len != t->bytes) return 0;
+    nft_recent_put(v->n, rr->type == 1 ? 0 : 1, p->data + rr->data_offset, t->bytes, v->verified, UINT64_MAX);
+    return 0;
+}
+static void nft_recent_note_answer(md_nft *n, const md_packet *r, const md_dns_view *view, uint64_t verified) {
+    if (!n->hit_window_ms || view->addresses > NFT_RECENT_MAX_ADDRESSES) return;
+    char scratch[MD_ERROR_SIZE];
+    nft_recent_note v = {n, verified};
+    pthread_mutex_lock(&n->recent_lock);
+    (void)md_dns_view_each(r, view, nft_recent_note_rr, &v, scratch);
+    pthread_mutex_unlock(&n->recent_lock);
+}
 #include "nft_fast.h"
 #endif
+void md_nft_set_hit_window(md_nft *n, unsigned window_ms) {
+    if (!n) return;
+    n->hit_window_ms = window_ms;
+#ifdef __linux__
+    nft_recent_clear(n);
+#endif
+}
+void md_nft_get_stats(md_nft_stats *out) {
+    if (!out) return;
+#ifdef __linux__
+    out->applies = atomic_load(&nft_stat_applies);
+    out->skipped = atomic_load(&nft_stat_skipped);
+    out->transactions = atomic_load(&nft_stat_transactions);
+#else
+    memset(out, 0, sizeof(*out));
+#endif
+}
 int md_nft_enable_fast(md_nft *n, char *err) {
     if (!n || (!n->v4.enabled && !n->v6.enabled) ||
         (n->v4.enabled && n->v4.mask != 32) || (n->v6.enabled && n->v6.mask != 128)) {
@@ -634,14 +737,25 @@ int md_nft_apply_view(md_nft *n, const md_packet *r, const md_dns_view *view, ch
 #else
     /* 任何 nft 访问之前确认 view 与 r 对应；view 本身来自整包校验。 */
     if (md_dns_view_each(r, view, NULL, NULL, err)) return -1;
+    atomic_fetch_add(&nft_stat_applies, 1);
+    /* 热命中跳过：窗口内本进程已确认的同一批地址不再访问内核（两条路径相同）。 */
+    if (nft_recent_skip(n, r, view)) {
+        atomic_fetch_add(&nft_stat_skipped, 1);
+        md_trace_flag(MD_TF_NFT_SKIP);
+        return 0;
+    }
     if (n->fast_enabled) { md_trace_flag(MD_TF_NFT_FAST); return nft_fast_apply(n, r, view, err); }
     md_trace_flag(MD_TF_NFT_CLI);
     uint64_t until = milliseconds() + 5000;
     if (nft_worker_enter(n, until, err)) return -1;
     md_trace_mark(MD_T_NFT_IO);
+    uint64_t verified = milliseconds();
     /* nft 程序只在 interval set 需要时才查找（NULL 表示按固定路径查找）。 */
     int rc = add_target_view(NULL, &n->v4, r, view, until, err);
     if (!rc) rc = add_target_view(NULL, &n->v6, r, view, until, err);
+    /* 只有两个目标都成功才记录；任何错误清空全部记录（状态不确定）。 */
+    if (rc) nft_recent_clear(n);
+    else nft_recent_note_answer(n, r, view, verified);
     char release_error[MD_ERROR_SIZE] = {0};
     if (nft_worker_leave(n, release_error) && !rc) { snprintf(err, MD_ERROR_SIZE, "%s", release_error); rc = -1; }
     return rc;
@@ -660,7 +774,7 @@ void md_nft_free(md_nft *n) {
     if (!n) return;
 #ifdef __linux__
     nft_fast_free(n->fast);
-    pthread_cond_destroy(&n->ready); pthread_mutex_destroy(&n->lock);
+    pthread_cond_destroy(&n->ready); pthread_mutex_destroy(&n->lock); pthread_mutex_destroy(&n->recent_lock);
 #endif
     free(n);
 }

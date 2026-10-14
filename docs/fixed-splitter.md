@@ -93,6 +93,7 @@ cache_size=1024 # explanation
 | `nftset_ipv4` | 单值，五段逗号格式，IPv4 mask 1–32 | 不学习 IPv4 |
 | `nftset_ipv6` | 单值，五段逗号格式，IPv6 mask 1–128 | 不学习 IPv6 |
 | `nftset_fast` | 单值，0/1；1 要求 Linux ≥6.12、/32 或 /128 和预建普通 timeout set | 0 |
+| `nftset_hit_window_ms` | 单值，0–10000 毫秒；热命中跳过窗口，0 关闭（每个 CN 回答都核对/写入内核），需要 nft 目标 | 1000 |
 | `udp_sport_reuse` | 单值，0/1；1 启用有限上游 UDP 源端口复用（削弱每查询端口唯一性） | 0 |
 | `udp_sport_reuse_max_uses` | 单值，1–256；每个 socket 复用查询次数上限（仅 `udp_sport_reuse=1` 时生效） | 16 |
 | `udp_sport_reuse_ttl_ms` | 单值，100–60000 毫秒；socket 自打开起的最长存活（仅启用时生效） | 2000 |
@@ -235,6 +236,30 @@ DNS 正常回答并打印限速告警（0.1.1 及以前回 SERVFAIL）；队列�
 逐条读回本批地址（存在且 timeout 不短于期望），只重写缺失或过短的元素；批次失败后按
 成员剩余时间份额隔离，仍无法完成者返回失败。
 已有连接需要另外保存 conntrack 分流标记；新连接按当前地址集合判断。
+
+## 热命中跳过窗口（nftset_hit_window_ms，默认 1000 ms）
+
+热点 CN 域名每次缓存命中都会调用 nft 学习。窗口开启时，若同一回答的全部 IN A/AAAA
+（≤64 条，按原始地址）都在窗口内被本进程写入成功或核对通过，且（fast 路径）已知的
+内核剩余寿命满足与原跳过写入相同的判据（5 秒期限 + TTL+15 秒 − 14 秒，TTL 同样
+封顶 86400），本次回答不再访问内核（不进入 FIFO/串行令牌、不读 generation）。
+两条路径（fast 与 CLI/兼容，含 interval 目标）行为相同；需要更长租期的回答永远不会
+被跳过，因此“续期不缩短”和 TTL 上限不变；被跳过的回答不写入任何东西，也就不可能缩短。
+
+记录的失效：任一写入/核对错误清空全部记录；fast 路径观察到 generation 变化（外部
+写者、flush、重建）时丢弃全部映射并清空记录；进程重启记录为空。
+
+**已接受的取舍**：外部 `nft flush`/`delete element`/删表重建后，本进程最多在
+“最后一次核对 + 窗口”之前不会重新学习该地址（窗口内的命中仍正常回答，只是不写回）；
+窗口结束后的第一个回答会重新核对并写回。兼容路径不知道集合默认 timeout，若内核
+对重复添加会刷新默认 timeout，则续期最多推迟一个窗口。`nftset_hit_window_ms=0` 恢复
+逐次核对的旧行为。`DIVERSION_NFT_STATS=1` 时退出前向 stderr 打印 applies/skipped/
+transactions 计数（契约测试使用）。
+
+同一 fast cohort 中同时有 IPv4 与 IPv6 待写地址、且总数不超过单个事务上限时，两族
+地址合并为一个 GENID 保护的事务（一次 begin/end、一次 ACK 往返、一次 generation
+复读）；任一集合被拒绝则整个事务不提交，随后按原逻辑重试/隔离。只含一族的 cohort
+与原流程完全相同。
 
 ## 上游 UDP 已知限制（0.1.2 / M4）
 

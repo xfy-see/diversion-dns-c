@@ -22,6 +22,7 @@ typedef enum {
     CN_CONCURRENT, FOREIGN_CONCURRENT, TCP_IDLE, NFT4, NFT6, NFT_FAST,
     QUEUE_TIMEOUT, TCP_READ, TCP_WRITE, TCP_MAX, TCP_MAX_IP,
     UDP_SPORT_REUSE, UDP_SPORT_REUSE_MAX_USES, UDP_SPORT_REUSE_TTL_MS, UDP_SPORT_REUSE_POOL,
+    NFT_HIT_WINDOW,
     KEY_COUNT
 } config_key;
 static const char *const key_names[KEY_COUNT] = {
@@ -29,7 +30,8 @@ static const char *const key_names[KEY_COUNT] = {
     "cache_size", "cache_lazy_ttl", "cn_mark", "foreign_mark", "cn_interface", "foreign_interface",
     "cn_concurrent", "foreign_concurrent", "tcp_idle_timeout", "nftset_ipv4", "nftset_ipv6", "nftset_fast",
     "queue_timeout_ms", "tcp_read_timeout", "tcp_write_timeout", "tcp_max_connections", "tcp_max_connections_per_ip",
-    "udp_sport_reuse", "udp_sport_reuse_max_uses", "udp_sport_reuse_ttl_ms", "udp_sport_reuse_pool"
+    "udp_sport_reuse", "udp_sport_reuse_max_uses", "udp_sport_reuse_ttl_ms", "udp_sport_reuse_pool",
+    "nftset_hit_window_ms"
 };
 typedef struct { char *text; size_t line; } config_value;
 typedef struct { config_value values[CONFIG_LIST_MAX]; size_t count; } config_values;
@@ -261,6 +263,12 @@ static int build_config(md_engine *e, const config *c, const char *path, char *e
     if (config_number(c, NFT_FAST, 0, 0, 1, false, &fast, path, err)) return -1;
     if (fast && (!e->nft || md_nft_enable_fast(e->nft, err)))
         return config_error(err, path, key_line(c, NFT_FAST), e->nft ? err : "nftset_fast requires a target");
+    /* 热命中跳过窗口：默认 1000 ms，0 关闭（每次 CN 命中都核对/写入内核）。 */
+    uint32_t hit_window;
+    if (config_number(c, NFT_HIT_WINDOW, 1000, 0, 10000, false, &hit_window, path, err)) return -1;
+    if (c->keys[NFT_HIT_WINDOW].count && !e->nft)
+        return config_error(err, path, key_line(c, NFT_HIT_WINDOW), "nftset_hit_window_ms requires a target");
+    if (e->nft) md_nft_set_hit_window(e->nft, hit_window);
     /* Read-only GETSET: warn (never fail) about interval targets lacking auto-merge. */
     md_nft_audit(e->nft);
     e->cn = md_domain_new();
@@ -435,6 +443,12 @@ void md_engine_free(md_engine *e) {
     pthread_mutex_lock(&e->lock); e->stopping = true; refresh_job *jobs = e->jobs; e->jobs = NULL; pthread_mutex_unlock(&e->lock);
     while (jobs) { refresh_job *next = jobs->next; pthread_join(jobs->thread, NULL); free(jobs); jobs = next; }
     md_trace_close();
+    /* 契约测试/诊断：DIVERSION_NFT_STATS=1 时退出前打印 nft 写入计数（默认不打印）。 */
+    if (e->nft && getenv("DIVERSION_NFT_STATS")) {
+        md_nft_stats st; md_nft_get_stats(&st);
+        fprintf(stderr, "nftset stats: applies=%llu skipped=%llu transactions=%llu\n",
+                (unsigned long long)st.applies, (unsigned long long)st.skipped, (unsigned long long)st.transactions);
+    }
     md_domain_free(e->cn); md_cache_free(e->cache); md_nft_free(e->nft);
     free(e->upstreams[0].items); free(e->upstreams[1].items); free(e->listeners);
     pthread_mutex_destroy(&e->lock); free(e);

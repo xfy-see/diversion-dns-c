@@ -17,7 +17,7 @@ TRACE_FIELDS = ['kind', 'lane', 'flags', 'id', 'qtype', 'qname', 'resends', 'att
 FLAGS = {'hit_fresh': 1 << 0, 'hit_stale': 1 << 1, 'refresh_start': 1 << 2, 'up_tcp': 1 << 3,
          'up_tc_fallback': 1 << 4, 'nft_fast': 1 << 5, 'nft_cli': 1 << 6, 'nft_leader': 1 << 7,
          'follower': 1 << 8, 'error': 1 << 9, 'stale_drop': 1 << 10, 'loop_reply': 1 << 11,
-         'tcp': 1 << 12, 'refresh_job': 1 << 13}
+         'tcp': 1 << 12, 'refresh_job': 1 << 13, 'nft_skip': 1 << 14}
 LANES = {0: 'cached', 1: 'cn', 2: 'foreign', 3: 'reply'}
 # Server stages: (name, start field, end field). Missing (0) endpoints skip the stage.
 SERVER_STAGES = [('srv_dispatch', 'recv', 'dispatched'), ('srv_queue_wait', 'enqueue', 'pickup'),

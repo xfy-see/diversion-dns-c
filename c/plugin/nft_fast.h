@@ -30,11 +30,17 @@ struct nft_fast_state {
     size_t chunk_keys;
     bool metadata[2];
     nft_fast_entry entries[2][NFT_FAST_SLOTS];
-    uint8_t keys[NFT_FAST_KEYS][16];
-    uint64_t timeouts[NFT_FAST_KEYS];
+    uint8_t keys[NFT_FAST_KEYS][16], keys6[NFT_FAST_KEYS][16];
+    uint64_t timeouts[NFT_FAST_KEYS], timeouts6[NFT_FAST_KEYS];
+    /* recent_stale: cached mappings were dropped (generation adopted/reset), so the
+     * hit-skip records in md_nft must be cleared before new ones are noted.
+     * verify_ms: cohort start, before its generation read (conservative). */
+    bool recent_stale;
+    uint64_t verify_ms;
     uint8_t wire[NFT_FAST_WIRE], receive[MD_NL_BUFFER_SIZE];
 };
 static void nft_fast_invalidate(nft_fast_state *s) {
+    s->recent_stale = true;
     memset(s->entries, 0, sizeof(s->entries));
     s->metadata[0] = s->metadata[1] = false;
     s->generation = 0;
@@ -228,7 +234,7 @@ invalid:
 }
 /* seen/limit count Answer IN A+AAAA in wire order, so an oversized answer
  * learns exactly its first `limit` addresses (the same records as md_dns_view.addresses). */
-typedef struct { nft_fast_state *s; const nft_target *t; size_t count; uint64_t until; unsigned seen, limit; } nft_fast_keys;
+typedef struct { uint8_t (*keys)[16]; uint64_t *timeouts; const nft_target *t; size_t count; uint64_t until; unsigned seen, limit; } nft_fast_keys;
 static int nft_fast_collect(const md_packet *p, const md_rr *rr, void *arg) {
     nft_fast_keys *v = arg;
     if (rr->section || rr->class_ != 1 || (rr->type != 1 && rr->type != 28) || ++v->seen > v->limit) return 0;
@@ -237,26 +243,31 @@ static int nft_fast_collect(const md_packet *p, const md_rr *rr, void *arg) {
     const uint8_t *key = p->data + rr->data_offset;
     uint64_t ttl = (uint64_t)md_dns_ttl(rr->ttl) * 1000 + 15000;
     for (size_t i = 0; i < v->count; i++) {
-        if (!memcmp(v->s->keys[i], key, v->t->bytes)) {
-            if (v->s->timeouts[i] < ttl) v->s->timeouts[i] = ttl;
+        if (!memcmp(v->keys[i], key, v->t->bytes)) {
+            if (v->timeouts[i] < ttl) v->timeouts[i] = ttl;
             return 0;
         }
     }
     if (v->count == NFT_FAST_KEYS) return -1;
-    memset(v->s->keys[v->count], 0, 16);
-    memcpy(v->s->keys[v->count], key, v->t->bytes);
-    v->s->timeouts[v->count++] = ttl;
+    memset(v->keys[v->count], 0, 16);
+    memcpy(v->keys[v->count], key, v->t->bytes);
+    v->timeouts[v->count++] = ttl;
     return 0;
 }
 /* Adopt a generation committed by another writer: drop every cached mapping
  * (that commit may have removed them) and re-check this target's metadata. */
-static int nft_fast_revalidate(nft_fast_state *s, const nft_target *t, unsigned family,
+/* One target family's keys for this cohort; keys[0..pending) need a write. */
+typedef struct { const nft_target *t; unsigned family; uint8_t (*keys)[16]; uint64_t *timeouts; size_t count, pending; } nft_fast_group;
+static int nft_fast_revalidate(nft_fast_state *s, const nft_fast_group *g, size_t ng,
                                uint32_t generation, uint64_t until, char *err) {
+    s->recent_stale = true;
     memset(s->entries, 0, sizeof(s->entries));
     s->metadata[0] = s->metadata[1] = false;
     s->generation = generation;
-    if (nft_fast_metadata(s, t, until, err)) return -1;
-    s->metadata[family] = true;
+    for (size_t i = 0; i < ng; i++) {
+        if (nft_fast_metadata(s, g[i].t, until, err)) return -1;
+        s->metadata[g[i].family] = true;
+    }
     return 0;
 }
 /* Readback confirmation after an ambiguous concurrent commit. Each key must be
@@ -264,15 +275,14 @@ static int nft_fast_revalidate(nft_fast_state *s, const nft_target *t, unsigned 
  * margin nft_fast_target uses to skip writes. Confirmed keys are cached under
  * the new generation; if any key is missing the cohort retries, and the retry's
  * per-key readback writes only the keys that are still missing or short. */
-static int nft_fast_confirm(nft_fast_state *s, const nft_target *t, unsigned family,
-                            size_t offset, size_t count, uint64_t until, char *err) {
-    size_t missing = 0;
-    for (size_t i = offset; i < offset + count; i++) {
+static int nft_fast_confirm(nft_fast_state *s, const nft_fast_group *g, uint64_t until, char *err) {
+    size_t missing = 0, count = g->count;
+    for (size_t i = 0; i < count; i++) {
         uint64_t existing = 0, now = milliseconds();
-        if (nft_fast_existing(s, t, s->keys[i], until, &existing, err)) return -1;
+        if (nft_fast_existing(s, g->t, g->keys[i], until, &existing, err)) return -1;
         uint64_t expires = existing > UINT64_MAX - now ? UINT64_MAX : now + existing;
-        if (existing == UINT64_MAX || (existing && expires >= until + s->timeouts[i] - 14000)) {
-            nft_fast_remember(s, family, s->keys[i], t->bytes, expires);
+        if (existing == UINT64_MAX || (existing && expires >= until + g->timeouts[i] - 14000)) {
+            nft_fast_remember(s, g->family, g->keys[i], g->t->bytes, expires);
             continue;
         }
         missing++;
@@ -281,17 +291,30 @@ static int nft_fast_confirm(nft_fast_state *s, const nft_target *t, unsigned fam
     snprintf(err, MD_ERROR_SIZE, "nft generation changed around commit; %zu of %zu keys not confirmed", missing, count);
     return NFT_FAST_RETRY;
 }
-static int nft_fast_commit(nft_fast_state *s, const nft_target *t, unsigned family,
-                           size_t offset, size_t count, uint64_t until, bool *moved, char *err) {
+/* Commit g[i].keys[offset[i] .. offset[i]+count[i]) for every listed group in ONE
+ * GENID-guarded transaction (Stage 4: a cohort's IPv4 and IPv6 keys share the
+ * begin/end, ACK round trip and generation re-read). `all` lists every group of
+ * the cohort, so an adopted generation re-checks all their metadata. */
+static int nft_fast_commit(nft_fast_state *s, const nft_fast_group *g, size_t ng, const size_t *offset,
+                           const size_t *count, const nft_fast_group *all, size_t nall,
+                           uint64_t until, bool *moved, char *err) {
     md_nl_requests requests;
-    if (md_nft_nl_batch_timed_encode(s->wire, sizeof(s->wire), &requests, s->port,
-        nft_fast_seq(s), nft_fast_family(t), t->table, t->set,
-        (const uint8_t (*)[16])(s->keys + offset), count, t->bytes, s->generation, s->timeouts + offset)) {
+    md_nl_set_keys sets[2];
+    size_t used = 0;
+    for (size_t i = 0; i < ng; i++) {
+        if (!count[i]) continue;
+        sets[used++] = (md_nl_set_keys){nft_fast_family(g[i].t), g[i].t->table, g[i].t->set,
+                                        (const uint8_t (*)[16])(g[i].keys + offset[i]), count[i], g[i].t->bytes,
+                                        g[i].timeouts + offset[i]};
+    }
+    if (!used || md_nft_nl_batch_multi_encode(s->wire, sizeof(s->wire), &requests, s->port,
+                                              nft_fast_seq(s), s->generation, sets, used)) {
         snprintf(err, MD_ERROR_SIZE, "encode fast nft batch/sequence");
         return -1;
     }
     uint64_t sent_at = milliseconds();
     if (nft_nl_send(s->fd, s->wire, requests.length, until, err)) return -1;
+    atomic_fetch_add(&nft_stat_transactions, 1);
     do {
         size_t length;
         int e = 0;
@@ -314,24 +337,30 @@ static int nft_fast_commit(nft_fast_state *s, const nft_target *t, unsigned fami
     if (after != s->generation + 1u) {
         /* Every ACK succeeded, so this GENID-guarded batch committed; another
          * writer committed too. Instead of failing (and retrying) the cohort,
-         * adopt the new generation; nft_fast_target then reads every key back
+         * adopt the new generation; the caller then reads every key back
          * (present with at least the requested lifetime counts as success). */
         *moved = true;
-        return nft_fast_revalidate(s, t, family, after, until, err);
+        return nft_fast_revalidate(s, all, nall, after, until, err);
     }
     s->generation = after;
-    for (size_t i = offset; i < offset + count; i++)
-        nft_fast_remember(s, family, s->keys[i], t->bytes, sent_at + s->timeouts[i]);
+    for (size_t j = 0; j < ng; j++)
+        for (size_t i = offset[j]; i < offset[j] + count[j]; i++)
+            nft_fast_remember(s, g[j].family, g[j].keys[i], g[j].t->bytes, sent_at + g[j].timeouts[i]);
     return 0;
 }
-static int nft_fast_target(nft_fast_state *s, const nft_target *t, unsigned family,
-                           nft_fast_waiter **cohort, size_t count, uint64_t until, char *err) {
+/* Collect, metadata and per-key readback for one family; no mutation. */
+static int nft_fast_prepare(nft_fast_state *s, nft_fast_group *g, nft_fast_waiter **cohort, size_t count,
+                            uint64_t until, char *err) {
+    const nft_target *t = g->t;
+    unsigned family = g->family;
+    g->count = g->pending = 0;
     if (!t->enabled) return 0;
-    nft_fast_keys v = {s, t, 0, until, 0, 0};
+    nft_fast_keys v = {g->keys, g->timeouts, t, 0, until, 0, 0};
     for (size_t i = 0; i < count; i++) {
         v.seen = 0; v.limit = NFT_FAST_ANSWER_KEYS;
         if (md_dns_view_each(cohort[i]->packet, cohort[i]->view, nft_fast_collect, &v, err)) return -1;
     }
+    g->count = v.count;
     if (!v.count) return 0;
     /* Metadata must be read inside one stable generation. If another writer
      * commits meanwhile, adopt its generation and read the metadata again
@@ -348,53 +377,97 @@ static int nft_fast_target(nft_fast_state *s, const nft_target *t, unsigned fami
     for (size_t i = 0; i < v.count; i++) {
         uint64_t now = milliseconds();
         if (now >= until) { snprintf(err, MD_ERROR_SIZE, "fast nft readback deadline"); return -1; }
-        nft_fast_entry *entry = nft_fast_entry_for(s, family, s->keys[i], t->bytes);
-        uint64_t needed = until + s->timeouts[i] - 14000;
-        bool known = entry->bytes == t->bytes && !memcmp(entry->key, s->keys[i], t->bytes);
+        nft_fast_entry *entry = nft_fast_entry_for(s, family, g->keys[i], t->bytes);
+        uint64_t needed = until + g->timeouts[i] - 14000;
+        bool known = entry->bytes == t->bytes && !memcmp(entry->key, g->keys[i], t->bytes);
         if (known && entry->expires >= needed) continue;
         uint64_t existing = 0;
-        if (nft_fast_existing(s, t, s->keys[i], until, &existing, err)) return -1;
+        if (nft_fast_existing(s, t, g->keys[i], until, &existing, err)) return -1;
         /* now precedes readback, so the cached deadline is conservative. */
         uint64_t expires = existing > UINT64_MAX - now ? UINT64_MAX : now + existing;
         if (existing == UINT64_MAX || expires >= needed) {
-            nft_fast_remember(s, family, s->keys[i], t->bytes, expires);
+            nft_fast_remember(s, family, g->keys[i], t->bytes, expires);
             continue;
         }
-        if (existing > s->timeouts[i]) s->timeouts[i] = existing + 1000;
+        if (existing > g->timeouts[i]) g->timeouts[i] = existing + 1000;
         /* Swap, not overwrite: keys[0..count) stay complete so every key can
          * be confirmed again if another writer commits. */
         if (pending != i) {
-            uint8_t key[16]; uint64_t timeout = s->timeouts[pending];
-            memcpy(key, s->keys[pending], 16);
-            memcpy(s->keys[pending], s->keys[i], 16);
-            s->timeouts[pending] = s->timeouts[i];
-            memcpy(s->keys[i], key, 16);
-            s->timeouts[i] = timeout;
+            uint8_t key[16]; uint64_t timeout = g->timeouts[pending];
+            memcpy(key, g->keys[pending], 16);
+            memcpy(g->keys[pending], g->keys[i], 16);
+            g->timeouts[pending] = g->timeouts[i];
+            memcpy(g->keys[i], key, 16);
+            g->timeouts[i] = timeout;
         }
         pending++;
     }
-    /* Even an all-readback/all-cache hit validates the generation before
-     * success. External flush can occur without any writes from this cohort.
-     * If another writer committed meanwhile, do not discard the whole attempt:
-     * adopt its generation (metadata re-checked), commit the pending keys under
-     * it, then read every key back once more (N3).
-     */
+    g->pending = pending;
+    return 0;
+}
+/* Even an all-readback/all-cache hit validates the generation before
+ * success. External flush can occur without any writes from this cohort.
+ * If another writer committed meanwhile, do not discard the whole attempt:
+ * adopt its generation (metadata re-checked), commit the pending keys under
+ * it, then read every key back once more (N3). Two families with pending keys
+ * that fit one transaction share it (Stage 4); otherwise each family commits
+ * in SO_SNDBUF-sized chunks exactly as before. */
+static int nft_fast_finish(nft_fast_state *s, nft_fast_group *g, size_t ng, uint64_t until, char *err) {
     bool moved = false;
     uint32_t seen = 0;
     int rc = nft_fast_generation(s, until, &seen, err);
     if (rc == NFT_FAST_RETRY) {
         moved = true;
-        if (nft_fast_revalidate(s, t, family, seen, until, err)) return -1;
+        if (nft_fast_revalidate(s, g, ng, seen, until, err)) return -1;
     } else if (rc) return rc;
-    for (size_t offset = 0; offset < pending; ) {
-        size_t n = pending - offset;
-        if (n > s->chunk_keys) n = s->chunk_keys;
-        rc = nft_fast_commit(s, t, family, offset, n, until, &moved, err);
+    if (ng == 2 && g[0].pending && g[1].pending && g[0].pending + g[1].pending <= s->chunk_keys) {
+        size_t offset[2] = {0, 0}, count[2] = {g[0].pending, g[1].pending};
+        rc = nft_fast_commit(s, g, 2, offset, count, g, ng, until, &moved, err);
         if (rc) return rc;
-        offset += n;
+    } else {
+        for (size_t j = 0; j < ng; j++)
+            for (size_t offset = 0; offset < g[j].pending; ) {
+                size_t n = g[j].pending - offset;
+                if (n > s->chunk_keys) n = s->chunk_keys;
+                rc = nft_fast_commit(s, &g[j], 1, &offset, &n, g, ng, until, &moved, err);
+                if (rc) return rc;
+                offset += n;
+            }
     }
-    if (moved) return nft_fast_confirm(s, t, family, 0, v.count, until, err);
+    if (moved)
+        for (size_t j = 0; j < ng; j++)
+            if ((rc = nft_fast_confirm(s, &g[j], until, err))) return rc;
     return 0;
+}
+/* Record every key this cohort verified (cached expiry known) for the hit-skip
+ * window. Stale records are cleared first when mappings were dropped. */
+static void nft_fast_note_recent(md_nft *n, nft_fast_state *s, const nft_fast_group *g, size_t ng) {
+    if (s->recent_stale) { nft_recent_clear(n); s->recent_stale = false; }
+    if (!n->hit_window_ms) return;
+    pthread_mutex_lock(&n->recent_lock);
+    for (size_t j = 0; j < ng; j++)
+        for (size_t i = 0; i < g[j].count; i++) {
+            const nft_fast_entry *e = nft_fast_entry_for(s, g[j].family, g[j].keys[i], g[j].t->bytes);
+            if (e->bytes == g[j].t->bytes && !memcmp(e->key, g[j].keys[i], g[j].t->bytes))
+                nft_recent_put(n, g[j].family, g[j].keys[i], g[j].t->bytes, s->verify_ms, e->expires);
+        }
+    pthread_mutex_unlock(&n->recent_lock);
+}
+/* Both families: prepare IPv4 then IPv6 (no mutation), then one finish. A
+ * cohort whose answers carry only one family behaves exactly as before. */
+static int nft_fast_targets(md_nft *n, nft_fast_state *s, nft_fast_waiter **cohort, size_t count,
+                            uint64_t until, char *err) {
+    nft_fast_group g[2] = {{&n->v4, 0, s->keys, s->timeouts, 0, 0}, {&n->v6, 1, s->keys6, s->timeouts6, 0, 0}};
+    int rc = nft_fast_prepare(s, &g[0], cohort, count, until, err);
+    if (!rc) rc = nft_fast_prepare(s, &g[1], cohort, count, until, err);
+    if (rc) return rc;
+    nft_fast_group active[2];
+    size_t ng = 0;
+    for (size_t j = 0; j < 2; j++) if (g[j].count) active[ng++] = g[j];
+    if (!ng) { nft_fast_note_recent(n, s, active, 0); return 0; }
+    rc = nft_fast_finish(s, active, ng, until, err);
+    if (!rc) nft_fast_note_recent(n, s, active, ng);
+    return rc;
 }
 static int nft_fast_cohort(md_nft *n, nft_fast_waiter **cohort, size_t count,
                            uint64_t until, char *err) {
@@ -403,14 +476,16 @@ static int nft_fast_cohort(md_nft *n, nft_fast_waiter **cohort, size_t count,
         if (nft_fast_open(n, err)) return -1;
         nft_fast_state *s = n->fast;
         uint32_t gen;
+        s->verify_ms = milliseconds();
         int rc = nft_nl_generation(s->fd, s->port, nft_fast_seq(s), s->receive, until, &gen, err);
         if (!rc) {
             if (gen != s->generation) nft_fast_invalidate(s);
             s->generation = gen;
-            rc = nft_fast_target(s, &n->v4, 0, cohort, count, until, err);
-            if (!rc) rc = nft_fast_target(s, &n->v6, 1, cohort, count, until, err);
+            rc = nft_fast_targets(n, s, cohort, count, until, err);
         }
         if (!rc && milliseconds() < until) return 0;
+        /* Any failure leaves kernel state uncertain: drop every hit-skip record. */
+        nft_recent_clear(n);
         nft_fast_reset(s);
         if (!rc) snprintf(err, MD_ERROR_SIZE, "fast nft deadline exceeded after verification");
         if (rc != NFT_FAST_RETRY) return -1;

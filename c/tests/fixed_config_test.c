@@ -68,6 +68,8 @@ static void basic_contract(void) {
     accept_config("queue_timeout_ms=60000\ntcp_read_timeout=300\ntcp_write_timeout=300\ntcp_max_connections=1024\ntcp_max_connections_per_ip=1024\n");
     accept_config("nftset_fast=1\nnftset_ipv4=inet,dns,cn4,ipv4_addr,32\nnftset_ipv6=inet,dns,cn6,ipv6_addr,128\n");
     accept_config("nftset_ipv4=ip,dns,cn4,ipv4_addr,1\nnftset_ipv6=ip6,dns,cn6,ipv6_addr,1\n");
+    accept_config("nftset_hit_window_ms=0\nnftset_ipv4=inet,dns,cn4,ipv4_addr,32\n");
+    accept_config("nftset_hit_window_ms=10000\nnftset_fast=1\nnftset_ipv4=inet,dns,cn4,ipv4_addr,32\n");
     accept_config("udp_sport_reuse=0\n");
     accept_config("udp_sport_reuse=1\nudp_sport_reuse_max_uses=16\nudp_sport_reuse_ttl_ms=2000\nudp_sport_reuse_pool=2\n");
     accept_config("udp_sport_reuse=1\nudp_sport_reuse_max_uses=1\nudp_sport_reuse_ttl_ms=100\nudp_sport_reuse_pool=1\n");
@@ -103,6 +105,8 @@ static void malformed_contract(void) {
         "udp_sport_reuse=2\n", "udp_sport_reuse_max_uses=0\n", "udp_sport_reuse_max_uses=257\n",
         "udp_sport_reuse_ttl_ms=99\n", "udp_sport_reuse_ttl_ms=60001\n",
         "udp_sport_reuse_pool=0\n", "udp_sport_reuse_pool=5\n",
+        "nftset_hit_window_ms=1000\n", "nftset_hit_window_ms=10001\nnftset_ipv4=inet,t,s,ipv4_addr,32\n",
+        "nftset_hit_window_ms=-1\nnftset_ipv4=inet,t,s,ipv4_addr,32\n",
         "cache_size=10 # inline comments are not supported\n", "cache_size='10'\n", "cache_size=\"10\"\n", "cache_size=${CACHE_SIZE}\n",
         "listen_udp=localhost:53\n", "listen_tcp=127.0.0.1:65536\n", "listen_udp=udp://127.0.0.1:53\n",
         "cn_upstream=https://1.1.1.1/dns-query\n", "foreign_upstream=tls://1.1.1.1\n", "cn_upstream=resolver.test\n", "cn_upstream=127.0.0.1:0\n",
@@ -120,7 +124,7 @@ static void malformed_contract(void) {
         "tcp_max_connections_per_ip=32",
         "nftset_ipv4=inet,t,s,ipv4_addr,32", "nftset_ipv6=inet,t,s,ipv6_addr,128",
         "udp_sport_reuse=0", "udp_sport_reuse_max_uses=16", "udp_sport_reuse_ttl_ms=2000",
-        "udp_sport_reuse_pool=2"};
+        "udp_sport_reuse_pool=2", "nftset_hit_window_ms=1000"};
     for (size_t i = 0; i < sizeof(single)/sizeof(single[0]); ++i) {
         char extra[1024]; snprintf(extra, sizeof(extra), "%s\n%s\n", single[i], single[i]); reject(extra);
     }

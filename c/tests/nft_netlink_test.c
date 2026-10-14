@@ -50,6 +50,30 @@ int main(void) {
     CHECK(!md_nft_nl_batch_encode(wire,MD_NL_BUFFER_SIZE,&r,41771,1000,10,"diag","learn6",(const uint8_t (*)[16])keys,MD_NL_MAX_KEYS,16,1));
     CHECK(r.count==10&&r.length<MD_NL_BUFFER_SIZE);
     for(size_t i=1;i<r.count-1;++i){z=ack(copy,&r,i,0,0);CHECK(!md_nft_nl_ack_consume(&r,copy,z,&error)&&!error);CHECK(md_nft_nl_ack_complete(&r)==(i==r.count-2));}
+    {   /* Stage 4: one GENID batch carrying an IPv4 and an IPv6 set equals begin + the two
+         * single-set NEWSETELEM messages (same bytes, consecutive sequence numbers) + end. */
+        uint8_t (*k4)[16]=calloc(2,16),(*k6)[16]=calloc(1,16);uint64_t t4[2]={75000,90000},t6[1]={75000};assert(k4&&k6);
+        memcpy(k4[0],v4,4);k4[1][0]=198;k4[1][1]=18;k4[1][3]=7;k6[0][0]=0xfd;k6[0][1]=0xaa;k6[0][15]=9;
+        md_nl_set_keys groups[2]={{1,"diag","learn4",(const uint8_t (*)[16])k4,2,4,t4},{1,"diag","learn6",(const uint8_t (*)[16])k6,1,16,t6}};
+        md_nl_requests rm,r4,r6;uint8_t *w4=malloc(4096),*w6=malloc(4096);assert(w4&&w6);
+        CHECK(!md_nft_nl_batch_multi_encode(wire,MD_NL_BUFFER_SIZE,&rm,41771,900,0x55,groups,2));
+        CHECK(rm.count==4&&!rm.ack[0]&&rm.ack[1]&&rm.ack[2]&&!rm.ack[3]);
+        CHECK(!md_nft_nl_batch_timed_encode(w4,4096,&r4,41771,900,1,"diag","learn4",(const uint8_t (*)[16])k4,2,4,0x55,t4));
+        CHECK(!md_nft_nl_batch_timed_encode(w6,4096,&r6,41771,901,1,"diag","learn6",(const uint8_t (*)[16])k6,1,16,0x55,t6));
+        size_t m4=r4.offset[2]-r4.offset[1],m6=r6.offset[2]-r6.offset[1];
+        CHECK(!memcmp(wire,w4,r4.offset[1])); /* identical begin with generation */
+        CHECK(rm.offset[2]-rm.offset[1]==m4&&!memcmp(wire+rm.offset[1],w4+r4.offset[1],m4));
+        CHECK(rm.offset[3]-rm.offset[2]==m6&&!memcmp(wire+rm.offset[2],w6+r6.offset[1],m6));
+        CHECK(md_nl_u32(wire+rm.offset[3]+8)==903&&md_nl_u16(wire+rm.offset[3]+4)==17&&rm.length==rm.offset[3]+20);
+        /* Both NEWSETELEM must be ACKed before the multi-set batch counts as complete. */
+        size_t za=ack(copy,&rm,1,0,0);CHECK(!md_nft_nl_ack_consume(&rm,copy,za,&error)&&!error&&!md_nft_nl_ack_complete(&rm));
+        za=ack(copy,&rm,2,0,0);CHECK(!md_nft_nl_ack_consume(&rm,copy,za,&error)&&!error&&md_nft_nl_ack_complete(&rm));
+        /* Single-group multi encode is byte-identical to the historical encoder. */
+        CHECK(!md_nft_nl_batch_multi_encode(wire,MD_NL_BUFFER_SIZE,&rm,41771,900,0x55,groups,1)&&rm.length==r4.length&&!memcmp(wire,w4,r4.length));
+        groups[1].set="9bad";CHECK(md_nft_nl_batch_multi_encode(wire,MD_NL_BUFFER_SIZE,&rm,41771,900,0x55,groups,2)<0);
+        CHECK(md_nft_nl_batch_multi_encode(wire,MD_NL_BUFFER_SIZE,&rm,41771,900,0x55,groups,3)<0);
+        free(k4);free(k6);free(w4);free(w6);
+    }
     CHECK(!md_nft_nl_getgen_encode(wire,MD_NL_BUFFER_SIZE,&r,41771,697));CHECK(r.length==20&&!r.ack[0]&&md_nl_u16(wire+4)==0xA10);saved=r;
     uint32_t g;z=gen_reply(copy,41771,697,0x12345678);CHECK(!md_nft_nl_gen_consume(&r,copy,z,&g,&error)&&g==0x12345678&&!error);
     CHECK(md_nft_nl_gen_consume(&r,copy,z,&g,&error)<0);

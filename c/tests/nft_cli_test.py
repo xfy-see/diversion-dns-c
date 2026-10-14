@@ -182,7 +182,7 @@ def main():
     case('ipv6-interval-overlap-skipped',mode='ipv6',interval=True,name='cn_site6',failure='overlap')
     # Fast mode uses only fake netlink. Repeated requests verify successful ACK
     # dedup, expiration renewal, reset recovery and strict metadata/error handling.
-    for mode, expected_batches, expected_rc in [('fast-dedup', 1, 0), ('fast-reset', 2, 0), ('fast-renew', 2, 0), ('fast-existing', 0, 0), ('fast-interval', 0, 4), ('fast-error', 1, 4), ('fast-permanent', 0, 0), ('fast-permanent-reset', 0, 0), ('fast-old-kernel', 0, 4), ('fast-ttl-highbit', 1, 0), ('fast-ttl-cap', 1, 0), ('fast-race-before', 1, 0), ('fast-race-after', 1, 0), ('fast-race-flush', 2, 0), ('fast-race-forever', 0, 4), ('fast-restart', 2, 0), ('fast-sequence', 2, 0), ('fast-small-buffer', 5, 0), ('fast-large-answer', 1, 0), ('fast-cohort', None, 0), ('fast-cohort-poison', 3, 0)]:
+    for mode, expected_batches, expected_rc in [('fast-dedup', 1, 0), ('fast-reset', 2, 0), ('fast-renew', 2, 0), ('fast-existing', 0, 0), ('fast-interval', 0, 4), ('fast-error', 1, 4), ('fast-permanent', 0, 0), ('fast-permanent-reset', 0, 0), ('fast-old-kernel', 0, 4), ('fast-ttl-highbit', 1, 0), ('fast-ttl-cap', 1, 0), ('fast-race-before', 1, 0), ('fast-race-after', 1, 0), ('fast-race-flush', 2, 0), ('fast-race-forever', 0, 4), ('fast-restart', 2, 0), ('fast-sequence', 2, 0), ('fast-small-buffer', 5, 0), ('fast-large-answer', 1, 0), ('fast-cohort', None, 0), ('fast-cohort-poison', 3, 0), ('fast-window', 2, 0), ('fast-window-renew', 2, 0), ('fast-window-error', 2, 0), ('fast-both', 1, 0)]:
         for kind in ('ipv4','ipv6'):
             local_env=env|{'FAKE_MODE':mode,'NFT_TEST_LOG':str(out/(mode+'-'+kind+'.unexpected-cli'))}
             result=subprocess.run([str(driver),str(child),kind,'diag','learn'],capture_output=True,text=True,timeout=8,env=local_env)
@@ -199,7 +199,8 @@ def main():
                                         ('plain-race-retry', 0, {'opens':2,'generations':4,'batches':1}),
                                         ('plain-race-forever', 4, {'opens':3,'generations':6,'batches':0}),
                                         ('plain-restart', 0, {'opens':2,'generations':4,'batches':2}),
-                                        ('plain-interval-metadata', 4, {'opens':1,'generations':1,'batches':0})]:
+                                        ('plain-interval-metadata', 4, {'opens':1,'generations':1,'batches':0}),
+                                        ('window-plain', 0, {'opens':2,'batches':2})]:
         for kind in ('ipv4','ipv6'):
             local_env=env|{'FAKE_MODE':mode,'NFT_TEST_LOG':str(out/(mode+'-'+kind+'.unexpected-cli'))}
             result=subprocess.run([str(driver),str(child),kind,'diag','learn'],capture_output=True,text=True,timeout=8,env=local_env)

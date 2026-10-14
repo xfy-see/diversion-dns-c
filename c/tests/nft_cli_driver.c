@@ -56,6 +56,14 @@ static const int fake_fd=2147483646;
 static uint8_t fake_reply[MD_NL_BUFFER_SIZE];static size_t fake_length;
 static unsigned opens,closes,sends,generations,batches,key_count,post_receive_clocks;static uint64_t late_ms;static bool batch_received;
 static const char *fake_mode(void){const char *s=getenv("FAKE_MODE");return s?s:"normal";}
+static bool fail_gen; /* window-error: the next generation read fails (EPERM). */
+/* FAST_V6 selects one family; FAST_BOTH decides per request by the set name (…6). */
+static bool fake_v6(const uint8_t *p){
+    if(getenv("FAST_V6"))return true;
+    if(!getenv("FAST_BOTH"))return false;
+    size_t a=20+md_nl_align(md_nl_u16(p+20)),z=md_nl_u16(p+a);
+    return z>=6&&p[a+z-2]=='6';
+}
 static int __attribute__((unused)) fake_clock(clockid_t id,struct timespec *t){if(batch_received&&!strcmp(fake_mode(),"late-parse")&&++post_receive_clocks==2)late_ms=6000;int rc=clock_gettime(id,t);if(!rc&&id==CLOCK_MONOTONIC){t->tv_sec+=(time_t)(late_ms/1000);t->tv_nsec+=(long)(late_ms%1000)*1000000;if(t->tv_nsec>=1000000000){++t->tv_sec;t->tv_nsec-=1000000000;}}return rc;}
 static int __attribute__((unused)) fake_socket(int family,int type,int protocol){assert(family==16&&type==(SOCK_RAW|SOCK_CLOEXEC|SOCK_NONBLOCK)&&protocol==12);++opens;return fake_fd;}
 static int __attribute__((unused)) fake_bind(int fd,const struct sockaddr *p,socklen_t n){assert(fd==fake_fd&&n==sizeof(struct sockaddr_nl));const struct sockaddr_nl *s=(const struct sockaddr_nl *)p;assert(s->nl_family==16&&!s->nl_pid&&!s->nl_groups);return 0;}
@@ -77,7 +85,7 @@ static ssize_t __attribute__((unused)) fake_send(int fd,const void *data,size_t 
     assert(fd==fake_fd&&!flags&&size==sizeof(struct sockaddr_nl));const struct sockaddr_nl *k=(const struct sockaddr_nl *)peer;assert(k->nl_family==16&&!k->nl_pid&&!k->nl_groups);++sends;fake_length=0;const uint8_t *p=data;
     if(md_nl_u16(p+4)==0xA10){++generations;assert(n==20&&md_nl_u16(p+6)==1&&md_nl_u32(p+12)==41771);
         uint32_t seq=md_nl_u32(p+8);assert(seq);if(seq>UINT32_MAX-64u)seq_high=true;else if(seq_high&&seq<64u)seq_wrapped=true;
-        if(!strcmp(fake_mode(),"gen-error")){fake_length=fake_ack(p,fake_reply,-EPERM);return (ssize_t)n;}
+        if(!strcmp(fake_mode(),"gen-error")||fail_gen){fake_length=fake_ack(p,fake_reply,-EPERM);return (ssize_t)n;}
         if (fast_mode() && ((!strcmp(fake_mode(), "fast-reset") && generations == 5) ||
             (!strcmp(fake_mode(), "fast-permanent-reset") && generations == 4) ||
             (!strcmp(fake_mode(), "fast-race-before") && generations == 3) ||
@@ -93,7 +101,7 @@ static ssize_t __attribute__((unused)) fake_send(int fd,const void *data,size_t 
         /* CLI cases: the grammar child's NFT_TEST_INTERVAL now drives the GETSET flags (R3). */
         const char *interval=getenv("NFT_TEST_INTERVAL"),*failure=getenv("NFT_TEST_FAILURE");
         uint8_t val[4];md_nl_be32(val,!strcmp(fake_mode(),"fast-interval")?20:!strcmp(fake_mode(),"plain-interval-metadata")||(interval&&!strcmp(interval,"1"))?4:16);assert(!md_nl_attr(&w,3,val,4));
-        bool v6=getenv("FAST_V6")!=NULL;md_nl_be32(val,failure&&!strcmp(failure,"malformed-metadata")?13:v6?8:7);assert(!md_nl_attr(&w,4,val,4));md_nl_be32(val,v6?16:4);assert(!md_nl_attr(&w,5,val,4));
+        bool v6=fake_v6(p);md_nl_be32(val,failure&&!strcmp(failure,"malformed-metadata")?13:v6?8:7);assert(!md_nl_attr(&w,4,val,4));md_nl_be32(val,v6?16:4);assert(!md_nl_attr(&w,5,val,4));
         md_nl_message_end(&w,at);fake_length=w.length;return (ssize_t)n;
     }
     if(fast_mode()&&md_nl_u16(p+4)==0xA0D){
@@ -102,11 +110,11 @@ static ssize_t __attribute__((unused)) fake_send(int fd,const void *data,size_t 
         md_nl_requests q={0};q.port=41771;md_nl_writer w={fake_reply,sizeof(fake_reply),0};size_t at,es,el,key;
         assert(!md_nl_message_start(&w,&q,0xA0C,0,md_nl_u32(p+8),p[16],0,&at));size_t a=20;
         for(unsigned i=1;i<=2;i++){size_t z=md_nl_u16(p+a);assert(!md_nl_attr(&w,(uint16_t)i,p+a+4,z-4));a+=md_nl_align(z);}
-        unsigned bytes=getenv("FAST_V6")?16:4;const uint8_t *address=p+a+16;
+        unsigned bytes=fake_v6(p)?16:4;const uint8_t *address=p+a+16;
         assert(!md_nl_nested_start(&w,3,&es)&&!md_nl_nested_start(&w,1,&el)&&!md_nl_nested_start(&w,1,&key)&&!md_nl_attr(&w,1,address,bytes)&&!md_nl_nested_end(&w,key));
         uint8_t ttl[8]={0};md_nl_be32(ttl+4,300000);
         if (strncmp(fake_mode(), "fast-permanent", 14)) assert(!md_nl_attr(&w,5,ttl,8));
-        assert(!md_nl_nested_end(&w,el)&&!md_nl_nested_end(&w,es));if(!getenv("FAST_V6")){md_nl_put16(fake_reply+es+2,3);md_nl_put16(fake_reply+el+2,1);md_nl_put16(fake_reply+key+2,1);}
+        assert(!md_nl_nested_end(&w,el)&&!md_nl_nested_end(&w,es));if(!fake_v6(p)){md_nl_put16(fake_reply+es+2,3);md_nl_put16(fake_reply+el+2,1);md_nl_put16(fake_reply+key+2,1);}
         md_nl_message_end(&w,at);fake_length=w.length;return (ssize_t)n;
     }
     if (fast_mode()) assert(n <= (!strcmp(fake_mode(), "fast-small-buffer") ? 2048u : 180224u) - 32);
@@ -244,6 +252,18 @@ int main(int argc, char **argv) {
     /* The production path hands nft the single parsed view of the response. */
     md_dns_view *view = malloc(sizeof(*view)); assert(view && !md_dns_view_parse(&response, view, error));
     if(v6)setenv("FAST_V6","1",1);
+    md_nft_stats st;
+    if(!strcmp(fake_mode(),"window-plain")){
+        /* Hit-skip window on the compatible path: the second identical answer inside
+         * the window makes no netlink call at all; after the window it writes again. */
+        md_nft_set_hit_window(n,60000);
+        rc=md_nft_apply(n,&response,error);
+        unsigned first=sends;
+        if(!rc){rc=md_nft_apply(n,&response,error);assert(rc||sends==first);}
+        md_nft_get_stats(&st);assert(rc||(st.applies==2&&st.skipped==1&&st.transactions==1));
+        if(!rc){late_ms+=61000;rc=md_nft_apply(n,&response,error);assert(rc||sends>first);}
+        md_nft_get_stats(&st);assert(rc||(st.applies==3&&st.skipped==1&&st.transactions==2));
+    }else
     if(plain_mode()){
         /* H4: start just below the 32-bit sequence boundary, then force the
          * 64-bit block counter to wrap; every write must keep succeeding. */
@@ -274,6 +294,48 @@ int main(int argc, char **argv) {
             nft_fast_process(n, group, 2, a.until);
             assert(a.rc == 0 && b.rc == -1 && b.error[0]);
             free(bad); free(bad_view);
+        }
+        else if (!rc && !strcmp(fake_mode(), "fast-both")) {
+            /* Stage 4: a cohort with IPv4 and IPv6 keys commits ONE transaction:
+             * cohort gen + 2x(metadata+gen) + pre-commit gen + post-commit gen. */
+            md_nft_free(n);
+            setenv("FAST_BOTH","1",1); unsetenv("FAST_V6");
+            n = md_nft_new("inet,diag,learn4,ipv4_addr,32 inet,diag,learn6,ipv6_addr,128", error); assert(n);
+            assert(!md_nft_enable_fast(n, error));
+            response.len = 19; md_write16(response.data+6, 2); md_write16(response.data+8, 0); md_write16(response.data+10, 0);
+            record(&response, 1, 1, "198.18.0.9"); record(&response, 28, 1, "fdaa::9");
+            unsigned g0 = generations;
+            rc = md_nft_apply(n, &response, error);
+            assert(rc || (batches == 1 && key_count == 2 && generations - g0 == 5));
+            /* Window off: the repeat is served from the verified cache (no write). */
+            if (!rc) rc = md_nft_apply(n, &response, error);
+            assert(rc || (batches == 1 && key_count == 2));
+        }
+        else if (!rc && (!strcmp(fake_mode(), "fast-window") || !strcmp(fake_mode(), "fast-window-renew") || !strcmp(fake_mode(), "fast-window-error"))) {
+            md_nft_set_hit_window(n, 60000);
+            rc = md_nft_apply(n, &response, error);
+            unsigned first = sends;
+            if (!rc && !strcmp(fake_mode(), "fast-window-renew")) md_write32(response.data+25, 120); /* needs a longer lease */
+            if (!rc) rc = md_nft_apply(n, &response, error);
+            md_nft_get_stats(&st);
+            if (!strcmp(fake_mode(), "fast-window-renew")) assert(rc || (sends > first && st.skipped == 0));
+            else assert(rc || (sends == first && st.skipped == 1 && st.applies == 2));
+            if (!rc && !strcmp(fake_mode(), "fast-window")) {
+                late_ms += 61000; /* window over: full path again (verifies and rewrites) */
+                rc = md_nft_apply(n, &response, error);
+                assert(rc || sends > first);
+            }
+            if (!rc && !strcmp(fake_mode(), "fast-window-error")) {
+                /* Any failure drops every record: after an error nothing is skipped. */
+                late_ms += 61000; fail_gen = true;
+                assert(md_nft_apply(n, &response, error));
+                static const nft_recent zero;
+                for (unsigned f2 = 0; f2 < 2; f2++) for (unsigned i = 0; i < NFT_RECENT_SLOTS; i++)
+                    assert(!memcmp(&n->recent[f2][i], &zero, sizeof(zero)));
+                fail_gen = false; late_ms -= 61000;
+                unsigned before = sends; rc = md_nft_apply(n, &response, error);
+                assert(rc || sends > before);
+            }
         }
         else if (!rc) {
             rc = md_nft_apply(n, &response, error);

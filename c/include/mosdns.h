@@ -181,6 +181,14 @@ int md_nft_apply_view(md_nft *n, const md_packet *r, const md_dns_view *rv, char
 /* 只读检查兼容路径的目标集合，interval set 缺少 auto-merge 时向 stderr 告警；
  * 读取失败时静默，不改变内核状态，也不影响返回结果。 */
 void md_nft_audit(const md_nft *n);
+/* 热命中跳过窗口（毫秒，0 关闭，即每次都走完整的内核核对/写入）。窗口内同一
+ * 地址已被本进程写入或核对且剩余寿命足够时，不再访问内核；代价是外部 flush/
+ * delete/重建后最多 window 毫秒内不会重新学习。任何写入错误或 generation 变化
+ * 清空全部记录。见 docs/fixed-splitter.md「热命中跳过窗口」。 */
+void md_nft_set_hit_window(md_nft *n, unsigned window_ms);
+/* 进程内累计计数（诊断/契约测试）：apply 调用、窗口跳过、内核写事务。 */
+typedef struct { uint64_t applies, skipped, transactions; } md_nft_stats;
+void md_nft_get_stats(md_nft_stats *out);
 void md_nft_free(md_nft *n);
 
 /* engine 拥有不可变分流配置、规则、缓存、nft 和监听器。
@@ -239,7 +247,7 @@ enum {
     MD_TF_UP_TCP = 1u << 3, MD_TF_UP_TC_FALLBACK = 1u << 4, MD_TF_NFT_FAST = 1u << 5,
     MD_TF_NFT_CLI = 1u << 6, MD_TF_NFT_LEADER = 1u << 7, MD_TF_FOLLOWER = 1u << 8,
     MD_TF_ERROR = 1u << 9, MD_TF_STALE_DROP = 1u << 10, MD_TF_LOOP_REPLY = 1u << 11,
-    MD_TF_TCP = 1u << 12, MD_TF_REFRESH_JOB = 1u << 13
+    MD_TF_TCP = 1u << 12, MD_TF_REFRESH_JOB = 1u << 13, MD_TF_NFT_SKIP = 1u << 14
 };
 typedef struct {
     uint64_t t[MD_T_COUNT];
