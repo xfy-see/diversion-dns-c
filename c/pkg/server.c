@@ -507,6 +507,7 @@ int md_server_run(md_engine *e, unsigned workers, char *err) {
     if (pipe(p.wake) || nonblock(p.wake[0]) || nonblock(p.wake[1])) {
         snprintf(err, MD_ERROR_SIZE, "completion pipe: %s", strerror(errno)); goto cleanup;
     }
+    preallocate_fdtable(p.wake[0], count, max_connections, total);
     for (size_t i = 0; i < count; i++) {
         const md_listener *l = md_engine_listener(e, i);
         struct sockaddr_storage a; socklen_t alen;
@@ -534,7 +535,6 @@ int md_server_run(md_engine *e, unsigned workers, char *err) {
             snprintf(err, MD_ERROR_SIZE, "listen %s: %s", l->listen, strerror(errno)); goto cleanup;
         }
     }
-    preallocate_fdtable(fds[0], count, max_connections, total);
     for (; started < total; started++) {
         roles[started] = (worker){&p, started % MD_LANE_COUNT};
         int rc = md_thread_create(&threads[started], work, &roles[started]);

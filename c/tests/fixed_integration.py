@@ -250,6 +250,10 @@ class FixedIntegration(unittest.TestCase):
             info = {}
             config = self.config(tcp_max_connections=64, tcp_max_connections_per_ip=64)
             with running(config, nofile=128, process_info=info) as port:
+                # A listening socket can precede worker/signal-handler startup,
+                # particularly under QEMU. Prove application readiness first;
+                # one UDP answer stays far below the fd-capacity boundary.
+                self.assertEqual(address(udp_exchange(port, query("fd-ready.foreign.test"))), "203.0.113.9")
                 root = Path("/proc") / str(info["pid"])
                 def capacity():
                     return int(next(line.split()[1] for line in
