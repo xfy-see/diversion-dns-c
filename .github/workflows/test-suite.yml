@@ -49,6 +49,7 @@ jobs:
             mkdir -p "dist/$arch"
             GOARCH="$arch" go build -trimpath -ldflags='-s -w' -o "dist/$arch/load" benchmarks/suite/load.go
             GOARCH="$arch" go build -trimpath -ldflags='-s -w' -o "dist/$arch/fixture" benchmarks/suite/fixture.go
+            GOARCH="$arch" go build -trimpath -ldflags='-s -w' -o "dist/$arch/diagload" benchmarks/suite/diagload.go
           done
           cp benchmarks/suite/*.go dist/
           go version > dist/toolchain.txt
@@ -73,6 +74,14 @@ jobs:
           from suite_metrics import measure
           result=measure(json.load(open('helper-smoke.json')))
           assert result['strict_qps_pass'],result
+          PYTHON
+          dist/amd64/diagload -addr 127.0.0.1:15531 -unique -rate 20 -seconds 1 -workers 4 -predial > diag-smoke.json
+          python3 - <<'PYTHON'
+          import json
+          d=json.load(open('diag-smoke.json'))
+          s=d['samples']
+          assert d['schema']=='diversion-diagload-v1' and len(s)==20,d
+          assert all(not x.get('error') and not x.get('unsent') and x['slot_ns']<=x['pickup_ns']<=x['send_ns']<x['recv_ns'] for x in s),s
           PYTHON
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:

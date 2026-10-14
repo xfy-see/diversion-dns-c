@@ -474,6 +474,7 @@ static int nft_fast_apply(md_nft *n, const md_packet *r, const md_dns_view *view
             }
             if (!n->fast_head) n->fast_tail = NULL;
             n->active = true;
+            if (md_trace_cur) { md_trace_cur->t[MD_T_NFT_IO] = md_now_ns(); md_trace_cur->flags |= MD_TF_NFT_LEADER; }
             pthread_mutex_unlock(&n->lock);
             nft_fast_process(n, cohort, count, until);
             pthread_mutex_lock(&n->lock);

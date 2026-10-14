@@ -634,9 +634,11 @@ int md_nft_apply_view(md_nft *n, const md_packet *r, const md_dns_view *view, ch
 #else
     /* 任何 nft 访问之前确认 view 与 r 对应；view 本身来自整包校验。 */
     if (md_dns_view_each(r, view, NULL, NULL, err)) return -1;
-    if (n->fast_enabled) return nft_fast_apply(n, r, view, err);
+    if (n->fast_enabled) { md_trace_flag(MD_TF_NFT_FAST); return nft_fast_apply(n, r, view, err); }
+    md_trace_flag(MD_TF_NFT_CLI);
     uint64_t until = milliseconds() + 5000;
     if (nft_worker_enter(n, until, err)) return -1;
+    md_trace_mark(MD_T_NFT_IO);
     /* nft 程序只在 interval set 需要时才查找（NULL 表示按固定路径查找）。 */
     int rc = add_target_view(NULL, &n->v4, r, view, until, err);
     if (!rc) rc = add_target_view(NULL, &n->v6, r, view, until, err);
