@@ -37,6 +37,11 @@ jobs:
         with:
           go-version: '1.24.9'
           cache: false
+      - name: Native fixed-arrival result output unit tests
+        env:
+          CGO_ENABLED: '0'
+          GO111MODULE: 'off'
+        run: go test -count=1 -v benchmarks/suite/load.go benchmarks/suite/load_output_test.go
       - name: Build standalone fixed-arrival helpers for test clients
         env:
           CGO_ENABLED: '0'
@@ -48,6 +53,7 @@ jobs:
           for arch in amd64 arm64 mipsle; do
             mkdir -p "dist/$arch"
             GOARCH="$arch" go build -trimpath -ldflags='-s -w' -o "dist/$arch/load" benchmarks/suite/load.go
+            GOARCH="$arch" go test -c -trimpath -ldflags='-s -w' -o "dist/$arch/load-output-test" benchmarks/suite/load.go benchmarks/suite/load_output_test.go
             GOARCH="$arch" go build -trimpath -ldflags='-s -w' -o "dist/$arch/fixture" benchmarks/suite/fixture.go
             GOARCH="$arch" go build -trimpath -ldflags='-s -w' -o "dist/$arch/diagload" benchmarks/suite/diagload.go
           done
@@ -75,6 +81,10 @@ jobs:
           result=measure(json.load(open('helper-smoke.json')))
           assert result['strict_qps_pass'],result
           PYTHON
+          if dist/amd64/load -addr 127.0.0.1:15531 -rate 1 -seconds 1 -workers 1 > /dev/full 2> helper-output-full.log; then
+            echo 'load unexpectedly succeeded with an unwritable output sink'
+            exit 1
+          fi
           dist/amd64/diagload -addr 127.0.0.1:15531 -unique -rate 20 -seconds 1 -workers 4 -predial > diag-smoke.json
           python3 - <<'PYTHON'
           import json
