@@ -56,7 +56,7 @@ NFT_CASES = {
         ("fast-existing", 0), ("fast-interval", 4), ("fast-error", 4))
        for family in ("ipv4", "ipv6")},
 }
-TEST_COUNTS = {"final_apk_loopback_integration": 12, "netlink_mock_assertions": 157,
+TEST_COUNTS = {"final_apk_loopback_integration": 12, "netlink_mock_assertions": 170,
                "nft_cli_checks": 30, "regex_concurrent_matches": 43200,
                "portable_regex_comparisons": 81089, "unexpected_regex_differences": 0,
                "known_budget_differences": 2}
@@ -272,7 +272,7 @@ def verify_tests(files, state, source, commands, logs):
     require("POSIX-lite profile: 96 explicit syntax/complexity rejections; grammar, limits, ASCII and locale checks passed\n"
             in logs["qemu-cache_domain_test"], "POSIX-lite profile checks missing")
     require(json_value(logs["qemu-nft_netlink_test"], "netlink log")
-            == {"passed": True, "assertions": 157, "sockets_used": False}, "netlink mock evidence differs")
+            == {"passed": True, "assertions": 170, "sockets_used": False}, "netlink mock evidence differs")
     domain = logs["qemu-domain-fixture"]
     require("shared domain fixture: 11 cases / 70 assertions passed; 4 Unicode/RE2-specific cases explicitly skipped with reasons\n" in domain
             and domain.endswith("POSIX-lite profile: 7 byte/ASCII cases and 5 required Unicode rejections / 37 assertions passed\n"),

@@ -216,7 +216,7 @@ nftset_fast={fast}
                 # Stage 4: 64 concurrent cold A/AAAA answers -> every address learned, and
                 # cohorts share transactions (fewer transactions than answers).
                 stop(); start()
-                with concurrent.futures.ThreadPoolExecutor(max_workers=32) as pool:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
                     list(pool.map(lambda i: query(f'win{100+i}', 1 if i % 2 == 0 else 28), range(64)))
                 stop(); st = stats(); observations.append(dict(case='fast-cold-mixed-64', **st))
                 assert st['applies'] == 64 and st['transactions'] <= 64, st

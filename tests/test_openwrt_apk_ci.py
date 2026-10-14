@@ -390,7 +390,7 @@ class SyntheticBuild:
         elif "/wrappers/" in command[0]:
             name = Path(command[0]).name
             label = "qemu-" + name
-            text = {"cache_domain_test": "43200 matches passed\n", "nft_netlink_test": '{"assertions":157}\n'}.get(name, "")
+            text = {"cache_domain_test": "43200 matches passed\n", "nft_netlink_test": '{"assertions":170}\n'}.get(name, "")
         elif len(command) > 1 and command[1].endswith("domain_fixture.py"):
             label = "qemu-domain-fixture"
         elif len(command) > 1 and command[1].endswith("nft_cli_test.py"):
