@@ -17,6 +17,7 @@ runs with DIVERSION_TRACE are attribution-only and never feed pass/fail.
 import argparse
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -80,6 +81,7 @@ class App:
     def __init__(self, app, folder, cpu, trace):
         env = dict(os.environ)
         env.pop('DIVERSION_TRACE', None)
+        env['DIVERSION_NFT_STATS'] = '1'  # builds with the counters print applies/skipped/transactions at exit
         if trace:
             env['DIVERSION_TRACE'] = str(folder / 'trace.tsv')
         self.log = (folder / 'app.log').open('w')
@@ -135,9 +137,19 @@ def run_one(args, name, app, spec, tool, folder, trace, cfg_extra=(), load_extra
         row['metrics'] = {k: m.get(k) for k in ('pass', 'functional_pass', 'strict_rate_pass', 'nftset_exact_addresses_pass',
                                                'offered', 'sent', 'success', 'unsent', 'errors', 'p50_ms', 'p99_ms',
                                                'p999_ms', 'max_ms', 'send_late_max_ms', 'late_send_count', 'first10', 'last10')}
+    stats = re.search(r'applies=(\d+) skipped=(\d+) transactions=(\d+)', (folder / 'app.log').read_text())
+    if stats:
+        row['nft_stats'] = dict(zip(('applies', 'skipped', 'transactions'), map(int, stats.groups())))
     if trace:
         with open(folder / 'trace.tsv') as f:
             tr = tail_attribution.parse_trace(f)
+        q = [t for t in tr if t['kind'] == 'Q' and t['reply']]
+        row['trace_counts'] = dict(
+            replies=len(q), nft_applies=sum(1 for t in q if t['nft0']),
+            nft_kernel_io=sum(1 for t in q if t['nft_io']),
+            nft_skip=sum(1 for t in q if t['flags'] & tail_attribution.FLAGS['nft_skip']),
+            srv_over_2ms=sum(1 for t in q if t['reply'] - t['recv'] > 2_000_000),
+            nft_over_2ms=sum(1 for t in q if t['nft0'] and t['nft1'] - t['nft0'] > 2_000_000))
         if tool == 'diagload':
             res = tail_attribution.analyze(raw, tr)
             (folder / 'attribution.json').write_text(json.dumps(res, indent=1))
@@ -160,7 +172,7 @@ def main():
     ap.add_argument('--helpers', type=Path, required=True)
     ap.add_argument('--output', type=Path, required=True)
     ap.add_argument('--cpu', type=int, default=4)
-    ap.add_argument('--plan', choices=('full', 'regression', 'smoke'), default='full')
+    ap.add_argument('--plan', choices=('full', 'regression', 'smoke', 'compare'), default='full')
     ap.add_argument('--repeats', type=int, default=3)
     args = ap.parse_args()
     assert os.geteuid() == 0 and os.environ.get('DIVERSION_OWNED_NETNS') == '1', 'owned netns root required'
@@ -207,6 +219,22 @@ def main():
                 for rate in (250, 500, 1000, 2000):
                     go(target_name, target, 'cold-udp-a', 'diagload', True, load_extra=['-workers', '512', '-predial'],
                        tag='-step%d' % rate, spec_over=dict(rate=rate, seconds=5))
+        if args.plan == 'compare':   # Stage 1/4 comparison: every app, rotated order per repeat
+            for r in range(args.repeats):
+                order = apps[r % len(apps):] + apps[:r % len(apps)]
+                for name, app in order:
+                    for sid in ('hot-udp-mixed', 'hot-tcp-mixed', 'stability-hot-udp-mixed-500',
+                                'cold-udp-a', 'cold-udp-aaaa', 'cold-tcp-mixed'):
+                        over = dict(seconds=20) if sid in ('hot-udp-mixed', 'stability-hot-udp-mixed-500') else None
+                        go(name, app, sid, 'load', False, tag='-cmp%d' % r, spec_over=over)
+                        go(name, app, sid, 'diagload', True, load_extra=['-workers', '32'], tag='-cmp%d-w32' % r,
+                           spec_over=over)
+                    for sid in ('hot-udp-mixed', 'cold-udp-a'):
+                        over = dict(seconds=20) if sid == 'hot-udp-mixed' else None
+                        go(name, app, sid, 'load', False, cfg_extra=['nftset_fast=0'], tag='-cmp%d-nftcli' % r,
+                           spec_over=over)
+                        go(name, app, sid, 'diagload', True, cfg_extra=['nftset_fast=0'], load_extra=['-workers', '32'],
+                           tag='-cmp%d-nftcli-w32' % r, spec_over=over)
         if args.plan in ('full', 'regression'):
             for r in range(args.repeats):
                 order = apps if r % 2 == 0 else apps[::-1]

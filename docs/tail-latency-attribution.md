@@ -19,7 +19,7 @@
 * 时间：CLOCK_MONOTONIC 纳秒，0 表示未发生。`up_send/up_recv` 包住整个 `md_forward_q`
   （含建 socket/连接、重发与 TC→TCP 回退）；`nft_io` 为 CLI 路径取得串行令牌后、fast 路径成为
   批次 leader 时；fast 路径的非 leader 只有 `nft0/nft1`（全部为等待 leader）。
-* `flags` 位见 `c/include/mosdns.h` 中 `MD_TF_*`。
+* `flags` 位见 `c/include/mosdns.h` 中 `MD_TF_*`。 `MD_TF_NFT_SKIP`（1<<14，`nft_skip`）表示该回答因热命中跳过窗口未访问内核。`--plan compare` 在多个构建间轮换顺序比较热/冷/500 QPS/nftset_fast=0，并记录 `DIVERSION_NFT_STATS` 计数与 trace 中的内核 nft I/O、>2ms 次数。
 * 每行在回复发出后由 worker（UDP）或事件循环（TCP 写完）写入 1 MiB 缓冲文件；跟随者
   （合并的相同查询）复制主请求的阶段时间并带 follower 标志。
 
