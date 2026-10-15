@@ -620,10 +620,17 @@ int md_forward(const md_upstream *us, size_t count, unsigned concurrent,
 }
 int md_forward_view(const md_upstream *us, size_t count, unsigned concurrent,
                     const md_packet *q, md_packet *r, md_dns_view *rv, char *err) {
-    md_question parsed;
+    return md_forward_q(us, count, concurrent, q, NULL, r, rv, err);
+}
+int md_forward_q(const md_upstream *us, size_t count, unsigned concurrent,
+                 const md_packet *q, const md_dns_query *qv, md_packet *r, md_dns_view *rv, char *err) {
+    md_dns_query local;
     if (rv) { rv->valid = false; rv->count = 0; }
-    if (!us || !count || !q || !r || md_dns_question(q, &parsed, err) || (parsed.flags & 0x8000u))
+    /* 复用调用方的一次请求解析；兼容入口（qv 无效）才在此解析。 */
+    if (!md_dns_query_ok(q, qv)) qv = q && !md_dns_query_parse(q, &local, err) ? &local : NULL;
+    if (!us || !count || !q || !r || !qv || (qv->q.flags & 0x8000u))
         return fail(err, "invalid forward query or empty upstream list");
+    const md_question parsed = qv->q;
     if (!concurrent) concurrent = 1;
     if (concurrent > 3) concurrent = 3;
     if (concurrent > count) concurrent = (unsigned)count;

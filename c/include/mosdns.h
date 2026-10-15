@@ -48,6 +48,19 @@ bool md_dns_response_matches(const md_packet *q, const md_packet *r);
 int md_dns_error(const md_packet *q, md_packet *r, unsigned rcode);
 int md_dns_strip_opt(md_packet *p);
 void md_dns_limit_udp(const md_packet *q, md_packet *r);
+/* 一次解析的请求：md_dns_query_parse 做与 md_dns_question 完全相同的整包校验
+ * （同样的拒绝条件和错误信息），并在同一遍里记录缓存键所需的 EDNS 检查
+ * （至多一个无选项、版本 0、extended RCODE 0 的 OPT，且没有其他记录）。
+ * 服务端收包时解析一次，之后 engine/cache/forward/limit_udp/error 全部复用。
+ * 请求报文在处理期间只读；len 不符或未解析时，*_q 接口退回兼容的自行解析。
+ * route 是 engine 的分流备忘（-1 未知，0 境外，1 CN），解析时置 -1。 */
+typedef struct {
+    md_question q; size_t len; bool valid, cache_edns_ok; signed char route;
+} md_dns_query;
+int md_dns_query_parse(const md_packet *p, md_dns_query *v, char *err);
+bool md_dns_query_ok(const md_packet *p, const md_dns_query *v);
+int md_dns_error_q(const md_packet *q, const md_dns_query *qv, md_packet *r, unsigned rcode);
+void md_dns_limit_udp_q(const md_packet *q, const md_dns_query *qv, md_packet *r);
 
 /* 一次解析的响应索引：md_dns_view_parse 做与 md_dns_question+md_dns_records
  * 完全相同的整包校验，同时记录每条 RR 的偏移（报文 <=65535 字节，16 位足够）。
@@ -104,6 +117,11 @@ int md_cache_get_view(md_cache *c, const md_packet *q, md_packet *r, md_dns_view
 void md_cache_put(md_cache *c, const md_packet *q, const md_packet *r, uint64_t now);
 /* 同 md_cache_put，但复用调用方已为 r 构建的 view，不再解析响应。 */
 void md_cache_put_view(md_cache *c, const md_packet *q, const md_packet *r, const md_dns_view *rv, uint64_t now);
+/* 同上，复用请求的一次解析 qv（不再解析请求）；qv 无效时退回自行解析。 */
+int md_cache_get_q(md_cache *c, const md_packet *q, const md_dns_query *qv, md_packet *r, md_dns_view *rv, uint64_t now);
+void md_cache_put_q(md_cache *c, const md_packet *q, const md_dns_query *qv, const md_packet *r, const md_dns_view *rv, uint64_t now);
+bool md_cache_refresh_begin_q(md_cache *c, const md_packet *q, const md_dns_query *qv);
+void md_cache_refresh_end_q(md_cache *c, const md_packet *q, const md_dns_query *qv);
 /* begin 成功表示获得该 key 的刷新标记，必须由 end 配对释放；
  * false 还可能表示容量不足或 key 不支持缓存，不能只理解为重复刷新。 */
 bool md_cache_refresh_begin(md_cache *c, const md_packet *q);
@@ -127,6 +145,9 @@ int md_forward(const md_upstream *us, size_t count, unsigned concurrent,
 /* 同 md_forward；rv 非空时在返回且 r->len>0 时填入 r 的 view（接收时的唯一一次解析）。 */
 int md_forward_view(const md_upstream *us, size_t count, unsigned concurrent,
                     const md_packet *q, md_packet *r, md_dns_view *rv, char *err);
+/* 同 md_forward_view，复用请求的一次解析 qv；qv 无效时退回自行解析。 */
+int md_forward_q(const md_upstream *us, size_t count, unsigned concurrent,
+                 const md_packet *q, const md_dns_query *qv, md_packet *r, md_dns_view *rv, char *err);
 /* Server workers opt in once and clean up after their final synchronous query.
  * Unscoped/library calls keep fresh sockets. Allocation failure also stays fresh. */
 void md_forward_worker_enable(void);
@@ -189,6 +210,10 @@ unsigned md_engine_dispatch(md_engine *e, size_t entry, const md_packet *q, md_p
 /* True only for MD_LANE_REPLY; CN cache hits still use workers for mandatory
  * nft finalization and lazy refresh. Leaves r->len=0 otherwise. */
 bool md_engine_cached_query(md_engine *e, size_t entry, const md_packet *q, md_packet *r);
+/* 同 dispatch/query，复用服务端收包时的一次解析 qv，并在 qv->route 记住分流
+ * 结果（dispatch 与 worker 不再各做一次域名匹配）。qv 无效时退回自行解析。 */
+unsigned md_engine_dispatch_q(md_engine *e, size_t entry, const md_packet *q, md_dns_query *qv, md_packet *r);
+int md_engine_query_q(md_engine *e, size_t entry, const md_packet *q, md_dns_query *qv, md_packet *r, char *err);
 /* 销毁等待后台刷新结束；调用方先停服务/查询，避免访问已释放插件。 */
 void md_engine_free(md_engine *e);
 /* 单调时钟秒数，用于 TTL 和到期判断，不是 Unix 时间戳。 */

@@ -267,13 +267,8 @@ bool md_dns_response_matches(const md_packet *q, const md_packet *r) {
 }
 /* 能解析的问题会原样保留；无法解析时生成无问题的最小错误头。
  * memmove 允许请求与响应使用同一个报文对象。 */
-int md_dns_error(const md_packet *q, md_packet *r, unsigned rcode) {
-    md_question parsed;
-    name_marks m;
-    if (!q || !r || rcode > 15) return -1;
-    marks_reset(&m, q);
-    bool valid = question(q, &m, &parsed, NULL) == 0;
-    size_t len = valid ? parsed.end : 12;
+static int error_with(const md_packet *q, md_packet *r, unsigned rcode, bool valid, size_t len) {
+    if (!valid) len = 12;
     uint16_t id = q->len >= 2 ? md_read16(q->data) : 0;
     uint16_t flags = q->len >= 4 ? md_read16(q->data + 2) : 0;
     if (valid) memmove(r->data, q->data, len); else memset(r->data, 0, 12);
@@ -283,6 +278,20 @@ int md_dns_error(const md_packet *q, md_packet *r, unsigned rcode) {
     md_write16(r->data + 4, valid ? 1 : 0);
     memset(r->data + 6, 0, 6);
     return 0;
+}
+int md_dns_error(const md_packet *q, md_packet *r, unsigned rcode) {
+    md_question parsed;
+    name_marks m;
+    if (!q || !r || rcode > 15) return -1;
+    marks_reset(&m, q);
+    bool valid = question(q, &m, &parsed, NULL) == 0;
+    return error_with(q, r, rcode, valid, valid ? parsed.end : 12);
+}
+/* 已完整解析的请求必然有合法问题区，与 md_dns_error 的结果相同。 */
+int md_dns_error_q(const md_packet *q, const md_dns_query *qv, md_packet *r, unsigned rcode) {
+    if (!md_dns_query_ok(q, qv)) return md_dns_error(q, r, rcode);
+    if (!r || rcode > 15) return -1;
+    return error_with(q, r, rcode, true, qv->q.end);
 }
 /* 只删除末尾 OPT，避免移动后续记录而破坏报文内的绝对压缩指针。 */
 int md_dns_strip_opt(md_packet *p) {
@@ -301,16 +310,47 @@ int md_dns_strip_opt(md_packet *p) {
 }
 /* 超过客户端 EDNS 限制时保留完整问题，置 TC 并清空三个 RR 区段；
  * 不在任意字节处截断记录，客户端可据此改用 TCP 查询。 */
-void md_dns_limit_udp(const md_packet *q, md_packet *r) {
-    md_question a, b;
-    size_t limit = md_dns_question(q, &a, NULL) ? 512 : a.udp_size;
+static void limit_udp(const md_packet *q, const md_dns_query *qv, size_t limit, md_packet *r) {
+    md_question b;
     if (r->len <= limit) return;
     name_marks m;
     marks_reset(&m, r);
-    if (question(r, &m, &b, NULL)) { md_dns_error(q, r, 2); return; }
+    if (question(r, &m, &b, NULL)) { md_dns_error_q(q, qv, r, 2); return; }
     r->len = b.end;
     md_write16(r->data + 2, (uint16_t)(md_read16(r->data + 2) | 0x0200u));
     memset(r->data + 6, 0, 6);
+}
+void md_dns_limit_udp(const md_packet *q, md_packet *r) {
+    md_question a;
+    limit_udp(q, NULL, md_dns_question(q, &a, NULL) ? 512 : a.udp_size, r);
+}
+void md_dns_limit_udp_q(const md_packet *q, const md_dns_query *qv, md_packet *r) {
+    if (!md_dns_query_ok(q, qv)) { md_dns_limit_udp(q, r); return; }
+    limit_udp(q, qv, qv->q.udp_size, r);
+}
+/* 请求一次解析：与 md_dns_question 相同的 question+records 校验，回调只收集
+ * 缓存键的 EDNS 条件（等价于旧 cache make_key 里的第二次 md_dns_records）。 */
+typedef struct { unsigned opts; bool unsafe; } query_opts;
+static int query_record(const md_packet *p, const md_rr *rr, void *arg) {
+    (void)p;
+    query_opts *o = arg;
+    if (rr->type != 41 || rr->section != 2 || ++o->opts > 1 || rr->data_len ||
+        (rr->ttl & UINT32_C(0xffff0000))) o->unsafe = true;
+    return 0;
+}
+int md_dns_query_parse(const md_packet *p, md_dns_query *v, char *err) {
+    if (!v) return fail(err, "missing DNS query output");
+    v->valid = v->cache_edns_ok = false; v->len = 0; v->route = -1;
+    query_opts o = {0};
+    name_marks m;
+    marks_reset(&m, p);
+    if (question(p, &m, &v->q, err) || records(p, &m, &v->q, query_record, &o, NULL, NULL, NULL, err))
+        return -1;
+    v->cache_edns_ok = !o.unsafe; v->len = p->len; v->valid = true;
+    return 0;
+}
+bool md_dns_query_ok(const md_packet *p, const md_dns_query *v) {
+    return p && v && v->valid && v->len == p->len;
 }
 
 /* Validate before mutation; don't invalidate transaction signatures by silently
