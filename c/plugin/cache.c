@@ -262,7 +262,7 @@ bool md_cache_put_ex(md_cache *c, const md_packet *q, const md_dns_query *qv, co
     md_dns_query local; qv = query_view(q, qv, &local);
     uint8_t key[KEY_SIZE]; size_t len = qv ? make_key_q(q, qv, key) : 0;
     if (!len || !md_dns_view_matches(q, &qv->q, r, rv)) return false;
-    if (rv->q.end - 12 != len - 1 || memcmp(r->data + 12, key + 1, len - 1)) return false;
+    bool same_question = rv->q.end - 12 == len - 1 && !memcmp(r->data + 12, key + 1, len - 1);
     if (rv->signed_) return false;
     uint32_t minimum = 0; bool found = false; size_t ttl_count = 0;
     for (unsigned i = 0; i < rv->count; i++) {
@@ -289,7 +289,10 @@ bool md_cache_put_ex(md_cache *c, const md_packet *q, const md_dns_query *qv, co
         }
     } else return false;
     uint64_t hash = hash_key(key, len);
-    if (!ttl || !retention) goto not_stored;
+    /* The upstream may legally change question-name case. Keep the existing
+     * byte-exact cache policy, but revoke old data for this valid replacement
+     * rather than treating it as a mismatched or failed response. */
+    if (!same_question || !ttl || !retention) goto not_stored;
     /* 与 md_dns_strip_opt 相同：只去除末尾 OPT，非末尾 OPT 不缓存。 */
     size_t response_len = r->len;
     if (rv->has_opt) { if (rv->opt_end != r->len) goto not_stored; response_len = rv->opt_start; }

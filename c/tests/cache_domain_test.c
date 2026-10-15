@@ -235,6 +235,21 @@ static void replacement_revocation_tests(void) {
             md_cache_stats s; md_cache_get_stats(c, &s); assert(!s.entries[1] && !s.bytes[1]);
             md_cache_free(c);
         }
+    /* Case-insensitive DNS identity still supersedes old data when the wire
+     * question differs. It remains uncacheable under the byte-exact key policy. */
+    for (unsigned family = 0; family < 2; ++family) for (unsigned empty = 0; empty < 2; ++empty) {
+        md_cache_options policy = {0}; policy.stale_ttl[1] = 60;
+        md_cache *cache = md_cache_new_ex(4, &policy); assert(cache);
+        query(&q, "Case.test", 0x0100, 1); positive_family(&q, &r, 10, family != 0);
+        assert(put_g(cache, &q, &r, 100, 1, -1, false));
+        if (empty) assert(!md_dns_error(&q, &r, 0));
+        else positive_family(&q, &r, 0, family != 0);
+        assert(r.data[13] == 'C'); r.data[13] = 'c';
+        assert(md_dns_response_matches(&q, &r));
+        assert(!put_g(cache, &q, &r, 110, 1, -1, true));
+        assert(!get_g(cache, &q, &hit, 110, 1, 0, NULL));
+        md_cache_free(cache);
+    }
     /* Invalid/incomplete/mismatched responses and transient errors cannot revoke. */
     md_cache_options o = {0}; o.stale_ttl[1] = 60;
     md_cache *c = md_cache_new_ex(4, &o); assert(c);
