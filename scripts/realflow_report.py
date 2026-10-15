@@ -23,6 +23,7 @@ import time
 TRACE_FIELDS = ('kind lane flags id qtype qname resends attempts recv dispatched enqueue '
                 'pickup engine0 up_send up_recv nft0 nft_io nft1 engine1 reply').split()
 HIT_FRESH, HIT_STALE, FOLLOWER, ERROR = 1, 2, 1 << 8, 1 << 9
+LOOP_REPLY = 1 << 11
 STAGES = {'server_total': ('recv', 'reply'), 'dispatch': ('recv', 'dispatched'),
           'queue_wait': ('enqueue', 'pickup'), 'engine': ('engine0', 'engine1'),
           'upstream': ('up_send', 'up_recv'), 'nft': ('nft0', 'nft1')}
@@ -101,6 +102,66 @@ class Rules:
         if not self.files or self.unsupported:
             return 'unknown'
         return 'foreign'
+
+
+def trace_route(row):
+    """Route evidence from the immutable engine/server contract, never latency.
+
+    MD_LANE_CN=1 / MD_LANE_FOREIGN=2 are dispatch route decisions. Only
+    MD_LANE_REPLY=3 with BOTH HIT_FRESH and LOOP_REPLY proves the engine's
+    foreign-only immediate fresh-cache response. TCP release_quota also changes
+    ordinary worker jobs to lane 3, so lane 3 plus HIT_FRESH alone proves nothing.
+    Background refresh jobs do not carry a useful dispatch lane.
+    """
+    if row['kind'] != 'Q':
+        return None
+    if row['lane'] == 1:
+        return 'cn'
+    if row['lane'] == 2:
+        return 'foreign'
+    if row['lane'] == 3 and row['flags'] & HIT_FRESH and row['flags'] & LOOP_REPLY:
+        return 'foreign'
+    return None
+
+
+class RegionEvidence:
+    def __init__(self, rules):
+        self.rules = rules
+        self.routes = collections.defaultdict(set)
+        self.records = collections.Counter()
+
+    def add(self, row, arm):
+        route = trace_route(row)
+        if route is not None:
+            self.routes[normalized(row['qname'])].add(route)
+            self.records[arm + '/' + route] += 1
+
+    def classify(self, name):
+        name = normalized(name)
+        rule = self.rules.classify(name)
+        evidence = self.routes.get(name, set())
+        if len(evidence) > 1:
+            return 'unknown'
+        if evidence:
+            route = next(iter(evidence))
+            if rule != 'unknown' and rule != route:
+                return 'unknown'
+            return route
+        return rule
+
+    def summary(self):
+        conflicts = sum(len(routes) > 1 for routes in self.routes.values())
+        rule_conflicts = sum(self.rules.classify(name) != 'unknown' and
+                             any(route != self.rules.classify(name) for route in routes)
+                             for name, routes in self.routes.items())
+        classes = collections.Counter(self.classify(name) for name in self.routes)
+        return {'unique_names_with_trace_evidence': len(self.routes),
+                'resolved_evidence_names_by_region': dict(classes),
+                'trace_route_conflict_names': conflicts,
+                'rule_trace_conflict_names': rule_conflicts,
+                'evidence_records_by_arm_and_region': dict(self.records),
+                'contract': 'Q lane1=CN; Q lane2=foreign; Q lane3 requires HIT_FRESH and LOOP_REPLY for foreign',
+                'method': 'normalized name; evidence shared across A/B; any route or rule conflict remains unknown; no latency inference'}
 
 
 def read_jsonl(path, audit):
@@ -387,20 +448,38 @@ def parse_resources(rows, start=None, end=None):
             'queue_depth': dict(UNAVAILABLE)}
 
 
-def https_summary(rows, key, start):
+def https_summary(rows, key, start, end=None):
     groups = collections.defaultdict(lambda: {'counts': collections.Counter(),
                                               'values': collections.defaultdict(list)})
     cycles, pair_duplicates, unpaired = {}, 0, 0
+    window_counts = collections.Counter()
+    outside_outcomes = collections.defaultdict(collections.Counter)
     for row in rows:
         if row.get('type') != 'https_probe':
             continue
+        window_counts['total_probe_records'] += 1
+        stamp = row.get('started_unix_ns')
+        outside = ('timestamp_unavailable' if not isinstance(stamp, int) else
+                   'before_observation_window' if stamp < start else
+                   'after_observation_window' if end and stamp >= end else None)
+        if outside is not None:
+            window_counts[outside] += 1
+            outcome = outside_outcomes[outside]
+            outcome['attempts'] += 1
+            outcome['successful' if row.get('success') else 'failed'] += 1
+            error = str(row.get('error', '')).lower()
+            outcome['cancelled'] += 'cancel' in error
+            outcome['timeouts'] += 'timeout' in error or 'deadline' in error
+            outcome['certificate_verified'] += bool(row.get('certificate_verified'))
+            outcome['uncovered'] += str(row.get('coverage', '')).startswith('uncovered')
+            continue
+        window_counts['in_observation_window'] += 1
         site = row.get('site') or {}
         # Stable private host ID supports per-site comparison without names/paths/IPs.
         site_id = digest_name(key, site.get('host', 'unknown'))[:20]
         arm = row.get('arm') if row.get('arm') in ('a', 'b') else 'unknown'
         family = row.get('address_family') if row.get('address_family') in (4, 6) else 0
-        stamp = row.get('started_unix_ns')
-        periods = periods_for(stamp, start) if isinstance(stamp, int) else ('all',)
+        periods = periods_for(stamp, start)
         for period in periods:
             group = groups[(period, site_id, arm, family)]
             count = group['counts']
@@ -453,6 +532,11 @@ def https_summary(rows, key, start):
     if not cycles:
         paired['reason'] = 'no explicit shared HTTPS cycle ID; do not infer pairing by time'
     return {'available': bool(groups), 'scope': 'fixed-IP, Host/SNI preserved, certificate-verified HTTP GET; browser rendering not covered',
+            'window_assignment': 'probe started_unix_ns in [start_unix_ns, expected_end_unix_ns); excluded raw outcomes remain in original logs',
+            'window_counts': {name: window_counts[name] for name in
+                              ('total_probe_records', 'in_observation_window', 'before_observation_window',
+                               'after_observation_window', 'timestamp_unavailable')},
+            'out_of_window_outcomes': {name: dict(value) for name, value in outside_outcomes.items()},
             'groups': [dict(period=period, site_hmac=site_id, arm=arm, address_family=family,
                             counts=dict(value['counts']),
                             success_metrics={k: quantiles(v) for k, v in value['values'].items()})
@@ -489,9 +573,28 @@ def build_report(input_dir, rules_paths=(), start_unix_ns=None, start_mono_ns=No
     key = key_path.read_bytes() if key_path.exists() else os.urandom(32)
     audit = collections.defaultdict(dict)
     probe_hosts = {normalized(x) for x in metadata.get('probe_hosts', {})}
+    region_evidence = RegionEvidence(rules)
+    # Scan both immutable trace snapshots before classifying captures or either
+    # arm. A late cold query can prove the route of earlier cached same-name
+    # queries, while disagreements across arms remain visibly unknown.
+    for arm in ('a', 'b'):
+        for row in read_trace(files[arm + '_trace'], audit[arm + '_trace_route_evidence']):
+            stamp = row['recv'] or row['engine0']
+            if row['qname'] in probe_hosts:
+                continue
+            if start_mono and stamp and stamp < start_mono:
+                continue
+            if start_mono and expected_end and stamp >= start_mono + expected_end - start:
+                continue
+            region_evidence.add(row, arm)
+    classification = region_evidence.summary()
+    audit['region_classification'] = {
+        'trace_route_conflict_names': classification['trace_route_conflict_names'],
+        'rule_trace_conflict_names': classification['rule_trace_conflict_names']}
     capture = {}
     last_capture_stats = None
     capture_sequences = set()
+    capture_window_sequences = collections.defaultdict(set)
     duplicate_sequences = 0
     clock_offsets = []
     for row in read_jsonl(files['capture'], audit['capture']):
@@ -503,9 +606,15 @@ def build_report(input_dir, rules_paths=(), start_unix_ns=None, start_mono_ns=No
         if seq in capture_sequences:
             duplicate_sequences += 1
         capture_sequences.add(seq)
+        timestamp = row.get('ts_unix_ns')
+        window = ('timestamp_unavailable' if not isinstance(timestamp, int) else
+                  'before_observation_window' if timestamp < start else
+                  'after_observation_window' if expected_end and timestamp >= expected_end else
+                  'in_observation_window')
+        capture_window_sequences[window].add(seq)
         try:
             name, qt, qc, qid = parse_question(row['wire_b64'])
-            capture[seq] = {'region': rules.classify(name), 'id': qid,
+            capture[seq] = {'region': region_evidence.classify(name), 'id': qid,
                             'identity': digest_name(key, name, qt, qc), 'qtype': qt, 'qclass': qc,
                             'probe': name in probe_hosts}
         except (ValueError, KeyError, UnicodeError, struct.error):
@@ -522,6 +631,8 @@ def build_report(input_dir, rules_paths=(), start_unix_ns=None, start_mono_ns=No
     excluded = collections.Counter()
     observed_end = start
     runner_sequences = set()
+    runner_window_records = set()
+    runner_window_capture_sequences = set()
     duplicate_results = 0
     join_targets = {'a': collections.defaultdict(list), 'b': collections.defaultdict(list)}
     for row in read_jsonl(files['runner'], audit['runner']):
@@ -540,6 +651,9 @@ def build_report(input_dir, rules_paths=(), start_unix_ns=None, start_mono_ns=No
         if not isinstance(ts, int):
             audit['runner']['invalid_arrival_timestamp'] = audit['runner'].get('invalid_arrival_timestamp', 0) + 1
             continue
+        if ts >= start and (not expected_end or ts < expected_end):
+            runner_window_records.add(sequence)
+            runner_window_capture_sequences.add(row.get('capture_sequence'))
         if row.get('probe_host') or source.get('probe'):
             excluded['probe_host_pairs'] += 1
             continue
@@ -572,7 +686,7 @@ def build_report(input_dir, rules_paths=(), start_unix_ns=None, start_mono_ns=No
             if row['qname'] in probe_hosts:
                 counts['probe_records_excluded'] += 1
                 continue
-            region = rules.classify(row['qname'])
+            region = region_evidence.classify(row['qname'])
             stamp = row['recv'] or row['engine0']
             if start_mono and stamp and stamp < start_mono:
                 counts['before_start_records_excluded'] += 1
@@ -626,7 +740,7 @@ def build_report(input_dir, rules_paths=(), start_unix_ns=None, start_mono_ns=No
         path = files[arm + '_stderr']
         cache_stats[arm] = parse_cache_stats(path.read_text(errors='replace').splitlines()) if path.exists() else dict(UNAVAILABLE)
     resources = parse_resources(read_jsonl(files['resources'], audit['resources']), start, expected_end)
-    https = https_summary(read_jsonl(files['https'], audit['https']), key, start)
+    https = https_summary(read_jsonl(files['https'], audit['https']), key, start, expected_end)
     status_path = root / ('final.json' if (root / 'final.json').exists() else 'status.json')
     status = json.loads(status_path.read_text()) if status_path.exists() else {}
     if last_capture_stats is None:
@@ -655,6 +769,14 @@ def build_report(input_dir, rules_paths=(), start_unix_ns=None, start_mono_ns=No
     balance = {'capture_dns_records_in_snapshot': len(capture_sequences),
                'runner_unique_result_records': len(runner_sequences),
                'capture_minus_runner_records': len(capture_sequences) - len(runner_sequences),
+               'capture_in_observation_window': len(capture_window_sequences['in_observation_window']),
+               'capture_before_observation_window': len(capture_window_sequences['before_observation_window']),
+               'capture_after_observation_window': len(capture_window_sequences['after_observation_window']),
+               'capture_timestamp_unavailable': len(capture_window_sequences['timestamp_unavailable']),
+               'runner_in_observation_window': len(runner_window_records),
+               'capture_window_minus_runner_records': len(capture_window_sequences['in_observation_window']) - len(runner_window_records),
+               'capture_in_window_without_runner_result': len(capture_window_sequences['in_observation_window'] - runner_window_capture_sequences),
+               'runner_in_window_without_capture_record': len(runner_window_capture_sequences - capture_window_sequences['in_observation_window']),
                'capture_sequence_gaps': capture_gaps,
                'duplicate_capture_sequences': duplicate_sequences, 'duplicate_runner_results': duplicate_results,
                'main_flow_arrivals': all_counts['arrivals'], 'main_flow_dispatched_pairs': all_counts['dispatched_pairs'],
@@ -665,8 +787,18 @@ def build_report(input_dir, rules_paths=(), start_unix_ns=None, start_mono_ns=No
                'main_flow_unsent_pairs': all_counts['unsent_pairs'],
                'main_flow_arrivals_equal_dispatched_plus_unsent': all_counts['arrivals'] == all_counts['dispatched_pairs'] + all_counts['unsent_pairs'],
                'capture_kernel_totals': capture_totals,
-               'note': 'capture_minus_runner may include in-flight requests in live snapshots; kernel_drops counts known socket loss, not all possible capture loss'}
+               'note': 'total capture_minus_runner includes separately counted before/after-window records; only window-matched missing results may be in flight while runner is active; kernel_drops counts known socket loss, not all possible capture loss'}
     integrity_issues = []
+    if classification['trace_route_conflict_names']:
+        integrity_issues.append('trace_route_classification_conflict')
+    if classification['rule_trace_conflict_names']:
+        integrity_issues.append('rule_trace_classification_conflict')
+    if balance['runner_in_window_without_capture_record']:
+        integrity_issues.append('runner_observation_window_capture_record_missing')
+    if status.get('finished') and balance['capture_in_window_without_runner_result']:
+        integrity_issues.append('capture_observation_window_result_missing')
+    if balance['capture_timestamp_unavailable']:
+        integrity_issues.append('capture_timestamp_unavailable')
     if capture_totals.get('kernel_drops', 0):
         integrity_issues.append('capture_kernel_drops')
     for counter, count in capture_totals.get('counters', {}).items():
@@ -699,6 +831,7 @@ def build_report(input_dir, rules_paths=(), start_unix_ns=None, start_mono_ns=No
                             'note': 'No automatic pass grade: inspect known issues, final receipts, timing and coverage'},
               'rules': {'files': rules.files, 'unsupported_modes': dict(rules.unsupported),
                         'nonmatching_class': 'unknown' if not rules.files or rules.unsupported else 'foreign'},
+              'region_classification': classification,
               'clock_alignment': clock, 'excluded': dict(excluded), 'balance': balance,
               'periods': {k: v.view() for k, v in sorted(periods.items())},
               'trace': trace_out, 'cache_stats': cache_stats, 'resources': resources,
@@ -718,7 +851,10 @@ def markdown(report):
              '本报告仅含聚合数据。增量快照不代表 24 小时测试已完成；错误与超时单列，延迟分位数只看成功回答。', '',
              '- Runner 已结束：%s；采集完整性状态：%s。' % (report['runner_finished'], report['runner_complete']),
              '- 主流量：%d 对；已调度 %d 对；队列拒绝/未调度 %d 对；双方完整写出 %d 对。' % (counts['main_flow_arrivals'], counts['main_flow_dispatched_pairs'], counts['main_flow_unsent_pairs'], counts['main_flow_both_wire_sent_pairs']),
-             '- 捕获记录与结果差值：%d；capture sequence 缺口：%d。' % (counts['capture_minus_runner_records'], counts['capture_sequence_gaps']), '',
+             '- 窗内捕获 %d 条，窗内结果 %d 条，窗内差值 %d；窗前 %d 条、窗后尾段 %d 条单列；capture sequence 缺口 %d。' %
+             (counts['capture_in_observation_window'], counts['runner_in_observation_window'],
+              counts['capture_window_minus_runner_records'], counts['capture_before_observation_window'],
+              counts['capture_after_observation_window'], counts['capture_sequence_gaps']), '',
              '| 时段 | 组 | 已尝试 | 失败 | 超时 | 成功均值 ms | P50 | P90 | P99 | 最大值 |',
              '|---|---|---:|---:|---:|---:|---:|---:|---:|---:|']
     def fmt(value):
@@ -732,10 +868,10 @@ def markdown(report):
                          (period, arm.upper(), row['attempted'], row['failed'], row['timeouts'],
                           *(fmt(latency[x]) for x in ('mean_ms', 'p50_ms', 'p90_ms', 'p99_ms', 'max_ms'))))
     lines += ['', '少于 1000 个成功样本的 P99 标记为稀疏估计；15 分钟窗口、CN/境外、A/AAAA、UDP/TCP及成对差值见 report.json。', '',
-              '命中分类只依据 C trace 标志，不从延迟推断。基线无法区分首次、淘汰、到期与绕过时，保留 unavailable。', '',
+              '命中分类只依据 C trace 标志，不从延迟推断。国内/境外先看固定规则；不支持的正则由无冲突的实际 dispatch lane 证据补足；规则或 trace 冲突保留 unknown。基线无法区分首次、淘汰、到期与绕过时，保留 unavailable。', '',
               'HTTPS 为保留 Host/SNI 并校验证书的固定 IP HTTP GET。报告不代表浏览器完整渲染；正文不输出域名、IP 或请求历史。', '',
               '上游计数为 C 事务及重传，不等同于抓包精确报文数。普通 stderr 缓存累计指标包含业务探测；无法精确分配到 15 分钟窗口。', '',
-              '运行中的 trace 有 stdio 缓冲延迟；capture 记录与结果的差值可能包含尚未完成请求。必须结合最终 receipt、漏采计数及进程状态判定完整性。', '']
+              '运行中的 trace 有 stdio 缓冲延迟；窗内缺失结果可能包含尚未完成请求，窗后采集尾段单列。必须结合最终 receipt、漏采计数及进程状态判定完整性。', '']
     return '\n'.join(lines)
 
 

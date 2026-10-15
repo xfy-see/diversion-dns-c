@@ -282,6 +282,108 @@ class TestReport(unittest.TestCase):
         self.assertEqual(result['excluded']['after_deadline_pairs'], 1)
         self.assertEqual(result['balance']['main_flow_arrivals'], 1)
 
+    def test_regex_unknown_is_resolved_by_actual_foreign_lane_evidence(self):
+        self.rules.write_text('domain:cn.test\nregexp:^some-cn-pattern\\.test$\n')
+        jsonl(self.root / 'capture-private.jsonl', [self.capture()])
+        jsonl(self.root / 'dns-results.jsonl', [self.pair()])
+        (self.root / 'a.trace.tsv').write_text(trace('private.foreign.test', lane=2))
+        # A proves the normalized name's route for B cached lane0 too.
+        (self.root / 'b.trace.tsv').write_text(trace('PRIVATE.FOREIGN.TEST.', lane=0, flags=r.HIT_FRESH))
+        result = self.report()
+        self.assertEqual(result['periods']['all']['by']['region/foreign']['a']['attempted'], 1)
+        self.assertEqual(result['trace']['b']['classes_by_region']['foreign']['fresh_hit'], 1)
+        self.assertEqual(result['region_classification']['resolved_evidence_names_by_region']['foreign'], 1)
+        self.assertEqual(result['rules']['nonmatching_class'], 'unknown')
+
+    def test_actual_trace_route_conflict_stays_unknown_and_is_audited(self):
+        self.rules.write_text('regexp:^some-cn-pattern\\.test$\n')
+        jsonl(self.root / 'capture-private.jsonl', [self.capture()])
+        jsonl(self.root / 'dns-results.jsonl', [self.pair()])
+        (self.root / 'a.trace.tsv').write_text(trace('private.foreign.test', lane=1))
+        (self.root / 'b.trace.tsv').write_text(trace('private.foreign.test', lane=2))
+        result = self.report()
+        self.assertEqual(result['periods']['all']['by']['region/unknown']['a']['attempted'], 1)
+        self.assertEqual(result['region_classification']['trace_route_conflict_names'], 1)
+        self.assertEqual(result['input_audit']['region_classification']['trace_route_conflict_names'], 1)
+        self.assertIn('trace_route_classification_conflict', result['integrity']['known_issues'])
+        self.assertNotIn('private.foreign.test', json.dumps(result))
+
+    def test_literal_rule_conflict_with_actual_trace_stays_unknown(self):
+        self.rules.write_text('full:private.foreign.test\n')
+        jsonl(self.root / 'capture-private.jsonl', [self.capture()])
+        jsonl(self.root / 'dns-results.jsonl', [self.pair()])
+        (self.root / 'a.trace.tsv').write_text(trace('private.foreign.test', lane=2))
+        result = self.report()
+        self.assertEqual(result['periods']['all']['by']['region/unknown']['a']['attempted'], 1)
+        self.assertEqual(result['region_classification']['rule_trace_conflict_names'], 1)
+        self.assertIn('rule_trace_classification_conflict', result['integrity']['known_issues'])
+
+    def test_lane3_needs_fresh_and_loop_reply_to_prove_foreign(self):
+        self.rules.write_text('regexp:^some-cn-pattern\\.test$\n')
+        evidence = r.RegionEvidence(r.Rules([self.rules]))
+        # A CN TCP fresh hit can acquire lane3 after release_quota, without
+        # LOOP_REPLY. Neither that nor a background refresh proves foreign.
+        for line in (trace('cn-tcp.test', lane=3, flags=r.HIT_FRESH | (1 << 12)),
+                     trace('loop-only.test', lane=3, flags=r.LOOP_REPLY),
+                     trace('refresh.test', kind='R', lane=2),
+                     trace('stale.test', lane=0, flags=r.HIT_STALE)):
+            row = r.parse_trace_line(line)
+            evidence.add(row, 'a')
+            self.assertEqual(evidence.classify(row['qname']), 'unknown')
+        evidence.add(r.parse_trace_line(trace('fast-reply.test', lane=3,
+                       flags=r.HIT_FRESH | r.LOOP_REPLY)), 'b')
+        self.assertEqual(evidence.classify('FAST-REPLY.TEST.'), 'foreign')
+
+    def test_capture_after_window_tail_is_separate_from_window_loss(self):
+        meta = json.loads((self.root / 'metadata.json').read_text())
+        meta['duration_seconds'] = 10
+        (self.root / 'metadata.json').write_text(json.dumps(meta))
+        jsonl(self.root / 'capture-private.jsonl', [self.capture(1), self.capture(2, delta=10 * NS),
+              self.capture(3, delta=11 * NS), self.capture(4, delta=-NS)])
+        jsonl(self.root / 'dns-results.jsonl', [self.pair()])
+        (self.root / 'final.json').write_text(json.dumps(dict(finished=True, complete=True)))
+        result = self.report()
+        balance = result['balance']
+        self.assertEqual(balance['capture_dns_records_in_snapshot'], 4)
+        self.assertEqual(balance['capture_in_observation_window'], 1)
+        self.assertEqual(balance['capture_before_observation_window'], 1)
+        self.assertEqual(balance['capture_after_observation_window'], 2)
+        self.assertEqual(balance['runner_in_observation_window'], 1)
+        self.assertEqual(balance['capture_window_minus_runner_records'], 0)
+        self.assertEqual(balance['capture_in_window_without_runner_result'], 0)
+        self.assertNotIn('capture_observation_window_result_missing', result['integrity']['known_issues'])
+        self.assertIn('窗后尾段 2 条单列', r.markdown(result))
+
+    def test_after_deadline_cancelled_https_is_retained_outside_business_window(self):
+        meta = json.loads((self.root / 'metadata.json').read_text())
+        meta['duration_seconds'] = 180
+        (self.root / 'metadata.json').write_text(json.dumps(meta))
+        rows = []
+        for arm in ('a', 'b'):
+            rows.append(dict(type='https_probe', cycle_id=1, site=dict(host='business.secret.test'),
+                         arm=arm, address_family=4, started_unix_ns=START + NS,
+                         success=True, certificate_verified=True, tls_handshake_success=True,
+                         dns_and_http_total_ms=20))
+        rows += [dict(type='https_probe', cycle_id=2, site=dict(host='business.secret.test'),
+                      arm='a', address_family=4, started_unix_ns=START + 180 * NS + 9394700,
+                      success=False, error='Get business.secret.test: context canceled'),
+                 dict(type='https_probe', cycle_id=0, site=dict(host='business.secret.test'),
+                      arm='a', address_family=4, started_unix_ns=START - 1,
+                      success=False, error='timeout')]
+        jsonl(self.root / 'https-results.jsonl', rows)
+        summary = self.report()['https']
+        self.assertEqual(summary['window_counts']['in_observation_window'], 2)
+        self.assertEqual(summary['window_counts']['after_observation_window'], 1)
+        self.assertEqual(summary['window_counts']['before_observation_window'], 1)
+        self.assertEqual(summary['out_of_window_outcomes']['after_observation_window']['cancelled'], 1)
+        self.assertEqual(summary['out_of_window_outcomes']['after_observation_window']['failed'], 1)
+        all_groups = [group for group in summary['groups'] if group['period'] == 'all']
+        self.assertEqual(sum(group['counts'].get('failed', 0) for group in all_groups), 0)
+        self.assertEqual(summary['paired']['groups'][0]['counts']['success/success'], 1)
+        self.assertNotIn('failure', json.dumps(summary['paired']['groups']))
+        # The original failure is preserved verbatim, only aggregate filtering changes.
+        self.assertIn('context canceled', (self.root / 'https-results.jsonl').read_text())
+
     def test_bad_trace_and_negative_timestamps_are_rejected(self):
         with self.assertRaises(ValueError):
             r.parse_trace_line('Q\t1\t2')
