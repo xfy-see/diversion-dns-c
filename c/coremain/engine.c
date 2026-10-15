@@ -3,6 +3,9 @@
  * 原始 QNAME 选择唯一上游组；包括缓存命中在内的 CN 响应均经过 nft。
  * DNS、缓存、规则、上游和 nft 的实现复用原有模块。 */
 #define _POSIX_C_SOURCE 200809L
+#ifdef __APPLE__
+#define _DARWIN_C_SOURCE /* O_NOFOLLOW with strict POSIX feature selection */
+#endif
 #include "mosdns.h"
 #include <arpa/inet.h>
 #include <errno.h>
