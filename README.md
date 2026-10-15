@@ -4,7 +4,15 @@
 
 原始问题名匹配 CN 规则后，走共享缓存及唯一 CN/foreign 上游组；CN 回答包含缓存命中都经过原有 nft 最终处理。保留数字 UDP/TCP 上游、TCP 持久连接、TTL/LRU/lazy 缓存、Linux mark/接口绑定和 domain/full/keyword/regexp。没有跨组 fallback、热重载、服务安装或系统 DNS 接管。GPL-3.0-or-later。运行时不依赖 YAML；历史 YAML 配置仅作迁移输入与证据保留。
 
-## v0.1.2
+## v0.1.3
+
+[下载 v0.1.3](https://github.com/xfy-see/diversion-dns-c/releases/tag/v0.1.3) · [发布说明与升级注意](docs/release-v0.1.3.md)
+
+v0.1.3 增加现有 OpenWrt 定制部署的 DNS 降级自动恢复覆盖层：备用 DNS 保持服务，候选 C 连续三轮通过国内/境外 A/AAAA 验证才回切；恢复失败退避重试，手动降级保持不动。覆盖层单独提供 `openwrt-recovery-v0.1.3.tar.gz`，适用布局与依赖见 [部署说明](deployment/openwrt-recovery/README.md)。源码清理还移除了未使用的 vendored libyaml。
+
+双架构 `0.1.3-r1` APK 仍只包含程序，不会自动安装覆盖层或接管 DNS。C 请求处理行为与 v0.1.2 一致；这次没有新的性能提升声明。正式发布以 Release 已公开且校验信息齐备为准。
+
+## v0.1.2（历史版本）
 
 [下载 v0.1.2](https://github.com/xfy-see/diversion-dns-c/releases/tag/v0.1.2) · [发布说明与升级注意](docs/release-v0.1.2.md)
 
@@ -56,9 +64,9 @@ python3 scripts/migrate-site-config.py docs/go-profiles-site-only.yaml -o /tmp/s
 | Linux ARM64 static | 固定 Zig 0.14.1、PCRE2 10.48，静态 musl 程序和全部测试程序 |
 | Linux x86_64 static | 同样固定依赖的静态 musl 程序和全部测试程序 |
 
-同一工作流还显式构建并验证 POSIX-lite：native/sanitizer 覆盖 macOS ARM64 和 Linux x86_64，静态 musl 覆盖 Linux ARM64/x86_64。它们分别保存在 `experimental-lite-*` Actions 产物中，并在 manifest 内记录 backend；默认产物仍为 PCRE2，lite 不进入原有 CI 预发布；正式版本（v0.1.0、v0.1.1、v0.1.2）另行收录经过同源验证的 lite 包。OpenWrt APK 另走 [SDK 实验流程](packaging/openwrt/README.md)。
+同一工作流还显式构建并验证 POSIX-lite：native/sanitizer 覆盖 macOS ARM64 和 Linux x86_64，静态 musl 覆盖 Linux ARM64/x86_64。它们分别保存在 `experimental-lite-*` Actions 产物中，并在 manifest 内记录 backend；默认产物仍为 PCRE2，lite 不进入原有 CI 预发布；正式版本（v0.1.0 至 v0.1.3）另行收录经过同源验证的 lite 包。OpenWrt APK 另走 [SDK 实验流程](packaging/openwrt/README.md)。
 
-每个正式版本由各自的一次性发布 job（`release-010`、`release-011`、`release-012`）发布，只在 `VERSION` 与该版本一致时运行；它还等待双 APK job，并独立验证下载内容；已有 tag/release 一律不覆盖。
+每个正式版本由各自的一次性发布 job（`release-010`、`release-011`、`release-012`、`release-013`）发布，只在 `VERSION` 与该版本一致时运行；它还等待双 APK job，并独立验证下载内容；已有 tag/release 一律不覆盖。v0.1.3 还显式核验同一 main 提交的 kernel、delivery 及独立测试套件，并提供带源码摘要清单的自动恢复覆盖包。
 
 main 分支的四个编译/测试 job 成功后，delivery job 会生成 `ci-<commit>-run<id>-attempt<n>` 预发布版本。四个同源 `.tar.gz` 下载包与 `SHA256SUMS` 可以直接从 GitHub Releases 下载，无需 Actions 登录；它们保留 Actions 包内同一份文件。
 

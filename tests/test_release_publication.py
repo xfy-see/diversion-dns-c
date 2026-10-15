@@ -4,6 +4,9 @@ Shared publisher contracts run against both the archived v0.1.0 publisher and
 the v0.1.2 publisher, which must keep the same checks.
 """
 import importlib.util
+from contextlib import contextmanager
+import gzip
+import tarfile
 import io
 import zipfile
 import copy
@@ -29,13 +32,27 @@ def load_publisher(name, version):
 
 pub = load_publisher("publish_010", "0.1.0")
 pub012 = load_publisher("publish_012", "0.1.2")
+pub013 = load_publisher("publish_013", "0.1.3")
+
+
+@contextmanager
+def publisher_source(publisher):
+    """Exercise old publishers against their own archived version, not current HEAD."""
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        (root / "VERSION").write_text(publisher.VERSION + "\n")
+        notes = getattr(publisher, "NOTES", Path("docs") / f"release-{publisher.TAG}.md")
+        (root / notes).parent.mkdir(parents=True)
+        (root / notes).write_text("Synthetic release notes\n")
+        with mock.patch.object(publisher, "ROOT", root):
+            yield root
 
 
 class VersionContracts(unittest.TestCase):
     def test_application_recipe_and_metadata_share_version(self):
-        self.assertEqual((ROOT / "VERSION").read_text(), "0.1.2\n")
-        self.assertIn('puts("mosdns-c 0.1.2 fixed-splitter")', (ROOT / "c/main.c").read_text())
-        self.assertIn("PKG_VERSION:=0.1.2\nPKG_RELEASE:=1\n", (ROOT / "packaging/openwrt/Makefile").read_text())
+        self.assertEqual((ROOT / "VERSION").read_text(), "0.1.3\n")
+        self.assertIn('puts("mosdns-c 0.1.3 fixed-splitter")', (ROOT / "c/main.c").read_text())
+        self.assertIn("PKG_VERSION:=0.1.3\nPKG_RELEASE:=1\n", (ROOT / "packaging/openwrt/Makefile").read_text())
         self.assertIn("application_version", (ROOT / "scripts/artifacts.py").read_text())
 
     def test_only_main_push_release_job_gets_write_permission(self):
@@ -94,7 +111,7 @@ class GitHubReadContractsMixin:
     def test_existing_complete_release_never_calls_mutating_api(self):
         env = {"GITHUB_SHA": "a" * 40, "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "1",
                "GITHUB_REPOSITORY": self.pub.REPO, "GITHUB_REF": "refs/heads/main", "GITHUB_EVENT_NAME": "push"}
-        with mock.patch.dict(os.environ, env), mock.patch.object(self.pub, "run", return_value=("a" * 40).encode()) as run, \
+        with publisher_source(self.pub), mock.patch.dict(os.environ, env), mock.patch.object(self.pub, "run", return_value=("a" * 40).encode()) as run, \
                 mock.patch.object(self.pub, "existing_release", return_value={"html_url": "https://github.com/"}), mock.patch.object(self.pub, "api") as api:
             self.pub.main()
             api.assert_not_called()
@@ -134,13 +151,15 @@ class PublishSequenceContractsMixin:
                 return {"object": {"sha": "b" * 40 if main_moved and path.endswith("main") else commit}}
             if path.startswith("actions/runs/"):
                 return {"head_sha": commit, "run_attempt": 2 if attempt_changed else 1,
-                        "status": "completed", "conclusion": "success"}
+                        "status": "completed", "conclusion": "success", "head_branch": "main", "event": "push",
+                        "path": ".github/workflows/" + {"11": "build.yml", "12": "openwrt-apk.yml", "13": "test-suite.yml"}[path.rsplit("/", 1)[1]]}
             raise AssertionError(path)
         with mock.patch.object(self.pub, "run", side_effect=command), mock.patch.object(self.pub, "api", side_effect=api), \
                 mock.patch.object(self.pub, "checked_jobs", return_value=[]):
             error = None
             try:
-                self.pub.publish_assets([asset], commit, "release notes", 11, 1, 12, 1)
+                self.pub.publish_assets([asset], commit, "release notes", 11, 1, 12, 1,
+                                        *([13, 1] if self.pub is pub013 else []))
             except ValueError as exc:
                 error = str(exc)
         return calls, error
@@ -247,9 +266,7 @@ class Release012Contracts(unittest.TestCase):
 
     def test_version_derived_names_match_source(self):
         self.assertEqual((pub012.VERSION, pub012.TAG, pub012.PACKAGE_VERSION), ("0.1.2", "v0.1.2", "0.1.2-r1"))
-        self.assertEqual((ROOT / "VERSION").read_text().strip(), pub012.VERSION)
         self.assertEqual(pub012.CLI_VERSION, "mosdns-c 0.1.2 fixed-splitter")
-        self.assertIn(f'puts("{pub012.CLI_VERSION}")', (ROOT / "c/main.c").read_text())
         self.assertEqual(pub012.NOTES.as_posix(), "docs/release-v0.1.2.md")
         self.assertEqual(pub012.WORK.as_posix(), ".build/release-v0.1.2")
         self.assertEqual((pub.TAG, pub.VERSION), ("v0.1.0", "0.1.0"))
@@ -293,7 +310,7 @@ class Release012Contracts(unittest.TestCase):
         self.assertEqual(blocks[0].replace("0.1.0", "0.1.1"), blocks[1])
         self.assertEqual(blocks[1].replace("0.1.1", "0.1.2"), blocks[2])
         self.assertIn("run: python3 scripts/publish-v0.1.2.py", blocks[2])
-        self.assertEqual(workflow.count("contents: write"), 4)
+        self.assertEqual(workflow.count("contents: write"), 5)
 
     def test_other_source_version_skips_before_any_github_read(self):
         for version in ("0.1.0", "0.1.1", "0.2.0"):
@@ -331,7 +348,7 @@ class Release012Contracts(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "partial/conflicting v0.1.2 tag/release exists"):
                 pub012.existing_release()
         env = main_env()
-        with mock.patch.dict(os.environ, env), mock.patch.object(pub012, "run", return_value=("a" * 40).encode()) as run, \
+        with publisher_source(pub012), mock.patch.dict(os.environ, env), mock.patch.object(pub012, "run", return_value=("a" * 40).encode()) as run, \
                 mock.patch.object(pub012, "api", side_effect=api), mock.patch.object(pub012, "absent", return_value=False):
             with self.assertRaisesRegex(ValueError, "review without overwriting"):
                 pub012.main()
@@ -373,7 +390,7 @@ class Release012Contracts(unittest.TestCase):
             if path == "git/ref/heads/main":
                 return {"object": {"sha": "b" * 40}}
             raise AssertionError(path)
-        with mock.patch.dict(os.environ, main_env()), mock.patch.object(pub012, "run", return_value=("a" * 40).encode()) as run, \
+        with publisher_source(pub012), mock.patch.dict(os.environ, main_env()), mock.patch.object(pub012, "run", return_value=("a" * 40).encode()) as run, \
                 mock.patch.object(pub012, "existing_release", return_value=None), mock.patch.object(pub012, "api", side_effect=api):
             with self.assertRaisesRegex(ValueError, "main moved"):
                 pub012.main()
@@ -390,6 +407,163 @@ class ArtifactDownloadContracts011(ArtifactDownloadContractsMixin, unittest.Test
 
 class PublishSequenceContracts011(PublishSequenceContractsMixin, unittest.TestCase):
     pub = pub011
+
+
+
+class GitHubReadContracts013(GitHubReadContractsMixin, unittest.TestCase):
+    pub = pub013
+
+
+class ArtifactDownloadContracts013(ArtifactDownloadContractsMixin, unittest.TestCase):
+    pub = pub013
+
+
+class PublishSequenceContracts013(PublishSequenceContractsMixin, unittest.TestCase):
+    pub = pub013
+
+
+class Release013Contracts(unittest.TestCase):
+    def test_current_version_assets_notes_and_job(self):
+        self.assertEqual((ROOT / "VERSION").read_text().strip(), pub013.VERSION)
+        self.assertEqual(pub013.PACKAGE_VERSION, "0.1.3-r1")
+        self.assertIn(f'puts("{pub013.CLI_VERSION}")', (ROOT / "c/main.c").read_text())
+        names = pub013.expected_asset_names()
+        self.assertEqual(len(names), 18)
+        self.assertIn("openwrt-recovery-v0.1.3.tar.gz", names)
+        notes = (ROOT / pub013.NOTES).read_text()
+        self.assertTrue(notes.startswith("# diversion-dns-c v0.1.3\n"))
+        for name in names:
+            self.assertIn(name, notes)
+        self.assertEqual(len(pub013.BUILD_JOBS + pub013.APK_JOBS + pub013.SUITE_JOBS), 10)
+        self.assertEqual(set(pub013.BUILD_JOBS[-2:]), {"Real kernel / GCC 14", "delivery"})
+        workflow = (ROOT / ".github/workflows/build.yml").read_text().split("  release-013:\n", 1)[1]
+        for token in ("needs: [native, static, delivery]", "refs/heads/main", "cancel-in-progress: false",
+                      "persist-credentials: false", "contents: write", "python3 scripts/publish-v0.1.3.py"):
+            self.assertIn(token, workflow)
+        source = (ROOT / "scripts/publish-v0.1.3.py").read_text()
+        for token in ('"--clobber"', '"force": True', '"--prerelease"'):
+            self.assertNotIn(token, source)
+
+    def state(self, workflow="test-suite.yml", **changes):
+        return {"id": 13, "head_sha": "a" * 40, "head_branch": "main", "event": "push", "run_attempt": 1,
+                "path": ".github/workflows/" + workflow, "status": "completed", "conclusion": "success", **changes}
+
+    def test_wait_requires_unique_successful_exact_main_push(self):
+        row = self.state()
+        with mock.patch.object(pub013, "api", return_value={"total_count": 1, "workflow_runs": [row]}):
+            self.assertEqual(pub013.wait_workflow("test-suite.yml", "a" * 40, 1), row)
+        for rows, total in (([row, row], 2), ([self.state(conclusion="failure")], 1),
+                            ([self.state(path="wrong")], 1), ([self.state(head_sha="b" * 40)], 1),
+                            ([self.state(event="pull_request")], 1), ([self.state(head_branch="feature")], 1),
+                            ([self.state(status="in_progress")], 1), ([], 101)):
+            with self.subTest(rows=rows, total=total), mock.patch.object(pub013, "api", return_value={"total_count": total, "workflow_runs": rows}), \
+                    mock.patch.object(pub013.time, "monotonic", return_value=2), mock.patch.object(pub013.time, "sleep") as sleep:
+                with self.assertRaises(ValueError):
+                    pub013.wait_workflow("test-suite.yml", "a" * 40, 1)
+                sleep.assert_not_called()
+
+    def test_final_recheck_rejects_suite_attempt_failure_or_identity_change(self):
+        def states(change):
+            def api(path):
+                key = int(path.rsplit("/", 1)[1])
+                workflow = {11: "build.yml", 12: "openwrt-apk.yml", 13: "test-suite.yml"}[key]
+                return self.state(workflow, **(change if key == 13 else {}))
+            return api
+        for change in ({}, {"head_sha": "b" * 40}, {"run_attempt": 2}, {"conclusion": "failure"},
+                       {"status": "in_progress"}, {"event": "pull_request"}, {"path": "wrong"}, {"head_branch": "feature"}):
+            with self.subTest(change=change), mock.patch.object(pub013, "api", side_effect=states(change)), \
+                    mock.patch.object(pub013, "checked_jobs", return_value=[]) as checked:
+                if change:
+                    with self.assertRaisesRegex(ValueError, "CI run or attempt changed"):
+                        pub013.recheck_ci("a" * 40, 11, 1, 12, 1, 13, 1)
+                else:
+                    pub013.recheck_ci("a" * 40, 11, 1, 12, 1, 13, 1)
+                    self.assertEqual(checked.call_args_list, [mock.call(11, pub013.BUILD_JOBS),
+                        mock.call(12, pub013.APK_JOBS), mock.call(13, pub013.SUITE_JOBS)])
+
+    def test_other_version_never_reads_github(self):
+        with publisher_source(pub012) as root, mock.patch.object(pub013, "ROOT", root), \
+                mock.patch.dict(os.environ, main_env()), mock.patch.object(pub013, "run", return_value=("a" * 40).encode()), \
+                mock.patch.object(pub013, "api") as api, mock.patch("builtins.print"):
+            pub013.main()
+            api.assert_not_called()
+
+
+class RecoveryOverlayContracts(unittest.TestCase):
+    commit, tree = "a" * 40, "b" * 40
+
+    def files(self):
+        return {name: ("immutable synthetic source: " + name).encode() for name in pub013.OVERLAY_FILES}
+
+    def tar(self, entries):
+        raw = io.BytesIO()
+        with tarfile.open(fileobj=raw, mode="w") as archive:
+            for name, data, mode, kind in entries:
+                member = tarfile.TarInfo(name)
+                member.size, member.mode, member.type = len(data), mode, kind
+                if kind == tarfile.SYMTYPE:
+                    member.linkname = "../not-allowed"
+                archive.addfile(member, io.BytesIO(data))
+        return raw.getvalue()
+
+    def entries(self, files=None):
+        return [(name, data, pub013.OVERLAY_FILES.get(name, 0o644), tarfile.REGTYPE)
+                for name, data in (self.files() if files is None else files).items()]
+
+    def test_source_is_exact_commit_git_archive_with_fixed_modes(self):
+        raw = self.tar(self.entries())
+        with mock.patch.object(pub013, "run", side_effect=[(self.tree + "\n").encode(), raw]) as run:
+            self.assertEqual(pub013.recovery_source(self.commit), (self.tree, self.files()))
+        self.assertEqual(run.call_args_list[1].args[0], ["git", "-C", pub013.ROOT, "-c", "tar.umask=0022",
+                         "archive", "--format=tar", self.commit, "LICENSE", "deployment/openwrt-recovery"])
+
+    def test_source_rejects_extra_missing_duplicate_symlink_and_changed_mode(self):
+        original = self.entries()
+        changes = [original + [("extra.sh", b"bad", 0o755, tarfile.REGTYPE)], original[:-1],
+                   original + original[:1], [(original[0][0], b"bad", 0o644, tarfile.SYMTYPE)] + original[1:],
+                   [(original[0][0], original[0][1], 0o777, tarfile.REGTYPE)] + original[1:]]
+        for entries in changes:
+            with self.subTest(entries=len(entries)), mock.patch.object(pub013, "run", side_effect=[self.tree.encode(), self.tar(entries)]):
+                with self.assertRaises(ValueError):
+                    pub013.recovery_source(self.commit)
+
+    def test_archive_roundtrip_has_only_source_license_and_manifest(self):
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(pub013, "recovery_source", side_effect=lambda commit: (self.tree, self.files())) as source:
+            report = pub013.prepare_recovery_overlay(Path(temporary), self.commit)
+            self.assertEqual(source.call_count, 2)  # writer plus independent read-back verifier
+            path = Path(temporary) / pub013.OVERLAY_NAME
+            self.assertEqual(report, pub013.verify_recovery_overlay(path, self.commit))
+            self.assertEqual(report["manifest"]["commit"], self.commit)
+            self.assertEqual(report["manifest"]["source_tree"], self.tree)
+            self.assertEqual(set(report["manifest"]["files"]), set(pub013.OVERLAY_FILES))
+            self.assertEqual(report["sha256"], pub013.a.digest(path.read_bytes()))
+            with tarfile.open(path, "r:gz") as archive:
+                self.assertEqual(set(archive.getnames()), set(pub013.OVERLAY_FILES) | {"manifest.json"})
+                self.assertEqual(len(archive.getmembers()), 9)
+                for member in archive:
+                    self.assertTrue(member.isfile())
+                    self.assertEqual(member.mode, pub013.OVERLAY_FILES.get(member.name, 0o644))
+            with self.assertRaises(FileExistsError):
+                pub013.prepare_recovery_overlay(Path(temporary), self.commit)
+
+    def test_archive_rejects_payload_manifest_modes_and_membership_tampering(self):
+        files = self.files()
+        manifest = pub013.recovery_manifest(self.commit, self.tree, files)
+        files["manifest.json"] = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
+        entries = self.entries(files)
+        cases = [entries[:-1], entries + [entries[0]], entries + [("../escape", b"bad", 0o644, tarfile.REGTYPE)],
+                 [(entries[0][0], b"modified", 0o644, tarfile.REGTYPE)] + entries[1:],
+                 [(entries[0][0], entries[0][1], 0o777, tarfile.REGTYPE)] + entries[1:],
+                 [(entries[0][0], b"", 0o644, tarfile.SYMTYPE)] + entries[1:],
+                 entries[:-1] + [("manifest.json", b"{}", 0o644, tarfile.REGTYPE)]]
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(pub013, "recovery_source", side_effect=lambda commit: (self.tree, self.files())):
+            path = Path(temporary) / pub013.OVERLAY_NAME
+            for i, changed in enumerate(cases):
+                with self.subTest(case=i):
+                    path.write_bytes(gzip.compress(self.tar(changed)))
+                    with self.assertRaises(ValueError):
+                        pub013.verify_recovery_overlay(path, self.commit)
+
 
 if __name__ == "__main__":
     unittest.main()
