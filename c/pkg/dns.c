@@ -340,7 +340,7 @@ static int query_record(const md_packet *p, const md_rr *rr, void *arg) {
 }
 int md_dns_query_parse(const md_packet *p, md_dns_query *v, char *err) {
     if (!v) return fail(err, "missing DNS query output");
-    v->valid = v->cache_edns_ok = false; v->len = 0; v->route = -1;
+    v->valid = v->cache_edns_ok = false; v->len = 0; v->route = -1; v->cache_memo = -1;
     query_opts o = {0};
     name_marks m;
     marks_reset(&m, p);
