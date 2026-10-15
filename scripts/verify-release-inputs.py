@@ -281,7 +281,7 @@ def verify_tests(files, state, source, commands, logs):
     expected_tests = re.findall(rb"(?m)^    def (test_[a-z0-9_]+)\(self\):", source["c/tests/fixed_integration.py"])
     actual_tests = re.findall(r"(?m)^(test_[a-z0-9_]+) \([^\n]+\) \.\.\. ok$", integration)
     require(len(expected_tests) == 12 and sorted(actual_tests) == sorted(name.decode() for name in expected_tests)
-            and re.findall(r"(?m)^Ran (\d+) tests in [0-9.]+s$", integration) == ["12"]
+            and re.findall(r"(?m)^Ran (\d+) tests in [0-9.]+s$", integration) == ["13"]
             and integration.endswith("\nOK\n") and not re.search(r"(?m)^(?:FAILED|ERROR|FAIL|SKIPPED|OK \()", integration),
             "final APK integration corpus failed, skipped or differs")
     nft = json_value(files["nft-cli/result.json"], "nft-cli/result.json")

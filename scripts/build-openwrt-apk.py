@@ -315,7 +315,7 @@ def main():
         require('"assertions":170' in (logs / "qemu-nft_netlink_test.log").read_text(), "netlink corpus missing")
         nft = json.loads((out / "nft-cli/result.json").read_text())
         require(nft["ok"] and len(nft["checks"]) == nft_count and all(item["passed"] for item in nft["checks"]), "nft CLI corpus changed or failed")
-        require("Ran 12 tests" in (logs / "qemu-final-apk-integration.log").read_text(), "final APK integration corpus missing")
+        require("Ran 13 tests" in (logs / "qemu-final-apk-integration.log").read_text(), "final APK integration corpus missing")
         differential = json.loads((out / "regex-differential.json").read_text())
         require(differential["portable_comparisons"] == 81089 and differential["unexpected_differences"] == 0, "differential corpus changed or failed")
         state["tests"] = {"final_apk_loopback_integration": 12, "netlink_mock_assertions": 170, "nft_cli_checks": nft_count,
