@@ -12,7 +12,7 @@ Read [`c/REGEX-POSIX-LITE.md`](../../c/REGEX-POSIX-LITE.md) first. This backend
 intentionally accepts a restricted ASCII regex grammar, not arbitrary PCRE2.
 It keeps the existing parser/resource guards and per-rule-set C locale with
 thread-local `uselocale`. It must not be replaced with process-global locale
-changes. No PCRE2 or libyaml archive is linked into this package.
+changes. No PCRE2 or libyaml archive is linked into this package (libyaml is not vendored).
 
 ## Build with an appropriate SDK
 

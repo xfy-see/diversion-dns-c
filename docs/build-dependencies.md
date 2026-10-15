@@ -13,8 +13,8 @@ ASan/UBSan 和 Linux musl 静态构建均不编译或链接 libyaml，也不读�
 - libc、线程与编译器运行库：原生程序由目标系统提供；Linux 静态版本使用
   固定 Zig 0.14.1 所带 musl/启动和编译器支持。具体链接输入保留在静态
   manifest 和尺寸归因报告中
-- libyaml 0.2.5：只为历史源码、测试与已存证据保留在 `c/vendor/libyaml/`。
-  它的 MIT 许可证仍随源码保留，当前程序不包含该库
+- libyaml：已从源树移除（历史上曾 vendored 0.2.5）。当前程序不编译、不链接、不读取 YAML；
+  大小归因器仍保留 `libyaml` 分类，仅用于重读旧证据中的 map 条目
 
 PCRE2 官方归档：
 `https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.48/pcre2-10.48.tar.gz`
@@ -39,7 +39,7 @@ fixture、`fixed_integration.py` 和 `nft_cli_driver` 的 18 项 CLI 语法/失�
 
 静态发布保留完整的链接 map、字节相同的 map 重放文件、未剥离诊断文件和
 归因 JSON；新静态构建要求 `disk_bytes.libyaml` 为零。归因器保留这一历史
-分类，便于重读旧证据，不能因源树仍有 libyaml 就把它算作当前运行依赖。
+分类，便于重读旧证据；源树已无 libyaml，也不能把它算作当前运行依赖。
 
 原生本地与 Linux musl 静态产物、x86_64 与 ARM64、带调试符号与剥离文件
 必须分别记录。只比较编译器、依赖、优化及剥离参数相同的前后版本；编译或

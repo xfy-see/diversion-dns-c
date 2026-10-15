@@ -2,7 +2,7 @@
 
 独立的 C11/POSIX DNS 分流程序，从 mosdns C r12 导入后专用于 CN-site 场景。源码仍在 `c/`；运行时已去掉 YAML、插件图和 sequence，改用有界 `key=value` 配置与固定请求链。
 
-原始问题名匹配 CN 规则后，走共享缓存及唯一 CN/foreign 上游组；CN 回答包含缓存命中都经过原有 nft 最终处理。保留数字 UDP/TCP 上游、TCP 持久连接、TTL/LRU/lazy 缓存、Linux mark/接口绑定和 domain/full/keyword/regexp。没有跨组 fallback、热重载、服务安装或系统 DNS 接管。GPL-3.0-or-later；未参与构建的历史 libyaml 源码和原 MIT 许可证保留。
+原始问题名匹配 CN 规则后，走共享缓存及唯一 CN/foreign 上游组；CN 回答包含缓存命中都经过原有 nft 最终处理。保留数字 UDP/TCP 上游、TCP 持久连接、TTL/LRU/lazy 缓存、Linux mark/接口绑定和 domain/full/keyword/regexp。没有跨组 fallback、热重载、服务安装或系统 DNS 接管。GPL-3.0-or-later。运行时不依赖 YAML；历史 YAML 配置仅作迁移输入与证据保留。
 
 ## v0.1.2
 
@@ -64,7 +64,7 @@ main 分支的四个编译/测试 job 成功后，delivery job 会生成 `ci-<co
 
 每包绑定 commit、run ID/attempt、完整 Git 源码树及逐文件 SHA256。独立保留 CI 测试日志。默认本地工作流不调用 C 编译器，只有用户明确授权时例外；常规本机测试直接运行下载的程序。
 
-Linux static 包还在 `builds/static/size/` 保存 `mosdns-c.unstripped`、`mosdns-c.map`、`mosdns-c.mapped` 和 `attribution.json`。正常发布的 `builds/static/mosdns-c` 仍按原参数剥离；CI 用同一条 LLD 链接命令额外生成 map，并要求带 map 的已剥离文件与发布文件 SHA256 完全相同。应用、固定 PCRE2 依赖和测试使用 `-Os -flto`，仍保留静态 musl、原 stack 与 unwind 策略。JSON 按真正保留下来的输入节区计数：LTO 合并的项目、PCRE2 及 runtime 输入列为 `mixed_lto`，不硬拆为各自字节；依赖配置、精确链接输入和诊断 ELF 符号另行验证。未合并输入及历史非 LTO 产物继续按项目代码、PCRE2 和 musl/启动/编译器支持归类。当前产物不编译或链接 libyaml，历史产物归因仍保留其原分类，并单列合并常量、链接器生成内容及对齐/文件元数据；`bss_bytes` 是内存节区，不计入磁盘文件。未剥离 ELF 另供符号检查，不能假定其代码字节与使用 `-s` 的发布链接完全相同。
+Linux static 包还在 `builds/static/size/` 保存 `mosdns-c.unstripped`、`mosdns-c.map`、`mosdns-c.mapped` 和 `attribution.json`。正常发布的 `builds/static/mosdns-c` 仍按原参数剥离；CI 用同一条 LLD 链接命令额外生成 map，并要求带 map 的已剥离文件与发布文件 SHA256 完全相同。应用、固定 PCRE2 依赖和测试使用 `-Os -flto`，仍保留静态 musl、原 stack 与 unwind 策略。JSON 按真正保留下来的输入节区计数：LTO 合并的项目、PCRE2 及 runtime 输入列为 `mixed_lto`，不硬拆为各自字节；依赖配置、精确链接输入和诊断 ELF 符号另行验证。未合并输入及历史非 LTO 产物继续按项目代码、PCRE2 和 musl/启动/编译器支持归类。当前产物不编译或链接 libyaml（源树已移除该 vendored 依赖）；历史产物归因仍保留 libyaml 分类，并单列合并常量、链接器生成内容及对齐/文件元数据；`bss_bytes` 是内存节区，不计入磁盘文件。未剥离 ELF 另供符号检查，不能假定其代码字节与使用 `-s` 的发布链接完全相同。
 
 ## 下载后的完整本地校验
 
