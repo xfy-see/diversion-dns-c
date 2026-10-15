@@ -198,3 +198,13 @@ exact verification and hardware-acceptance boundaries.
 
 The previous release, `v0.1.0` (`0.1.0-r1`), is described in
 [its release notes](../../docs/release-v0.1.0.md).
+
+## v0.1.3 recovery overlay
+
+The APK remains binary-only. The separate stable asset
+`openwrt-recovery-v0.1.3.tar.gz` contains the deployment scripts, README, license,
+and a manifest bound to the release commit/tree. It targets the existing custom
+`.1` layout described in `deployment/openwrt-recovery/README.md`; installing the
+APK does not install this overlay, enable a service, or change DNS/routing.
+The `release-013` publisher also gates on the same main commit's kernel, delivery,
+and independent test-suite jobs, in addition to native/static and APK verification.

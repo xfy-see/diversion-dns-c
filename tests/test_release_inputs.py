@@ -234,6 +234,12 @@ class ReleaseInputs(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "membership differs"):
             fixture.check()
 
+    def test_v013_artifact_is_accepted_for_each_architecture(self):
+        for arch in ("aarch64_cortex-a53", "mipsel_24kc"):
+            with self.subTest(arch=arch):
+                fixture = self.fixture(arch, "0.1.3")
+                self.assertEqual(fixture.check()["application_version"], "0.1.3")
+
     def test_checksums_reject_traversal_duplicates_and_invalid_hashes(self):
         fixture = self.fixture()
         path = fixture.folder / "SHA256SUMS"
