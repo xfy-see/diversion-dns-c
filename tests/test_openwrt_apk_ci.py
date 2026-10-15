@@ -397,7 +397,7 @@ class SyntheticBuild:
             label = "qemu-nft-cli"
             self.write(self.out / "nft-cli/result.json", json.dumps({"ok": True, "checks": [{"passed": True}] * len(json.loads((ROOT / "c/tests/nft_cli_contract.json").read_text()))}).encode())
         elif len(command) > 1 and command[1].endswith("fixed_integration.py"):
-            label, text = "qemu-final-apk-integration", "Ran 12 tests\n\nOK\n"
+            label, text = "qemu-final-apk-integration", "Ran 13 tests\n\nOK\n"
         elif len(command) > 1 and command[1].endswith("build-native-pcre2.py"):
             label = "native-pcre2-build"
             self.write(self.work / "pcre2-reference/manifest.json", b"{}")

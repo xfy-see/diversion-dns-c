@@ -39,6 +39,7 @@ static unsigned test_calls[2], test_nft_calls, test_nft_v4, test_nft_v6;
 static unsigned test_last_concurrent[2];
 static size_t test_last_count[2];
 static uint32_t test_last_mark[2], test_ttl;
+static unsigned test_rcode; static uint8_t test_addr = 9;
 static unsigned test_forward_advance, test_nft_advance;
 static char test_last_device[2][64];
 static bool test_forward_fails, test_nft_fails, test_refresh_block, test_refresh_entered;
@@ -52,7 +53,7 @@ static void test_reset(void) {
     memset(test_last_count, 0, sizeof(test_last_count)); memset(test_last_mark, 0, sizeof(test_last_mark));
     memset(test_last_device, 0, sizeof(test_last_device));
     test_forward_fails = test_nft_fails = test_refresh_block = test_refresh_entered = false;
-    test_ttl = 60; test_last_nft.len = 0; test_forward_advance = test_nft_advance = 0;
+    test_ttl = 60; test_rcode = 0; test_addr = 9; test_last_nft.len = 0; test_forward_advance = test_nft_advance = 0;
 }
 static void test_write(const char *path, const char *text) {
     FILE *f = fopen(path, "wb"); assert(f); assert(fwrite(text, 1, strlen(text), f) == strlen(text)); assert(!fclose(f));
@@ -108,10 +109,10 @@ static int test_forward(const md_upstream *us, size_t count, unsigned concurrent
         test_refresh_entered = true; pthread_cond_broadcast(&test_ready);
         while (test_refresh_block) pthread_cond_wait(&test_ready, &test_lock);
     }
-    bool failed = test_forward_fails; uint32_t ttl = test_ttl; pthread_mutex_unlock(&test_lock);
+    bool failed = test_forward_fails; uint32_t ttl = test_ttl; unsigned forced = test_rcode; uint8_t addr = test_addr; pthread_mutex_unlock(&test_lock);
     if (failed) { r->len = 0; snprintf(err, MD_ERROR_SIZE, "injected upstream transport failure"); return -1; }
     md_question parsed; assert(!md_dns_question(q, &parsed, err));
-    unsigned rcode = !strncmp(parsed.name, "nx.", 3) ? 3 : 0; assert(!md_dns_error(q, r, rcode));
+    unsigned rcode = forced ? forced : !strncmp(parsed.name, "nx.", 3) ? 3 : 0; assert(!md_dns_error(q, r, rcode));
     if (rcode) return 0;
     size_t target_offset = 0;
     if (!strncmp(parsed.name, "alias.", 6)) {
@@ -124,7 +125,7 @@ static int test_forward(const md_upstream *us, size_t count, unsigned concurrent
         const uint8_t ip6[] = {0x20,0x01,0x0d,0xb8,0,0,0,0,0,0,0,0,0,0,0,9};
         test_add_record(r, 28, ip6, sizeof(ip6), ttl);
     } else {
-        const uint8_t cn[] = {192,0,2,9}, foreign[] = {203,0,113,9};
+        const uint8_t cn[] = {192,0,2,addr}, foreign[] = {203,0,113,addr};
         test_add_record(r, 1, group ? foreign : cn, sizeof(cn), ttl);
     }
     if (target_offset) md_write16(r->data + address_offset, (uint16_t)(0xc000 | target_offset));
@@ -309,6 +310,155 @@ static void test_lazy_refresh(void) {
     /* Free joins the blocked refresh before destroying cache or nft resources. */
     md_engine_free(e); assert(test_calls[0] == 2 && test_nft_calls == 7);
 }
+/* ---- cache policy: stale/refresh failure, prefetch, counters, override, warm-up ---- */
+static unsigned test_stat(md_engine *e, unsigned group, unsigned counter) {
+    md_cache_stats st; md_cache_get_stats(e->cache, &st); return (unsigned)st.v[group][counter];
+}
+/* Background refresh threads run on real time; wait until a counter reaches n. */
+static void test_wait_stat(md_engine *e, unsigned group, unsigned counter, unsigned n) {
+    for (unsigned i = 0; i < 5000 && test_stat(e, group, counter) < n; ++i) {
+        struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL);
+    }
+    assert(test_stat(e, group, counter) >= n);
+}
+static uint32_t test_answer_ttl(const md_packet *r) {
+    md_question parsed; char err[MD_ERROR_SIZE]; assert(!md_dns_question(r, &parsed, err));
+    return md_read32(r->data + parsed.end + 6);
+}
+static void test_stale_refresh_failure(void) {
+    test_reset(); test_ttl = 10; md_engine *e = test_engine("cache_stale_ttl=60\n", true);
+    md_packet q = test_question("keep.foreign.test", 1, 0x0100), r = test_resolve(e, &q);
+    assert(test_calls[1] == 1 && r.data[r.len-1] == 9 && test_answer_ttl(&r) == 10);
+    /* SERVFAIL refresh: old positive kept, served stale with TTL 30 */
+    atomic_store(&test_clock, 112); test_rcode = 2;
+    r = test_resolve(e, &q); assert(r.data[r.len-1] == 9 && test_answer_ttl(&r) == 30 && !(md_read16(r.data+2) & 15));
+    test_wait_stat(e, 1, MD_CS_REFRESH_FAIL, 1); assert(test_stat(e, 1, MD_CS_REFRESH_KEPT) == 1);
+    r = test_resolve(e, &q); assert(r.data[r.len-1] == 9 && !(md_read16(r.data+2) & 15));
+    test_wait_stat(e, 1, MD_CS_REFRESH_FAIL, 2);
+    /* transport timeout refresh: old answer kept */
+    test_rcode = 0; test_forward_fails = true; atomic_store(&test_clock, 120);
+    r = test_resolve(e, &q); assert(r.data[r.len-1] == 9 && test_answer_ttl(&r) == 30);
+    test_wait_stat(e, 1, MD_CS_REFRESH_FAIL, 3);
+    r = test_resolve(e, &q); assert(r.data[r.len-1] == 9); test_wait_stat(e, 1, MD_CS_REFRESH_FAIL, 4);
+    /* legitimate NXDOMAIN replaces */
+    test_forward_fails = false; test_rcode = 3; atomic_store(&test_clock, 130);
+    r = test_resolve(e, &q); assert(r.data[r.len-1] == 9); test_wait_stat(e, 1, MD_CS_REFRESH_OK, 1);
+    r = test_resolve(e, &q); assert((md_read16(r.data+2) & 15) == 3);
+    /* address change replaces */
+    test_rcode = 0; q = test_question("move.foreign.test", 1, 0x0100); r = test_resolve(e, &q); assert(r.data[r.len-1] == 9);
+    atomic_store(&test_clock, 141); test_addr = 77;
+    r = test_resolve(e, &q); assert(r.data[r.len-1] == 9); test_wait_stat(e, 1, MD_CS_REFRESH_OK, 2);
+    r = test_resolve(e, &q); assert(r.data[r.len-1] == 77 && test_answer_ttl(&r) == 10);
+    /* hard deadline: 10 s TTL + 60 s stale after insertion at 130 -> gone at 200 */
+    unsigned before = test_calls[1]; q = test_question("deadline.foreign.test", 1, 0x0100);
+    atomic_store(&test_clock, 130); (void)test_resolve(e, &q);
+    test_rcode = 2; atomic_store(&test_clock, 199); (void)test_resolve(e, &q); test_wait_stat(e, 1, MD_CS_REFRESH_FAIL, 5);
+    atomic_store(&test_clock, 200); r = test_resolve(e, &q); assert((md_read16(r.data+2) & 15) == 2);
+    assert(test_calls[1] == before + 3);
+    /* CN group has no stale by default: expiry is a miss */
+    test_rcode = 0; q = test_question("nostale.cn", 1, 0x0100); before = test_calls[0];
+    (void)test_resolve(e, &q); atomic_store(&test_clock, 210); (void)test_resolve(e, &q); assert(test_calls[0] == before + 2);
+    md_engine_free(e);
+}
+static void test_stale_override(void) {
+    test_reset(); test_ttl = 10;
+    char rules[600], extra[1400]; snprintf(rules, sizeof(rules), "%s/ddns.txt", test_directory);
+    test_write(rules, "full:ddns.foreign.test\n");
+    snprintf(extra, sizeof(extra), "cache_stale_ttl=60\ncache_stale_ttl_cn=30\ncache_stale_answer_ttl=20\ncache_stale_override=0:%s\n", rules);
+    md_engine *e = test_engine(extra, true);
+    md_packet d = test_question("ddns.foreign.test", 1, 0x0100), n = test_question("normal.foreign.test", 1, 0x0100), c = test_question("stale.cn", 1, 0x0100);
+    (void)test_resolve(e, &d); (void)test_resolve(e, &n); (void)test_resolve(e, &c);
+    atomic_store(&test_clock, 111); pthread_mutex_lock(&test_lock); test_refresh_block = true; pthread_mutex_unlock(&test_lock);
+    unsigned cn_nft = test_nft_calls;
+    md_packet r = test_resolve(e, &n); assert(test_answer_ttl(&r) == 20);
+    r = test_resolve(e, &c); assert(test_answer_ttl(&r) == 20 && test_nft_calls == cn_nft + 1); /* stale CN still writes nft */
+    pthread_mutex_lock(&test_lock); test_refresh_block = false; pthread_cond_broadcast(&test_ready); pthread_mutex_unlock(&test_lock);
+    test_wait_stat(e, 1, MD_CS_REFRESH_OK, 1); test_wait_stat(e, 0, MD_CS_REFRESH_OK, 1);
+    unsigned before = test_calls[1]; r = test_resolve(e, &d); assert(test_calls[1] == before + 1 && test_answer_ttl(&r) == 10);
+    md_engine_free(e); assert(!unlink(rules));
+}
+static void test_prefetch(void) {
+    test_reset(); test_ttl = 100; md_engine *e = test_engine("cache_prefetch_percent=10\ncache_prefetch_max=1\n", true);
+    md_packet q = test_question("pf.foreign.test", 1, 0x0100), *d = calloc(1, sizeof(*d)), r; char err[MD_ERROR_SIZE];
+    assert(d); (void)test_resolve(e, &q); assert(test_calls[1] == 1);
+    md_dns_query qv = { .valid = false };
+    atomic_store(&test_clock, 101); assert(md_engine_dispatch_q(e, 0, &q, &qv, d) == MD_LANE_REPLY);
+    /* 5 s left (threshold 7..12): a reused fresh hit leaves the event loop for a worker */
+    atomic_store(&test_clock, 195); qv = (md_dns_query){ .valid = false };
+    assert(md_engine_dispatch_q(e, 0, &q, &qv, d) == MD_LANE_CACHED && qv.cache_memo == 1);
+    assert(!md_engine_query_q(e, 0, &q, &qv, &r, err) && r.len && test_answer_ttl(&r) == 5);
+    test_wait_stat(e, 1, MD_CS_REFRESH_OK, 1); assert(test_calls[1] == 2 && test_stat(e, 1, MD_CS_PREFETCH) == 1);
+    /* refreshed in the background: answered from the event loop again with a full TTL */
+    qv = (md_dns_query){ .valid = false };
+    assert(md_engine_dispatch_q(e, 0, &q, &qv, d) == MD_LANE_REPLY && test_answer_ttl(d) == 100);
+    /* counters: each request counted once across dispatch + worker */
+    assert(test_stat(e, 1, MD_CS_COLD) == 1 && test_stat(e, 1, MD_CS_FRESH) == 3);
+    md_engine_free(e);
+
+    /* concurrency cap: second due prefetch is refused while one is in flight; CN prefetch writes nft */
+    test_reset(); test_ttl = 100; e = test_engine("cache_prefetch_percent=10\ncache_prefetch_max=1\n", true);
+    md_packet a = test_question("a.cn", 1, 0x0100), b = test_question("b.foreign.test", 1, 0x0100);
+    (void)test_resolve(e, &a); (void)test_resolve(e, &b); (void)test_resolve(e, &a); (void)test_resolve(e, &b);
+    assert(test_calls[0] == 1 && test_calls[1] == 1 && test_nft_calls == 2);
+    atomic_store(&test_clock, 195); pthread_mutex_lock(&test_lock); test_refresh_block = true; pthread_mutex_unlock(&test_lock);
+    (void)test_resolve(e, &a);
+    struct timespec deadline; assert(!clock_gettime(CLOCK_REALTIME, &deadline)); deadline.tv_sec += 5;
+    pthread_mutex_lock(&test_lock);
+    while (!test_refresh_entered) assert(!pthread_cond_timedwait(&test_ready, &test_lock, &deadline));
+    pthread_mutex_unlock(&test_lock);
+    (void)test_resolve(e, &b); (void)test_resolve(e, &a);          /* capped / deduped: no new upstream query */
+    pthread_mutex_lock(&test_lock); test_refresh_block = false; pthread_cond_broadcast(&test_ready); pthread_mutex_unlock(&test_lock);
+    md_engine_free(e);
+    assert(test_calls[0] == 2 && test_calls[1] == 1);
+    assert(test_nft_calls == 5); /* a.cn: miss + hit + 2 hits at 195 + 1 prefetch resolve */
+    free(d);
+}
+static void test_counters_and_bypass(void) {
+    test_reset(); md_engine *e = test_engine("", true); char err[MD_ERROR_SIZE];
+    md_packet *d = calloc(1, sizeof(*d)), r; assert(d);
+    md_packet q = test_question("count.cn", 1, 0x0100); md_dns_query qv = { .valid = false };
+    assert(md_engine_dispatch_q(e, 0, &q, &qv, d) == MD_LANE_CN); assert(!md_engine_query_q(e, 0, &q, &qv, &r, err));
+    qv = (md_dns_query){ .valid = false };
+    assert(md_engine_dispatch_q(e, 0, &q, &qv, d) == MD_LANE_CACHED); assert(!md_engine_query_q(e, 0, &q, &qv, &r, err));
+    assert(test_stat(e, 0, MD_CS_COLD) == 1 && test_stat(e, 0, MD_CS_FRESH) == 1 && !test_stat(e, 1, MD_CS_COLD));
+    q = test_question("ecs.foreign.test", 1, 0x0100);
+    const uint8_t opt[] = {0,0,41,4,208,0,0,0,0,0,11,0,8,0,7,0,1,24,0,192,0,2};
+    memcpy(q.data + q.len, opt, sizeof(opt)); q.len += sizeof(opt); md_write16(q.data+10, 1);
+    (void)test_resolve(e, &q); (void)test_resolve(e, &q);
+    assert(test_stat(e, 1, MD_CS_BYPASS) == 2 && test_calls[1] == 2);
+    free(d); md_engine_free(e);
+}
+static size_t test_read_file(const char *path, char *out, size_t size) {
+    FILE *f = fopen(path, "rb"); assert(f); size_t n = fread(out, 1, size - 1, f); out[n] = 0; assert(!fclose(f)); return n;
+}
+static void test_warm_file(void) {
+    test_reset(); char warm[600], extra[1400], text[8192];
+    snprintf(warm, sizeof(warm), "%s/warm.txt", test_directory);
+    snprintf(extra, sizeof(extra), "cache_warm_file=%s\ncache_warm_qps=100\n", warm);
+    md_engine *e = test_engine(extra, true);
+    md_packet w1 = test_question("w1.foreign.test", 1, 0x0100), w2 = test_question("w2.cn", 28, 0x0100), once = test_question("once.foreign.test", 1, 0x0100);
+    (void)test_resolve(e, &w1); (void)test_resolve(e, &w1); (void)test_resolve(e, &w2); (void)test_resolve(e, &w2); (void)test_resolve(e, &once);
+    md_engine_free(e);
+    test_read_file(warm, text, sizeof(text));
+    assert(strstr(text, "0 1 w1.foreign.test\n") && strstr(text, "0 28 w2.cn\n") && !strstr(text, "once"));
+    assert(!strstr(text, "203.0.113") && !strstr(text, "2001:db8"));
+    /* junk lines are skipped; valid names are prewarmed through the resolver (CN via nft) */
+    size_t n = strlen(text); snprintf(text + n, sizeof(text) - n, "bad\n0 1 a..b\n9 1 x.test\n0 5 x.test\n0 1 sp ace\n0 1 e\\x.test\n");
+    test_write(warm, text);
+    test_reset(); e = test_engine(extra, true);
+    for (unsigned i = 0; i < 5000; ++i) {
+        pthread_mutex_lock(&test_lock); unsigned total = test_calls[0] + test_calls[1]; pthread_mutex_unlock(&test_lock);
+        if (total >= 2 && test_stat(e, 0, MD_CS_WARM) + test_stat(e, 1, MD_CS_WARM) >= 2) break;
+        struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL);
+    }
+    assert(test_stat(e, 1, MD_CS_WARM) == 1 && test_stat(e, 0, MD_CS_WARM) == 1);
+    assert(test_nft_calls == 1 && test_nft_v6 == 1);
+    unsigned before = test_calls[0] + test_calls[1];
+    (void)test_resolve(e, &w1); (void)test_resolve(e, &w2);
+    assert(test_calls[0] + test_calls[1] == before);
+    assert(test_calls[0] + test_calls[1] == 2); /* only the two valid names were prewarmed */
+    md_engine_free(e); assert(!unlink(warm));
+}
 int main(void) {
     strcpy(test_directory, "/tmp/mosdns-fixed-engine-XXXXXX"); assert(mkdtemp(test_directory));
     snprintf(test_rules, sizeof(test_rules), "%s/cn.txt", test_directory);
@@ -316,6 +466,7 @@ int main(void) {
     test_write(test_rules, "domain:cn\nfull:exact.test\nkeyword:needle\nregexp:^asset-[0-9]+\\.test$\n");
     test_split_and_cnames(); test_cache_keeps_nft(); test_negative_and_isolation();
     test_disabled_cache_and_group_options(); test_failures_and_entry(); test_deadlines_and_null_errors(); test_lazy_refresh();
+    test_stale_refresh_failure(); test_stale_override(); test_prefetch(); test_counters_and_bypass(); test_warm_file();
     assert(!unlink(test_config)); assert(!unlink(test_rules)); assert(!rmdir(test_directory));
     assert(!pthread_cond_destroy(&test_ready)); assert(!pthread_mutex_destroy(&test_lock));
     puts("fixed engine: QNAME split, CNAME, cache+nft, A/AAAA, errors and lazy refresh passed"); return 0;

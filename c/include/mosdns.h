@@ -53,9 +53,11 @@ void md_dns_limit_udp(const md_packet *q, md_packet *r);
  * （至多一个无选项、版本 0、extended RCODE 0 的 OPT，且没有其他记录）。
  * 服务端收包时解析一次，之后 engine/cache/forward/limit_udp/error 全部复用。
  * 请求报文在处理期间只读；len 不符或未解析时，*_q 接口退回兼容的自行解析。
- * route 是 engine 的分流备忘（-1 未知，0 境外，1 CN），解析时置 -1。 */
+ * route 是 engine 的分流备忘（-1 未知，0 境外，1 CN），解析时置 -1。
+ * cache_memo 是 engine 的缓存统计备忘（-1 尚未计数；0 已在 dispatch 计数；
+ * 1 已计数且已认领一次 prefetch），保证每个请求只计数一次。解析时置 -1。 */
 typedef struct {
-    md_question q; size_t len; bool valid, cache_edns_ok; signed char route;
+    md_question q; size_t len; bool valid, cache_edns_ok; signed char route, cache_memo;
 } md_dns_query;
 int md_dns_query_parse(const md_packet *p, md_dns_query *v, char *err);
 bool md_dns_query_ok(const md_packet *p, const md_dns_query *v);
@@ -127,6 +129,50 @@ void md_cache_refresh_end_q(md_cache *c, const md_packet *q, const md_dns_query 
 bool md_cache_refresh_begin(md_cache *c, const md_packet *q);
 void md_cache_refresh_end(md_cache *c, const md_packet *q);
 void md_cache_free(md_cache *c);
+/* Extended cache policy (all zero = legacy md_cache_new behaviour).
+ * lazy_ttl: legacy total retention measured from insertion (cache_lazy_ttl).
+ * stale_ttl[g]: extra seconds a positive answer may be served stale AFTER its
+ * TTL expired (cache_stale_ttl / cache_stale_ttl_cn, RFC 8767 style).
+ * stale_answer_ttl: TTL written into stale answers (0 = 5 legacy, 30 stale).
+ * max_bytes: byte budget for stored entries (0 = entries-only limit).
+ * foreign_reserve_percent: foreign entries are not evicted by CN churn while
+ * they use at most this share of entries/bytes.
+ * prefetch_percent: a reused (>=2 hits) fresh entry asks for a background
+ * refresh once its remaining TTL <= percent of the original TTL (jittered). */
+enum { MD_CACHE_CN = 0, MD_CACHE_FOREIGN = 1 };
+typedef struct {
+    uint32_t lazy_ttl, stale_ttl[2], stale_answer_ttl;
+    uint64_t max_bytes;
+    unsigned foreign_reserve_percent, prefetch_percent;
+} md_cache_options;
+md_cache *md_cache_new_ex(size_t capacity, const md_cache_options *o);
+/* Per-group counters. A query is counted once: FRESH/STALE hit, or one miss
+ * reason (COLD never seen, EVICTED by capacity, EXPIRED past its deadline),
+ * or BYPASS (not cacheable: ECS/EDNS options, non-IN, compressed question). */
+enum {
+    MD_CS_FRESH, MD_CS_STALE, MD_CS_COLD, MD_CS_EVICTED, MD_CS_EXPIRED, MD_CS_BYPASS,
+    MD_CS_REFRESH_OK, MD_CS_REFRESH_FAIL, MD_CS_REFRESH_KEPT, MD_CS_PREFETCH,
+    MD_CS_EVICTIONS, MD_CS_WARM, MD_CS_COUNT
+};
+typedef struct { uint64_t v[2][MD_CS_COUNT]; size_t entries[2]; uint64_t bytes[2]; } md_cache_stats;
+extern const char *const md_cache_stat_names[MD_CS_COUNT];
+typedef struct { bool prefetch_due; } md_cache_hit;
+/* flags for md_cache_get_ex */
+#define MD_CACHE_COUNT 1u     /* account this lookup in the group counters */
+#define MD_CACHE_CLAIM 2u     /* claim a due prefetch (only one claimer wins) */
+int md_cache_get_ex(md_cache *c, const md_packet *q, const md_dns_query *qv, md_packet *r, md_dns_view *rv,
+                    uint64_t now, unsigned group, unsigned flags, md_cache_hit *info);
+/* stale_ttl < 0 uses the group default; refresh=true means this answer came
+ * from a background refresh/prefetch: a SERVFAIL then never replaces a live
+ * positive entry before its hard deadline. Returns false when not stored. */
+typedef struct { unsigned group; int64_t stale_ttl; bool refresh; } md_cache_put_opts;
+bool md_cache_put_ex(md_cache *c, const md_packet *q, const md_dns_query *qv, const md_packet *r,
+                     const md_dns_view *rv, uint64_t now, const md_cache_put_opts *o);
+void md_cache_count(md_cache *c, unsigned group, unsigned counter);
+void md_cache_get_stats(md_cache *c, md_cache_stats *s);
+/* Hot names for restart warm-up: most recently used reused (>=1 hit) entries,
+ * names only. Each line is "<keyflags> <qtype> <name>\n"; returns lines written. */
+size_t md_cache_hot_names(md_cache *c, char *out, size_t out_size, size_t max);
 
 /* 已解析的上游配置；设置 SO_MARK/设备绑定要求 Linux，其他平台转发报错。 */
 typedef struct {
