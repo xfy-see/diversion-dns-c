@@ -11,11 +11,19 @@ import (
  "os"
  "os/exec"
  "os/signal"
+ "sync"
  "syscall"
  "time"
 )
 
+type boundedWriter struct { mu *sync.Mutex; writer io.Writer }
+func (w boundedWriter) Write(p []byte) (int,error) { w.mu.Lock();defer w.mu.Unlock();return w.writer.Write(p) }
+
 func bounded(seconds int, argv []string, stdout, stderr io.Writer, stop <-chan os.Signal) int {
+ // os/exec copies both child streams concurrently with our timeout messages.
+ // One mutex also handles callers passing the same writer for both streams.
+ var outputMu sync.Mutex
+ stdout=boundedWriter{&outputMu,stdout};stderr=boundedWriter{&outputMu,stderr}
  if seconds<1 || seconds>60 || len(argv)==0 {fmt.Fprintln(stderr,"bounded: invalid seconds or empty command");return 2}
  cmd:=exec.Command(argv[0],argv[1:]...)
  cmd.Stdin=nil;cmd.Stdout=stdout;cmd.Stderr=stderr
