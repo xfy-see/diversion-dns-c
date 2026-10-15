@@ -34,7 +34,7 @@ class CorpusVersionContracts(unittest.TestCase):
 
     def test_current_contract_from_verified_source(self):
         manifest = (ROOT / "c/tests/nft_cli_contract.json").read_bytes()
-        self.assertEqual(len(verify.nft_cases({"VERSION": b"0.1.1", "c/tests/nft_cli_contract.json": manifest})), 72)
+        self.assertEqual(len(verify.nft_cases({"VERSION": b"0.1.1", "c/tests/nft_cli_contract.json": manifest})), 82)
         with self.assertRaises(ValueError):
             verify.nft_cases({"VERSION": b"0.1.1", "c/plugin/nft_fast.h": b""})
 
@@ -94,7 +94,7 @@ class Evidence:
             "qemu-fixed_config_test": "fixed config: strict keys, bounds, lists, diagnostics and rules preflight passed\n",
             "qemu-fixed_engine_test": "fixed engine: QNAME split, CNAME, cache+nft, A/AAAA, errors and lazy refresh passed\n",
             "qemu-cache_domain_test": "POSIX-lite profile: 96 explicit syntax/complexity rejections; grammar, limits, ASCII and locale checks passed\nshared frozen domain regex: 8 threads / 43200 matches passed (4 UTF-8 thread locales available)\ndomain/cache/nftset parser tests passed\n",
-            "qemu-nft_netlink_test": '{"passed":true,"assertions":157,"sockets_used":false}\n',
+            "qemu-nft_netlink_test": '{"passed":true,"assertions":170,"sockets_used":false}\n',
             "qemu-domain-fixture": "shared domain fixture: 11 cases / 70 assertions passed; 4 Unicode/RE2-specific cases explicitly skipped with reasons\nPOSIX-lite profile: 7 byte/ASCII cases and 5 required Unicode rejections / 37 assertions passed\n",
             "native-reference-budget-unit": "PCRE2 operational budget: 2 direct MATCHLIMIT(-47) errors verified; bool API returns false\n",
             "qemu-nft-cli": '{"ok":true,"checks":30,"sanitized":false,"device_or_kernel_evidence":false}\n',
@@ -336,7 +336,7 @@ class ReleaseInputs(unittest.TestCase):
     def test_version_count_skip_failure_and_truncated_logs_rejected(self):
         fixture = self.fixture()
         edits = [("apk-version", "0.1.0", "0.2.0"), ("qemu-cache_domain_test", "43200", "143200"),
-                 ("qemu-nft_netlink_test", "157", "156"), ("qemu-domain-fixture", "70 assertions", "7 assertions"),
+                 ("qemu-nft_netlink_test", "170", "169"), ("qemu-domain-fixture", "70 assertions", "7 assertions"),
                  ("qemu-final-apk-integration", "Ran 12", "Ran 11"), ("qemu-final-apk-integration", "... ok", "... skipped 'why'"),
                  ("qemu-final-apk-integration", "\nOK\n", "\nFAILED (failures=1)\n"),
                  ("qemu-dns_test", "tests passed", "tests")]

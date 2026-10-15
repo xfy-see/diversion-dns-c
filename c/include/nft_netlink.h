@@ -71,27 +71,45 @@ static inline bool md_nl_identifier(const char *s) {
     for(;n<128&&s[n];++n){unsigned char c=(unsigned char)s[n];if(!((c>='a'&&c<='z')||(c>='A'&&c<='Z')||c=='_'||(n&&((c>='0'&&c<='9')||c=='-'))))return false;}
     return n>0&&n<128;
 }
+/* 一组目标集合的 NEWSETELEM 分块；batch 与多组编码共用，保证单组输出不变。 */
+typedef struct { uint8_t family; const char *table, *set; const uint8_t (*keys)[16]; size_t count; unsigned key_bytes; const uint64_t *timeouts; } md_nl_set_keys;
+static inline int md_nl_set_keys_valid(const md_nl_set_keys *g) {
+    return g&&g->keys&&g->count&&g->count<=MD_NL_MAX_KEYS&&(g->key_bytes==4||g->key_bytes==16)&&(g->family==1||g->family==2||g->family==10)&&md_nl_identifier(g->table)&&md_nl_identifier(g->set);
+}
+static inline int md_nl_set_keys_append(md_nl_writer *w,md_nl_requests *r,uint32_t *seq,const md_nl_set_keys *g) {
+    size_t at;
+    for(size_t first=0;first<g->count;first+=MD_NL_CHUNK_KEYS){
+        size_t elements;if(md_nl_message_start(w,r,0xA0C,0x405,(*seq)++,g->family,0,&at)||md_nl_attr(w,1,g->table,strlen(g->table)+1)||md_nl_attr(w,2,g->set,strlen(g->set)+1)||md_nl_nested_start(w,3,&elements))return -1;
+        size_t end=first+MD_NL_CHUNK_KEYS;if(end>g->count)end=g->count;
+        for(size_t i=first;i<end;++i){size_t elem,key;if(md_nl_nested_start(w,1,&elem)||md_nl_nested_start(w,1,&key)||md_nl_attr(w,1,g->keys[i],g->key_bytes)||md_nl_nested_end(w,key))return -1;
+            if(g->timeouts){uint8_t ttl[8];if(!g->timeouts[i])return -1;
+    md_nl_be32(ttl,(uint32_t)(g->timeouts[i]>>32));md_nl_be32(ttl+4,(uint32_t)g->timeouts[i]);if(md_nl_attr(w,4,ttl,8)||md_nl_attr(w,5,ttl,8))return -1;}
+            if(md_nl_nested_end(w,elem))return -1;}
+        if(md_nl_nested_end(w,elements))return -1;
+    md_nl_message_end(w,at);
+    }
+    return 0;
+}
+/* 一个 GENID 保护的原子批次写入 1–2 组集合（例如同一 cohort 的 IPv4 与 IPv6）：
+ * begin、各组分块 NEWSETELEM、end。任何一组被内核拒绝，整个批次都不提交。 */
+static inline int md_nft_nl_batch_multi_encode(uint8_t *out,size_t cap,md_nl_requests *r,uint32_t port,uint32_t seq,uint32_t generation,const md_nl_set_keys *groups,size_t ngroups) {
+    if(!out||!r||!port||!seq||seq>UINT32_MAX-MD_NL_MAX_REQUESTS||!generation||!groups||!ngroups||ngroups>2)return -1;
+    size_t total=0;for(size_t i=0;i<ngroups;i++){if(!md_nl_set_keys_valid(&groups[i]))return -1;total+=groups[i].count;}
+    if(total>MD_NL_MAX_KEYS)return -1;
+    memset(r,0,sizeof(*r));r->wire=out;r->port=port;md_nl_writer w={out,cap,0};size_t at;uint8_t gen[4];md_nl_be32(gen,generation);
+    if(md_nl_message_start(&w,r,16,1,seq++,0,10,&at)||md_nl_attr(&w,1,gen,4))return -1;
+    md_nl_message_end(&w,at);
+    for(size_t i=0;i<ngroups;i++)if(md_nl_set_keys_append(&w,r,&seq,&groups[i]))return -1;
+    if(md_nl_message_start(&w,r,17,1,seq,0,10,&at))return -1;
+    md_nl_message_end(&w,at);r->length=w.length;return 0;
+}
 /* Input keys are fixed 16-byte slots; only the first key_bytes are encoded. */
 /* 一个原子 nft 批次包含 begin、分块的 NEWSETELEM 和 end；begin
  * 携带 generation，防止将按旧元数据构建的元素写入已变化的规则集。
  * 参数和缓冲区失败只表示编码失败，调用方不可发送未完成的缓冲区。 */
 static inline int md_nft_nl_batch_timed_encode(uint8_t *out,size_t cap,md_nl_requests *r,uint32_t port,uint32_t seq,uint8_t family,const char *table,const char *set,const uint8_t (*keys)[16],size_t count,unsigned key_bytes,uint32_t generation,const uint64_t *timeouts) {
-    if(!out||!r||!port||!seq||seq>UINT32_MAX-MD_NL_MAX_REQUESTS||!generation||!keys||!count||count>MD_NL_MAX_KEYS||(key_bytes!=4&&key_bytes!=16)||(family!=1&&family!=2&&family!=10)||!md_nl_identifier(table)||!md_nl_identifier(set))return -1;
-    memset(r,0,sizeof(*r));r->wire=out;r->port=port;md_nl_writer w={out,cap,0};size_t at;uint8_t gen[4];md_nl_be32(gen,generation);
-    if(md_nl_message_start(&w,r,16,1,seq++,0,10,&at)||md_nl_attr(&w,1,gen,4))return -1;
-    md_nl_message_end(&w,at);
-    for(size_t first=0;first<count;first+=MD_NL_CHUNK_KEYS){
-        size_t elements;if(md_nl_message_start(&w,r,0xA0C,0x405,seq++,family,0,&at)||md_nl_attr(&w,1,table,strlen(table)+1)||md_nl_attr(&w,2,set,strlen(set)+1)||md_nl_nested_start(&w,3,&elements))return -1;
-        size_t end=first+MD_NL_CHUNK_KEYS;if(end>count)end=count;
-        for(size_t i=first;i<end;++i){size_t elem,key;if(md_nl_nested_start(&w,1,&elem)||md_nl_nested_start(&w,1,&key)||md_nl_attr(&w,1,keys[i],key_bytes)||md_nl_nested_end(&w,key))return -1;
-            if(timeouts){uint8_t ttl[8];if(!timeouts[i])return -1;
-    md_nl_be32(ttl,(uint32_t)(timeouts[i]>>32));md_nl_be32(ttl+4,(uint32_t)timeouts[i]);if(md_nl_attr(&w,4,ttl,8)||md_nl_attr(&w,5,ttl,8))return -1;}
-            if(md_nl_nested_end(&w,elem))return -1;}
-        if(md_nl_nested_end(&w,elements))return -1;
-    md_nl_message_end(&w,at);
-    }
-    if(md_nl_message_start(&w,r,17,1,seq,0,10,&at))return -1;
-    md_nl_message_end(&w,at);r->length=w.length;return 0;
+    md_nl_set_keys g={family,table,set,keys,count,key_bytes,timeouts};
+    return md_nft_nl_batch_multi_encode(out,cap,r,port,seq,generation,&g,1);
 }
 static inline int md_nft_nl_batch_encode(uint8_t *out,size_t cap,md_nl_requests *r,uint32_t port,uint32_t seq,uint8_t family,const char *table,const char *set,const uint8_t (*keys)[16],size_t count,unsigned key_bytes,uint32_t generation) {
     return md_nft_nl_batch_timed_encode(out,cap,r,port,seq,family,table,set,keys,count,key_bytes,generation,NULL);

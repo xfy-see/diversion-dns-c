@@ -34,6 +34,7 @@ typedef struct job {
     socklen_t peer_len;
     size_t entry;
     md_dns_query qv; /* 收包时唯一一次请求解析；acquire_job 清零（valid=false） */
+    md_trace tr;     /* 诊断计时（DIVERSION_TRACE），acquire_job 清零 */
     md_packet query, response;
 } job;
 /* 每条 lane 的待执行队列、正在访问上游的 job 链表与 outstanding；后者包含排队、
@@ -136,6 +137,7 @@ static bool follow_running(lane *l, job *j) {
 static bool enqueue(pool *p, job *j) {
     lane *l = &p->lanes[j->lane];
     j->queued = md_now_ms();
+    if (md_trace_enabled) j->tr.t[MD_T_ENQUEUE] = md_now_ns();
     pthread_mutex_lock(&p->lock);
     if (p->stopping || l->outstanding >= MAX_JOBS) {
         pthread_mutex_unlock(&p->lock); return false;
@@ -153,6 +155,11 @@ static bool enqueue(pool *p, job *j) {
 /* The listener stays open until all workers join. Datagram sends are atomic;
  * reply here rather than waiting for a second wakeup and scheduling the event
  * loop. It still owns job recycling. */
+static void trace_done(job *j) {
+    if (!md_trace_enabled) return;
+    j->tr.t[MD_T_REPLY] = md_now_ns(); j->tr.lane = j->lane;
+    md_trace_emit(&j->tr, &j->query);
+}
 static void reply_udp(job *j) {
     if (j->slot >= 0) return;
     md_dns_limit_udp_q(&j->query, &j->qv, &j->response);
@@ -161,6 +168,7 @@ static void reply_udp(job *j) {
                                 (struct sockaddr *)&j->peer, j->peer_len);
         (void)ignored;
     }
+    trace_done(j);
 }
 /* 每个 worker 建立自己的上游连接池，退出时释放；执行期间独占取出的 job。
  * UDP 可直接发回完整数据报，TCP 写操作必须交还事件循环保持帧进度一致。
@@ -185,14 +193,21 @@ static void *work(void *arg) {
         }
         pthread_mutex_unlock(&p->lock);
         char err[MD_ERROR_SIZE] = {0};
+        if (md_trace_enabled) {
+            j->tr.t[MD_T_PICKUP] = md_now_ns();
+            if (stale) j->tr.flags |= MD_TF_STALE_DROP;
+            md_trace_cur = &j->tr;
+        }
         if (stale) {
             fprintf(stderr, "query dropped: queued %llu ms (queue_timeout_ms=%llu)\n",
                     (unsigned long long)waited, (unsigned long long)p->queue_timeout);
             if (md_dns_error_q(&j->query, &j->qv, &j->response, 2)) j->response.len = 0;
         } else if (md_engine_query_q(p->engine, j->entry, &j->query, &j->qv, &j->response, err)) {
             fprintf(stderr, "query failed: %s\n", err);
+            md_trace_flag(MD_TF_ERROR);
             if (md_dns_error_q(&j->query, &j->qv, &j->response, 2)) j->response.len = 0;
         }
+        md_trace_cur = NULL;
         job *followers = NULL;
         if (running) {
             pthread_mutex_lock(&p->lock);
@@ -204,6 +219,10 @@ static void *work(void *arg) {
         /* 跟随者的查询与 j 除 ID 外相同，复制完整（未截断的）回复后只改写 ID。 */
         job *last = j;
         for (job *f = followers; f; f = f->next) {
+            if (md_trace_enabled) {
+                memcpy(f->tr.t + MD_T_PICKUP, j->tr.t + MD_T_PICKUP, (MD_T_REPLY - MD_T_PICKUP) * sizeof(f->tr.t[0]));
+                f->tr.flags |= MD_TF_FOLLOWER | (j->tr.flags & ~(uint32_t)MD_TF_LOOP_REPLY);
+            }
             f->response.len = j->response.len;
             if (j->response.len) {
                 memcpy(f->response.data, j->response.data, j->response.len);
@@ -290,14 +309,19 @@ static void tcp_read(pool *p, connection *c, int slot) {
                 if (!j) { close_connection(p, c); return; }
                 memcpy(j->query.data, c->body, c->expected);
                 j->query.len = c->expected;
+                if (md_trace_enabled) j->tr.t[MD_T_RECV] = md_now_ns();
                 j->entry = c->entry; j->slot = slot; j->generation = c->generation;
                 char err[MD_ERROR_SIZE];
                 if (md_dns_query_parse(&j->query, &j->qv, err) || (j->qv.q.flags & 0x8000)) {
                     recycle_job(p, j); close_connection(p, c); return;
                 }
                 /* 快路径只处理引擎确认可直接返回的鲜缓存，其他查询按 lane 执行完整查询图。 */
+                if (md_trace_enabled) md_trace_cur = &j->tr;
                 j->lane = md_engine_dispatch_q(p->engine, j->entry, &j->query, &j->qv, &j->response);
+                md_trace_cur = NULL;
+                if (md_trace_enabled) j->tr.t[MD_T_DISPATCHED] = md_now_ns();
                 if (j->lane == MD_LANE_REPLY) {
+                    j->tr.flags |= MD_TF_LOOP_REPLY;
                     /* 不占任何 lane 配额：每连接至多一个待写回复，受连接上限与写期限约束。 */
                     c->output = j; c->sent = 0; c->write_start = md_now_ms();
                     md_write16(c->header, (uint16_t)j->response.len);
@@ -327,6 +351,7 @@ static void tcp_write(pool *p, connection *c) {
         if (n <= 0) { close_connection(p, c); return; }
         c->sent += (size_t)n; c->last = md_now_ms();
     }
+    if (md_trace_enabled) { j->tr.flags |= MD_TF_TCP; trace_done(j); }
     release_job(p, j); c->output = NULL; c->busy = false;
     c->header_len = c->body_len = c->expected = c->sent = 0;
 }
@@ -385,14 +410,16 @@ static void udp_read(pool *p, int fd, size_t entry) {
                              (struct sockaddr *)&j->peer, &j->peer_len);
         if (n < 0) { recycle_job(p, j); return; }
         j->query.len = (size_t)n; j->socket = fd; j->entry = entry; j->slot = -1;
+        if (md_trace_enabled) j->tr.t[MD_T_RECV] = md_now_ns();
         char err[MD_ERROR_SIZE];
         if (md_dns_query_parse(&j->query, &j->qv, err) || (j->qv.q.flags & 0x8000)) { recycle_job(p, j); continue; }
+        if (md_trace_enabled) md_trace_cur = &j->tr;
         j->lane = md_engine_dispatch_q(p->engine, entry, &j->query, &j->qv, &j->response);
+        md_trace_cur = NULL;
+        if (md_trace_enabled) j->tr.t[MD_T_DISPATCHED] = md_now_ns();
         if (j->lane == MD_LANE_REPLY) {
-            md_dns_limit_udp_q(&j->query, &j->qv, &j->response);
-            ssize_t ignored = sendto(fd, j->response.data, j->response.len, 0,
-                                    (struct sockaddr *)&j->peer, j->peer_len);
-            (void)ignored;
+            j->tr.flags |= MD_TF_LOOP_REPLY;
+            reply_udp(j);
             recycle_job(p, j); continue;
         }
         if (!enqueue(p, j)) {
@@ -411,6 +438,7 @@ int md_server_run(md_engine *e, unsigned workers, char *err) {
     if (!count || count > 64 || workers < 1 || workers > 64) {
         snprintf(err, MD_ERROR_SIZE, "requires 1..64 listeners and 1..64 workers"); return -1;
     }
+    md_trace_init();
     static const md_server_limits fallback = {2000, 5, 10, 128, 32};
     const md_server_limits *limits = md_engine_server_limits(e);
     if (!limits) limits = &fallback;

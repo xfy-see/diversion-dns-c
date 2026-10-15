@@ -181,6 +181,14 @@ int md_nft_apply_view(md_nft *n, const md_packet *r, const md_dns_view *rv, char
 /* 只读检查兼容路径的目标集合，interval set 缺少 auto-merge 时向 stderr 告警；
  * 读取失败时静默，不改变内核状态，也不影响返回结果。 */
 void md_nft_audit(const md_nft *n);
+/* 热命中跳过窗口（毫秒，0 关闭，即每次都走完整的内核核对/写入）。窗口内同一
+ * 地址已被本进程写入或核对且剩余寿命足够时，不再访问内核；代价是外部 flush/
+ * delete/重建后最多 window 毫秒内不会重新学习。任何写入错误或 generation 变化
+ * 清空全部记录。见 docs/fixed-splitter.md「热命中跳过窗口」。 */
+void md_nft_set_hit_window(md_nft *n, unsigned window_ms);
+/* 进程内累计计数（诊断/契约测试）：apply 调用、窗口跳过、内核写事务。 */
+typedef struct { uint64_t applies, skipped, transactions; } md_nft_stats;
+void md_nft_get_stats(md_nft_stats *out);
 void md_nft_free(md_nft *n);
 
 /* engine 拥有不可变分流配置、规则、缓存、nft 和监听器。
@@ -220,6 +228,46 @@ void md_engine_free(md_engine *e);
 uint64_t md_now(void);
 /* 单调时钟毫秒数，供服务端排队期限和 TCP 读写期限使用。 */
 uint64_t md_now_ms(void);
+/* CLOCK_MONOTONIC 纳秒；与同机其他进程的 CLOCK_MONOTONIC 可直接比较。 */
+uint64_t md_now_ns(void);
+
+/* ---- 可选的逐请求阶段计时（诊断用，默认关闭）----
+ * 只有启动时设置环境变量 DIVERSION_TRACE=<文件路径> 才开启；未设置时
+ * md_trace_cur 恒为 NULL，各打点只是一次线程局部读取和分支，不取时钟、
+ * 不写文件，DNS/缓存/nft/上游语义完全不变。开启后每个请求结束时写一行
+ * TSV（格式见 docs/tail-latency-attribution.md），时间为 CLOCK_MONOTONIC 纳秒，
+ * 0 表示该阶段未发生。只用于受控测量，不用于生产。 */
+enum {
+    MD_T_RECV, MD_T_DISPATCHED, MD_T_ENQUEUE, MD_T_PICKUP, MD_T_ENGINE0,
+    MD_T_UP_SEND, MD_T_UP_RECV, MD_T_NFT0, MD_T_NFT_IO, MD_T_NFT1, MD_T_ENGINE1,
+    MD_T_REPLY, MD_T_COUNT
+};
+enum {
+    MD_TF_HIT_FRESH = 1u << 0, MD_TF_HIT_STALE = 1u << 1, MD_TF_REFRESH_START = 1u << 2,
+    MD_TF_UP_TCP = 1u << 3, MD_TF_UP_TC_FALLBACK = 1u << 4, MD_TF_NFT_FAST = 1u << 5,
+    MD_TF_NFT_CLI = 1u << 6, MD_TF_NFT_LEADER = 1u << 7, MD_TF_FOLLOWER = 1u << 8,
+    MD_TF_ERROR = 1u << 9, MD_TF_STALE_DROP = 1u << 10, MD_TF_LOOP_REPLY = 1u << 11,
+    MD_TF_TCP = 1u << 12, MD_TF_REFRESH_JOB = 1u << 13, MD_TF_NFT_SKIP = 1u << 14
+};
+typedef struct {
+    uint64_t t[MD_T_COUNT];
+    uint32_t flags, up_resends, up_attempts;
+    unsigned lane;
+} md_trace;
+extern bool md_trace_enabled;
+extern _Thread_local md_trace *md_trace_cur;
+static inline void md_trace_mark(unsigned stage) {
+    if (md_trace_cur) md_trace_cur->t[stage] = md_now_ns();
+}
+static inline void md_trace_mark_first(unsigned stage) {
+    if (md_trace_cur && !md_trace_cur->t[stage]) md_trace_cur->t[stage] = md_now_ns();
+}
+static inline void md_trace_flag(uint32_t flag) { if (md_trace_cur) md_trace_cur->flags |= flag; }
+/* 进程启动时读取环境变量；失败只告警，不影响服务。 */
+void md_trace_init(void);
+/* 写一行记录：q 为请求报文（取 ID/QTYPE/QNAME），可为 NULL。 */
+void md_trace_emit(const md_trace *t, const md_packet *q);
+void md_trace_close(void);
 /* pthread_create with at least MD_THREAD_STACK bytes of stack. musl defaults to
  * 128 KiB and a small RLIMIT_STACK shrinks glibc's default; larger platform
  * defaults are kept. Returns pthread_create's error number. */

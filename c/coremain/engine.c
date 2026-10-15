@@ -22,6 +22,7 @@ typedef enum {
     CN_CONCURRENT, FOREIGN_CONCURRENT, TCP_IDLE, NFT4, NFT6, NFT_FAST,
     QUEUE_TIMEOUT, TCP_READ, TCP_WRITE, TCP_MAX, TCP_MAX_IP,
     UDP_SPORT_REUSE, UDP_SPORT_REUSE_MAX_USES, UDP_SPORT_REUSE_TTL_MS, UDP_SPORT_REUSE_POOL,
+    NFT_HIT_WINDOW,
     KEY_COUNT
 } config_key;
 static const char *const key_names[KEY_COUNT] = {
@@ -29,7 +30,8 @@ static const char *const key_names[KEY_COUNT] = {
     "cache_size", "cache_lazy_ttl", "cn_mark", "foreign_mark", "cn_interface", "foreign_interface",
     "cn_concurrent", "foreign_concurrent", "tcp_idle_timeout", "nftset_ipv4", "nftset_ipv6", "nftset_fast",
     "queue_timeout_ms", "tcp_read_timeout", "tcp_write_timeout", "tcp_max_connections", "tcp_max_connections_per_ip",
-    "udp_sport_reuse", "udp_sport_reuse_max_uses", "udp_sport_reuse_ttl_ms", "udp_sport_reuse_pool"
+    "udp_sport_reuse", "udp_sport_reuse_max_uses", "udp_sport_reuse_ttl_ms", "udp_sport_reuse_pool",
+    "nftset_hit_window_ms"
 };
 typedef struct { char *text; size_t line; } config_value;
 typedef struct { config_value values[CONFIG_LIST_MAX]; size_t count; } config_values;
@@ -261,6 +263,12 @@ static int build_config(md_engine *e, const config *c, const char *path, char *e
     if (config_number(c, NFT_FAST, 0, 0, 1, false, &fast, path, err)) return -1;
     if (fast && (!e->nft || md_nft_enable_fast(e->nft, err)))
         return config_error(err, path, key_line(c, NFT_FAST), e->nft ? err : "nftset_fast requires a target");
+    /* 热命中跳过窗口：默认 1000 ms，0 关闭（每次 CN 命中都核对/写入内核）。 */
+    uint32_t hit_window;
+    if (config_number(c, NFT_HIT_WINDOW, 1000, 0, 10000, false, &hit_window, path, err)) return -1;
+    if (c->keys[NFT_HIT_WINDOW].count && !e->nft)
+        return config_error(err, path, key_line(c, NFT_HIT_WINDOW), "nftset_hit_window_ms requires a target");
+    if (e->nft) md_nft_set_hit_window(e->nft, hit_window);
     /* Read-only GETSET: warn (never fail) about interval targets lacking auto-merge. */
     md_nft_audit(e->nft);
     e->cn = md_domain_new();
@@ -293,7 +301,9 @@ static int build_config(md_engine *e, const config *c, const char *path, char *e
 static int finalize(md_engine *e, bool cn, md_packet *response, md_dns_view *view, uint64_t deadline, char *err) {
     if (md_now() >= deadline) return fail(err, "query execution deadline exceeded");
     if (response->len && md_dns_normalize_ttl_view(response, view, err)) return -1;
+    md_trace_mark(MD_T_NFT0);
     int rc = cn && e->nft && response->len ? md_nft_apply_view(e->nft, response, view, err) : 0;
+    md_trace_mark(MD_T_NFT1);
     if (!rc && md_now() >= deadline) rc = fail(err, "query execution deadline exceeded");
     return rc;
 }
@@ -304,7 +314,9 @@ static int resolve(md_engine *e, bool cn, const md_packet *query, const md_dns_q
     upstream_group *group = &e->upstreams[cn ? 0 : 1];
     md_dns_view *view = md_dns_view_scratch();
     if (!view) return fail(err, "out of memory for DNS view");
+    md_trace_mark(MD_T_UP_SEND);
     int rc = md_forward_q(group->items, group->count, group->concurrent, query, qv, response, view, err);
+    md_trace_mark(MD_T_UP_RECV);
     /* md_forward_view 只交出已校验的响应；防御性地在 view 缺失时重新解析。 */
     if (response->len && (!view->valid || view->len != response->len) && md_dns_view_parse(response, view, err)) {
         response->len = 0; return -1;
@@ -316,7 +328,15 @@ static int resolve(md_engine *e, bool cn, const md_packet *query, const md_dns_q
 static void *refresh_thread(void *opaque) {
     refresh_job *job = opaque;
     md_packet *response = calloc(1, sizeof(*response)); char err[MD_ERROR_SIZE] = {0};
-    if (response) { (void)resolve(job->engine, job->cn, &job->query, &job->qv, response, md_now() + 5, err); free(response); }
+    md_trace tr; memset(&tr, 0, sizeof(tr));
+    if (md_trace_enabled) { tr.flags = MD_TF_REFRESH_JOB; tr.t[MD_T_ENGINE0] = md_now_ns(); md_trace_cur = &tr; }
+    int rc = -1;
+    if (response) { rc = resolve(job->engine, job->cn, &job->query, &job->qv, response, md_now() + 5, err); free(response); }
+    if (md_trace_enabled) {
+        md_trace_cur = NULL; tr.t[MD_T_ENGINE1] = md_now_ns();
+        if (rc) tr.flags |= MD_TF_ERROR;
+        md_trace_emit(&tr, &job->query);
+    }
     md_cache_refresh_end_q(job->engine->cache, &job->query, &job->qv);
     pthread_mutex_lock(&job->engine->lock); job->done = true; pthread_mutex_unlock(&job->engine->lock);
     return NULL;
@@ -336,7 +356,7 @@ static void refresh_start(md_engine *e, bool cn, const md_packet *query, const m
     if (!job) { md_cache_refresh_end_q(e->cache, query, qv); pthread_mutex_unlock(&e->lock); return; }
     job->engine = e; job->query = *query; job->qv = *qv; job->cn = cn; job->next = e->jobs;
     if (md_thread_create(&job->thread, refresh_thread, job)) { md_cache_refresh_end_q(e->cache, query, qv); free(job); }
-    else e->jobs = job;
+    else { e->jobs = job; md_trace_flag(MD_TF_REFRESH_START); }
     pthread_mutex_unlock(&e->lock);
 }
 md_engine *md_engine_load(const char *path, bool check, char *err) {
@@ -382,7 +402,7 @@ unsigned md_engine_dispatch_q(md_engine *e, size_t entry, const md_packet *q, md
     md_dns_view *view = cn ? NULL : md_dns_view_scratch();
     if (!cn && !view) return MD_LANE_CACHED;
     int hit = md_cache_get_q(e->cache, q, qv, r, view, md_now());
-    if (hit == 1 && !cn && !finalize(e, false, r, view, md_now() + 5, err)) return MD_LANE_REPLY;
+    if (hit == 1 && !cn && !finalize(e, false, r, view, md_now() + 5, err)) { md_trace_flag(MD_TF_HIT_FRESH); return MD_LANE_REPLY; }
     r->len = 0;
     if (hit) return MD_LANE_CACHED;
     return cn ? MD_LANE_CN : MD_LANE_FOREIGN;
@@ -406,10 +426,13 @@ int md_engine_query_q(md_engine *e, size_t entry, const md_packet *q, md_dns_que
     bool cn = route_cn(e, qv);
     md_dns_view *view = md_dns_view_scratch();
     if (!view) return fail(err, "out of memory for DNS view");
+    md_trace_mark(MD_T_ENGINE0);
     int hit = md_cache_get_q(e->cache, q, qv, r, view, md_now());
-    if (hit == 2) refresh_start(e, cn, q, qv);
-    if (hit) return finalize(e, cn, r, view, deadline, err);
-    int rc = resolve(e, cn, q, qv, r, deadline, err);
+    if (hit == 2) { md_trace_flag(MD_TF_HIT_STALE); refresh_start(e, cn, q, qv); }
+    else if (hit) md_trace_flag(MD_TF_HIT_FRESH);
+    int rc = hit ? finalize(e, cn, r, view, deadline, err) : resolve(e, cn, q, qv, r, deadline, err);
+    md_trace_mark(MD_T_ENGINE1);
+    if (hit) return rc;
     if (!rc && !r->len) return fail(err, "upstream completed without a response");
     return rc;
 }
@@ -419,6 +442,13 @@ void md_engine_free(md_engine *e) {
     if (!e) return;
     pthread_mutex_lock(&e->lock); e->stopping = true; refresh_job *jobs = e->jobs; e->jobs = NULL; pthread_mutex_unlock(&e->lock);
     while (jobs) { refresh_job *next = jobs->next; pthread_join(jobs->thread, NULL); free(jobs); jobs = next; }
+    md_trace_close();
+    /* 契约测试/诊断：DIVERSION_NFT_STATS=1 时退出前打印 nft 写入计数（默认不打印）。 */
+    if (e->nft && getenv("DIVERSION_NFT_STATS")) {
+        md_nft_stats st; md_nft_get_stats(&st);
+        fprintf(stderr, "nftset stats: applies=%llu skipped=%llu transactions=%llu\n",
+                (unsigned long long)st.applies, (unsigned long long)st.skipped, (unsigned long long)st.transactions);
+    }
     md_domain_free(e->cn); md_cache_free(e->cache); md_nft_free(e->nft);
     free(e->upstreams[0].items); free(e->upstreams[1].items); free(e->listeners);
     pthread_mutex_destroy(&e->lock); free(e);

@@ -312,13 +312,13 @@ def main():
         run("qemu-pcre2-differential", [sys.executable, source / "c/tests/regex_differential.py", "--pcre2", reference / "tests/domain_driver",
              "--posix-lite", wrappers / "domain_driver", "--output", out / "regex-differential.json"])
         require("43200 matches passed" in (logs / "qemu-cache_domain_test.log").read_text(), "concurrency corpus missing")
-        require('"assertions":157' in (logs / "qemu-nft_netlink_test.log").read_text(), "netlink corpus missing")
+        require('"assertions":170' in (logs / "qemu-nft_netlink_test.log").read_text(), "netlink corpus missing")
         nft = json.loads((out / "nft-cli/result.json").read_text())
         require(nft["ok"] and len(nft["checks"]) == nft_count and all(item["passed"] for item in nft["checks"]), "nft CLI corpus changed or failed")
         require("Ran 12 tests" in (logs / "qemu-final-apk-integration.log").read_text(), "final APK integration corpus missing")
         differential = json.loads((out / "regex-differential.json").read_text())
         require(differential["portable_comparisons"] == 81089 and differential["unexpected_differences"] == 0, "differential corpus changed or failed")
-        state["tests"] = {"final_apk_loopback_integration": 12, "netlink_mock_assertions": 157, "nft_cli_checks": nft_count,
+        state["tests"] = {"final_apk_loopback_integration": 12, "netlink_mock_assertions": 170, "nft_cli_checks": nft_count,
                           "regex_concurrent_matches": 43200, "portable_regex_comparisons": 81089,
                           "unexpected_regex_differences": 0, "known_budget_differences": 2,
                           "reference": "native PCRE2 10.48 no-Unicode/no-JIT built from same commit; not target performance"}

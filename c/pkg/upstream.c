@@ -484,6 +484,7 @@ static int begin_connection(exchange *x, const md_upstream *u, bool tcp, bool al
     return 0;
 }
 static int begin(exchange *x, const md_upstream *u, bool tcp, char *err) {
+    if (md_trace_cur) { md_trace_cur->up_attempts++; if (tcp) md_trace_cur->flags |= MD_TF_UP_TCP; }
     return begin_connection(x, u, tcp, true, err);
 }
 /* 仅在恰好收完匹配响应、无污染/挂断事件且没有剩余数据时保留连接。
@@ -516,6 +517,7 @@ static int resend_udp(exchange *x, const md_packet *q, char *err) {
     }
     if ((size_t)n != q->len) { fail(err, "short upstream UDP resend"); stop(x); return -1; }
     x->udp_retry = milliseconds() + 1000;
+    if (md_trace_cur) md_trace_cur->up_resends++;
     return 0;
 }
 /* 1 is a matching complete response; 0 means pending; -1 means failed. */
@@ -574,6 +576,7 @@ static int advance(exchange *x, short events, const md_packet *q, const md_quest
         /* 只有匹配当前问题的 TC 响应触发 TCP 回退，沿用目标和 socket 路由约束。 */
         if (md_read16(x->packet.data + 2) & 0x0200u) {
             const md_upstream *u = x->upstream;
+            md_trace_flag(MD_TF_UP_TC_FALLBACK | MD_TF_UP_TCP);
             if (begin(x, u, true, err)) return -1;
             return 0;
         }
