@@ -117,7 +117,7 @@ SOCKS 或 bootstrap。
 PCRE2 固定 10.48，8-bit 静态库、禁用 Unicode/JIT/16-bit/32-bit。无系统库 fallback。
 默认依赖目录 `.build/pcre2-8-no-unicode-no-jit`，应用目录
 `.build/c-native-no-unicode-no-jit`，避免复用旧 Unicode 构建。
-libyaml 不再编译或链接进程序/库；`vendor/libyaml/` 的历史源码与 MIT 许可证保留。
+程序/库不编译或链接 libyaml；源树已移除 `vendor/libyaml/`。
 Python 的 PyYAML 仅用于可选的 [离线迁移工具](../scripts/migrate-site-config.py)。
 
 regexp 按字节匹配，`\d`/`\w` 保持 ASCII 类语义，存在匹配/回溯深度上限；与 Go RE2

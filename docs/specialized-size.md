@@ -30,7 +30,7 @@ size profile 额外设置 `-ffunction-sections -fdata-sections`，链接使用
 
 - 标准基线中 `nm --defined-only` 发现 127 个 `yaml_` 符号；专用版为 0
 - size profile 基线为 53 个 `yaml_` 符号；专用版为 0
-- 两版均保留 PCRE2 符号；当前原生/静态构建清单不再包含 libyaml 源码
+- 两版均保留 PCRE2 符号；源树已移除 libyaml，当前原生/静态构建也不链接它
 - 本次是整体固定流程与配置简化后的差值，不能把所有减少字节都归因给 libyaml
 
 ## 原始证据与复现

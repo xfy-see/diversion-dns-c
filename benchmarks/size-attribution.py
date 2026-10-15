@@ -10,8 +10,8 @@ import re
 import struct
 
 
-# Keep historical libyaml attribution readable; current specialized builds must
-# contribute zero bytes to this category and do not compile these members.
+# Keep historical libyaml attribution readable for old maps; current specialized
+# builds must contribute zero bytes here (libyaml is no longer in the source tree).
 YAML_MEMBERS = {f"{name}.c.o" for name in
                 ("api", "dumper", "emitter", "loader", "parser", "reader", "scanner", "writer")}
 PROJECT_MEMBERS = {f"{name}.c.o" for name in

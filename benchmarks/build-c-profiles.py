@@ -371,7 +371,7 @@ def main():
         size_result["versions"] = {"zig": manifest["build"]["compiler"]["version"],
                                    "pcre2": "10.48",
                                    "musl": "bundled with the pinned Zig distribution; upstream version not recorded"}
-        size_result["historical_source_only"] = {"libyaml": "0.2.5; retained source/license, not built or linked"}
+        size_result["historical_source_only"] = {"libyaml": "removed from source tree; category kept only for replaying old maps"}
         size_result["explicit_link_inputs"] = {
             "main.c.o": record(objects["main.c"]), "pkg/server.c.o": record(objects["pkg/server.c"]),
             "libmosdns-c.a": record(lib), "libpcre2-8.a": record(pcre_lib)}

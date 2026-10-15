@@ -32,6 +32,6 @@ make -C c -j4 test BUILD=../.build/c-asan SANITIZE=1
 - `.build/c-validation/manifest.json`
 - `.build/c-linux-check/manifest.json`：逐个记录工具版本/摘要、目标、命令、源文件/对象摘要和退出码，全部源文件已与当前输入重新核对。
 
-Native debug 可执行文件为 673,240 字节，静态链接 PCRE2/libyaml，动态依赖只有 macOS libSystem。这个数值未去除调试信息，不与其他语言或架构的 release 产物比较。
+Native debug 可执行文件为 673,240 字节（历史测量，当时仍静态链接 PCRE2/libyaml），动态依赖只有 macOS libSystem。这个数值未去除调试信息，不与其他语言或架构的 release 产物比较；当前构建已不再链接 libyaml。
 
 Linux 记录仅证明对象编译，没有目标 PCRE2 库的完整链接或 Linux 实际运行。实际 nftset 内核写入、元素 timeout、SO_MARK/SO_BINDTODEVICE 出口、路由器运行、性能和长期稳定性未在本轮验证。初版的语法/平台/传输兼容边界见 [README](README.md)。

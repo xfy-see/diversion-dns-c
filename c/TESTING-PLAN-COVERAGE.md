@@ -37,7 +37,7 @@ python3 c/tests/plan_integration.py .build/c-native/mosdns-c
 
 ## 目标设备的第一层入口
 
-`plan_regression_test.c` 不依赖 Python、互联网或生产配置，只需对应目标的 C/PCRE2/libyaml 构建产物与 loopback socket；可在 131 的独立临时目录直接运行测试二进制。超时用例约需 5 秒，竞速用例使用临时 UDP/TCP 端口，不创建 nft 表/集合、不设置 mark、不改变 resolver 或接口。`plan_integration.py` 需要 Python 3 和已链接的 C 主程序，亦只使用临时端口与临时配置。
+`plan_regression_test.c` 不依赖 Python、互联网或生产配置，只需对应目标的 C/PCRE2 构建产物与 loopback socket；可在 131 的独立临时目录直接运行测试二进制。超时用例约需 5 秒，竞速用例使用临时 UDP/TCP 端口，不创建 nft 表/集合、不设置 mark、不改变 resolver 或接口。`plan_integration.py` 需要 Python 3 和已链接的 C 主程序，亦只使用临时端口与临时配置。
 
 目标设备测试须记录架构、固件/内核、boot ID、构建参数和产物 SHA256，不能用本机通过或 Linux 编译结果替代目标运行结果。nftset、SO_MARK、SO_BINDTODEVICE 的实际行为应由隔离 Linux 内核用例及真实分流记录单独覆盖。
 
