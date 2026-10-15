@@ -13,11 +13,19 @@
 #include <string.h>
 #include <fcntl.h>
 #include <time.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define CONFIG_LINE_MAX 4096
 #define CONFIG_FILE_MAX (1024 * 1024)
 #define CONFIG_LIST_MAX 64
+#define WARM_FILE_MAX (4 * 1024 * 1024)
+#define WARM_ROWS_MAX 20000
+/* Bound background work across distinct keys as well as in-flight jobs.
+ * Foreground misses are unaffected. Failed allocation/start attempts also
+ * consume a token so resource exhaustion cannot bypass the rate bound. */
+#define REFRESH_BURST 8u
+#define REFRESH_TOKEN_NS UINT64_C(15625000) /* 64 starts/second */
 
 typedef enum {
     LISTEN_UDP, LISTEN_TCP, CN_FILE, CN_UPSTREAM, FOREIGN_UPSTREAM,
@@ -58,10 +66,12 @@ struct md_engine {
     upstream_group upstreams[2]; /* 0 CN, 1 foreign */
     md_listener *listeners; size_t listener_count;
     md_server_limits limits;
-    bool check, stopping;
+    bool check, stopping, runtime_started;
     pthread_mutex_t lock;
     pthread_cond_t wake; bool wake_ok;
     refresh_job *jobs;
+    uint64_t refresh_refill_ns;
+    unsigned refresh_tokens;
     stale_override overrides[STALE_OVERRIDE_MAX]; size_t override_count;
     uint32_t prefetch_max, warm_max, warm_qps, warm_save, stats_interval;
     char *warm_file;
@@ -418,10 +428,20 @@ static void *refresh_thread(void *opaque) {
     md_trace tr; memset(&tr, 0, sizeof(tr));
     if (md_trace_enabled) { tr.flags = MD_TF_REFRESH_JOB; tr.t[MD_T_ENGINE0] = md_now_ns(); md_trace_cur = &tr; }
     int rc = -1;
-    bool ok = false;
+    bool accepted = false, ok = false;
     if (response) {
         rc = resolve_ex(job->engine, job->cn, &job->query, &job->qv, response, md_now() + 5, true, err);
-        ok = response->len >= 12 && (md_read16(response->data + 2) & 15) != 2;
+        md_dns_view *view = md_dns_view_scratch();
+        if (response->len >= 12 && view && view->valid && view->len == response->len) {
+            unsigned rcode = md_dns_view_rcode(response, view);
+            accepted = (rcode == 0 || rcode == 3) && !view->signed_ &&
+                !(md_read16(response->data + 2) & 0x0200) &&
+                md_dns_view_matches(&job->query, &job->qv.q, response, view);
+        }
+        /* A valid uncacheable replacement (e.g. TTL=0) still revokes old data.
+         * Finalization failures are not successful refreshes, even when the
+         * existing policy stores the new DNS answer for a later nft retry. */
+        ok = !rc && accepted;
         free(response);
     }
     if (md_trace_enabled) {
@@ -429,8 +449,9 @@ static void *refresh_thread(void *opaque) {
         if (rc) tr.flags |= MD_TF_ERROR;
         md_trace_emit(&tr, &job->query);
     }
-    md_cache_refresh_end_q(job->engine->cache, &job->query, &job->qv);
-    /* 计数在释放去重占位之后：观察到计数即可再次发起同 key 刷新。 */
+    md_cache_refresh_finish(job->engine->cache, &job->query, &job->qv, md_now(), accepted);
+    /* Count completed jobs after releasing the in-flight marker. Failed keys
+     * retain a retry deadline, so completion does not imply immediate retry. */
     md_cache_count(job->engine->cache, job->cn ? MD_CACHE_CN : MD_CACHE_FOREIGN, ok ? MD_CS_REFRESH_OK : MD_CS_REFRESH_FAIL);
     pthread_mutex_lock(&job->engine->lock); job->done = true; pthread_mutex_unlock(&job->engine->lock);
     return NULL;
@@ -445,15 +466,41 @@ static void refresh_start(md_engine *e, bool cn, const md_packet *query, const m
         if (job->done) { *link = job->next; pthread_join(job->thread, NULL); free(job); }
         else { active++; prefetching += job->prefetch; link = &job->next; }
     }
-    if (e->stopping || active >= 64 || (prefetch && prefetching >= e->prefetch_max) ||
-        !md_cache_refresh_begin_q(e->cache, query, qv)) {
+    uint64_t now_ns = md_now_ns();
+    if (!e->refresh_refill_ns) {
+        e->refresh_refill_ns = now_ns;
+        e->refresh_tokens = REFRESH_BURST;
+    } else if (now_ns >= e->refresh_refill_ns) {
+        uint64_t elapsed = now_ns - e->refresh_refill_ns;
+        uint64_t add = elapsed / REFRESH_TOKEN_NS;
+        if (add) {
+            e->refresh_tokens = add >= REFRESH_BURST - e->refresh_tokens ?
+                REFRESH_BURST : e->refresh_tokens + (unsigned)add;
+            e->refresh_refill_ns = now_ns - elapsed % REFRESH_TOKEN_NS;
+        }
+    }
+    if (e->stopping || active >= 64 || !e->refresh_tokens || (prefetch && prefetching >= e->prefetch_max) ||
+        !md_cache_refresh_begin_at(e->cache, query, qv, md_now())) {
+        if (prefetch) md_cache_prefetch_cancel(e->cache, query, qv);
         pthread_mutex_unlock(&e->lock); return;
     }
+    --e->refresh_tokens;
     refresh_job *job = calloc(1, sizeof(*job));
-    if (!job) { md_cache_refresh_end_q(e->cache, query, qv); pthread_mutex_unlock(&e->lock); return; }
+    if (!job) {
+        md_cache_refresh_finish(e->cache, query, qv, md_now(), false);
+        md_cache_count(e->cache, cn ? MD_CACHE_CN : MD_CACHE_FOREIGN, MD_CS_REFRESH_FAIL);
+        pthread_mutex_unlock(&e->lock); return;
+    }
     job->engine = e; job->query = *query; job->qv = *qv; job->cn = cn; job->prefetch = prefetch; job->next = e->jobs;
-    if (md_thread_create(&job->thread, refresh_thread, job)) { md_cache_refresh_end_q(e->cache, query, qv); free(job); }
-    else { e->jobs = job; md_trace_flag(MD_TF_REFRESH_START); }
+    if (md_thread_create(&job->thread, refresh_thread, job)) {
+        md_cache_refresh_finish(e->cache, query, qv, md_now(), false);
+        md_cache_count(e->cache, cn ? MD_CACHE_CN : MD_CACHE_FOREIGN, MD_CS_REFRESH_FAIL);
+        free(job);
+    }
+    else {
+        e->jobs = job; md_trace_flag(MD_TF_REFRESH_START);
+        if (prefetch) md_cache_count(e->cache, cn ? MD_CACHE_CN : MD_CACHE_FOREIGN, MD_CS_PREFETCH);
+    }
     pthread_mutex_unlock(&e->lock);
 }
 /* ---- restart warm-up (names only, never addresses) ---- */
@@ -467,23 +514,41 @@ static void print_cache_stats(md_engine *e) {
         fprintf(stderr, "%s\n", line);
     }
 }
-/* 原子写：同目录临时文件 + fsync + rename；失败只告警，不影响服务。 */
+/* Atomic replacement; never open an existing temporary path for writing. */
 static int warm_save(md_engine *e) {
     if (!e->warm_file || !e->cache) return 0;
+    struct stat st;
+    if (!lstat(e->warm_file, &st)) {
+        if (!S_ISREG(st.st_mode)) {
+            fprintf(stderr, "cache warm: refusing non-regular save path %s\n", e->warm_file); return -1;
+        }
+    } else if (errno != ENOENT) {
+        fprintf(stderr, "cache warm: cannot inspect %s: %s\n", e->warm_file, strerror(errno)); return -1;
+    }
     size_t size = (size_t)e->warm_max * 272 + 64; char *buf = malloc(size);
     if (!buf) return -1;
     int head = snprintf(buf, size, "# diversion-dns cache warm v1 (names only)\n");
     size_t lines = md_cache_hot_names(e->cache, buf + head, size - (size_t)head, e->warm_max); (void)lines;
     size_t len = strlen(buf);
-    char tmp[1100]; snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", e->warm_file, (long)getpid());
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600), rc = -1;
+    char tmp[1100]; snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", e->warm_file);
+    int fd = mkstemp(tmp), rc = -1;
     if (fd >= 0) {
-        size_t off = 0;
-        while (off < len) { ssize_t n = write(fd, buf + off, len - off); if (n <= 0) { if (n < 0 && errno == EINTR) continue; break; } off += (size_t)n; }
-        if (off == len && !fsync(fd)) rc = 0;
-        if (close(fd)) rc = -1;
-        if (!rc && rename(tmp, e->warm_file)) rc = -1;
-        if (rc) unlink(tmp);
+        int flags = fcntl(fd, F_GETFD);
+        if (flags >= 0 && !fcntl(fd, F_SETFD, flags | FD_CLOEXEC) && !fchmod(fd, 0600)) {
+            size_t off = 0;
+            while (off < len) {
+                ssize_t n = write(fd, buf + off, len - off);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) { if (!n) errno = EIO; break; }
+                off += (size_t)n;
+            }
+            if (off == len && !fsync(fd)) rc = 0;
+        }
+        int saved = errno;
+        if (close(fd) && !rc) { saved = errno; rc = -1; }
+        if (!rc && rename(tmp, e->warm_file)) { saved = errno; rc = -1; }
+        /* Only this successful mkstemp created tmp; failures elsewhere own no path. */
+        if (rc) { (void)unlink(tmp); errno = saved; }
     }
     if (rc) fprintf(stderr, "cache warm: cannot save %s: %s\n", e->warm_file, strerror(errno));
     free(buf); return rc;
@@ -524,23 +589,59 @@ static bool maintenance_wait(md_engine *e, uint64_t ms) {
     while (!e->stopping && pthread_cond_timedwait(&e->wake, &e->lock, &ts) != ETIMEDOUT) {}
     bool stop = e->stopping; pthread_mutex_unlock(&e->lock); return stop;
 }
-/* 启动预热：顺序、限速（cache_warm_qps）、单线程，经正常 resolve 路径，
- * 所以 CN 答案照常经 nft finalize 学习集合；已在缓存中的名称跳过。 */
+static bool warm_stopping(md_engine *e) {
+    pthread_mutex_lock(&e->lock); bool stop = e->stopping; pthread_mutex_unlock(&e->lock); return stop;
+}
+/* Returns true only when shutdown interrupts pacing. */
+static bool warm_line(md_engine *e, const char *line, md_packet *q, md_packet *r,
+                      md_packet *probe, uint32_t *done, uint64_t pace) {
+    if (line[0] == '#' || warm_query(line, q)) return false;
+    md_dns_query qv; char err[MD_ERROR_SIZE];
+    if (md_dns_query_parse(q, &qv, err)) return false;
+    bool cn = route_cn(e, &qv);
+    if (md_cache_get_ex(e->cache, q, &qv, probe, NULL, md_now(), cn ? 0 : 1, 0, NULL) == 1) return false;
+    if (maintenance_wait(e, pace)) return true;
+    r->len = 0; ++*done;
+    (void)resolve_ex(e, cn, q, &qv, r, md_now() + 5, true, err);
+    md_cache_count(e->cache, cn ? MD_CACHE_CN : MD_CACHE_FOREIGN, MD_CS_WARM);
+    return false;
+}
+/* Sequential, paced startup queries use normal resolution (CN goes through nft).
+ * Nonblocking open rejects FIFOs without waiting; no symlink or device is read.
+ * Byte/row bounds also cover comments and invalid lines, including growing files. */
 static void warm_load(md_engine *e) {
-    FILE *f = fopen(e->warm_file, "rb");
-    if (!f) return;
+    int fd = open(e->warm_file, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return;
+    struct stat st;
+    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size < 0 || st.st_size > WARM_FILE_MAX) {
+        close(fd); fprintf(stderr, "cache warm: refusing non-regular or oversized file %s\n", e->warm_file); return;
+    }
+    FILE *f = fdopen(fd, "rb");
+    if (!f) { close(fd); return; }
     md_packet *q = malloc(sizeof(*q)), *r = malloc(sizeof(*r)), *probe = malloc(sizeof(*probe));
-    char line[400]; uint32_t done = 0; uint64_t pace = 1000 / e->warm_qps;
-    while (q && r && probe && done < e->warm_max && fgets(line, sizeof(line), f)) {
-        if (line[0] == '#' || warm_query(line, q)) continue;
-        md_dns_query qv; char err[MD_ERROR_SIZE];
-        if (md_dns_query_parse(q, &qv, err)) continue;
-        bool cn = route_cn(e, &qv);
-        if (md_cache_get_ex(e->cache, q, &qv, probe, NULL, md_now(), cn ? 0 : 1, 0, NULL) == 1) continue;
-        if (maintenance_wait(e, pace)) break;
-        r->len = 0; ++done;
-        (void)resolve_ex(e, cn, q, &qv, r, md_now() + 5, true, err);
-        md_cache_count(e->cache, cn ? MD_CACHE_CN : MD_CACHE_FOREIGN, MD_CS_WARM);
+    char line[400], chunk[4096]; size_t used = 0, bytes = 0;
+    uint32_t done = 0, rows = 0; uint64_t pace = 1000 / e->warm_qps;
+    bool invalid = false, stop = false;
+    while (q && r && probe && done < e->warm_max && rows < WARM_ROWS_MAX && bytes < WARM_FILE_MAX) {
+        if (warm_stopping(e)) { stop = true; break; }
+        size_t want = WARM_FILE_MAX - bytes;
+        if (want > sizeof(chunk)) want = sizeof(chunk);
+        size_t n = fread(chunk, 1, want, f); bytes += n;
+        for (size_t i = 0; i < n && done < e->warm_max && rows < WARM_ROWS_MAX; ++i) {
+            if (chunk[i] == '\n') {
+                ++rows; line[used] = 0;
+                if (!invalid && warm_line(e, line, q, r, probe, &done, pace)) { stop = true; break; }
+                used = 0; invalid = false;
+            } else if (!chunk[i] || used == sizeof(line) - 1) invalid = true;
+            else if (!invalid) line[used++] = chunk[i];
+        }
+        if (stop || n < want) break;
+    }
+    /* An overlong/NUL-containing row is discarded through its newline, so its
+     * suffix can never become a separate query. A final short row is accepted. */
+    if (q && r && probe && !stop && !warm_stopping(e) && done < e->warm_max &&
+        rows < WARM_ROWS_MAX && feof(f) && used && !invalid) {
+        line[used] = 0; (void)warm_line(e, line, q, r, probe, &done, pace);
     }
     free(q); free(r); free(probe); fclose(f);
     fprintf(stderr, "cache warm: prewarmed %u names from %s\n", (unsigned)done, e->warm_file);
@@ -573,11 +674,22 @@ md_engine *md_engine_load(const char *path, bool check, char *err) {
         const char *env = getenv("DIVERSION_CACHE_STATS");
         unsigned long n = env ? strtoul(env, NULL, 10) : 0;
         e->stats_interval = n >= 5 && n <= 86400 ? (uint32_t)n : 0;
-        if ((e->warm_file || e->stats_interval) && !md_thread_create(&e->maintenance, maintenance_thread, e))
-            e->maintenance_running = true;
     }
     if (rc) { md_engine_free(e); return NULL; }
     return e;
+}
+/* The server calls this only after every listener and worker is ready. A bad
+ * config or failed bind therefore neither prewarms nor replaces an old file. */
+int md_engine_start(md_engine *e, char *err) {
+    if (!e || e->check || !e->wake_ok || e->stopping) return fail(err, "engine is not ready to start");
+    if (e->runtime_started) return 0;
+    if (e->cache && (e->warm_file || e->stats_interval)) {
+        int rc = md_thread_create(&e->maintenance, maintenance_thread, e);
+        if (rc) return fail(err, "cache maintenance thread: %s", strerror(rc));
+        e->maintenance_running = true;
+    }
+    e->runtime_started = true;
+    return 0;
 }
 size_t md_engine_listener_count(const md_engine *e) { return e ? e->listener_count : 0; }
 const md_listener *md_engine_listener(const md_engine *e, size_t i) { return e && i < e->listener_count ? &e->listeners[i] : NULL; }
@@ -662,7 +774,7 @@ void md_engine_free(md_engine *e) {
     pthread_mutex_lock(&e->lock); refresh_job *jobs = e->jobs; e->jobs = NULL; pthread_mutex_unlock(&e->lock);
     while (jobs) { refresh_job *next = jobs->next; pthread_join(jobs->thread, NULL); free(jobs); jobs = next; }
     /* 退出时保存热点名称（仅名称）；DIVERSION_CACHE_STATS 打印命中/未命中原因计数。 */
-    if (e->cache && !e->check) {
+    if (e->cache && !e->check && e->runtime_started) {
         if (e->warm_file) (void)warm_save(e);
         if (getenv("DIVERSION_CACHE_STATS")) print_cache_stats(e);
     }

@@ -172,9 +172,13 @@ static void stale_and_refresh_tests(void) {
     /* (b) background refresh SERVFAIL keeps the old positive answer until the hard deadline */
     query(&q, "keep.test", 0x0100, 1); positive(&q, &r, 10); assert(put_g(c, &q, &r, 100, 1, -1, false));
     md_packet fail; assert(!md_dns_error(&q, &fail, 2));
-    assert(!put_g(c, &q, &fail, 105, 1, -1, true)); assert(stat_of(c, 1, MD_CS_REFRESH_KEPT) == 1);
+    assert(md_cache_refresh_begin_at(c, &q, NULL, 105));
+    assert(!put_g(c, &q, &fail, 105, 1, -1, true));
+    md_cache_refresh_finish(c, &q, NULL, 105, false); assert(stat_of(c, 1, MD_CS_REFRESH_KEPT) == 1);
     assert(get_g(c, &q, &hit, 106, 1, 0, NULL) == 1 && !(md_read16(hit.data + 2) & 15) && md_read16(hit.data + 6) == 1);
-    assert(!put_g(c, &q, &fail, 112, 1, -1, true)); assert(stat_of(c, 1, MD_CS_REFRESH_KEPT) == 2);
+    assert(md_cache_refresh_begin_at(c, &q, NULL, 112));
+    assert(!put_g(c, &q, &fail, 112, 1, -1, true));
+    md_cache_refresh_finish(c, &q, NULL, 112, false); assert(stat_of(c, 1, MD_CS_REFRESH_KEPT) == 2);
     assert(get_g(c, &q, &hit, 112, 1, 0, NULL) == 2 && !(md_read16(hit.data + 2) & 15));
     /* legitimate NXDOMAIN replaces */
     md_packet nx; assert(!md_dns_error(&q, &nx, 3)); assert(put_g(c, &q, &nx, 113, 1, -1, true));
@@ -199,6 +203,133 @@ static void stale_and_refresh_tests(void) {
     query(&q, "answer.test", 0x0100, 1); positive(&q, &r, 10); assert(put_g(c, &q, &r, 100, 1, -1, false));
     assert(get_g(c, &q, &hit, 111, 1, 0, NULL) == 2); assert_ttl(&hit, 7); md_cache_free(c);
     o = (md_cache_options){0}; assert(!(o.foreign_reserve_percent = 91, md_cache_new_ex(4, &o)));
+}
+static void positive_family(md_packet *q, md_packet *r, uint32_t ttl, bool ipv6) {
+    if (!ipv6) { positive(q, r, ttl); return; }
+    md_write16(q->data + q->len - 4, 28);
+    assert(!md_dns_error(q, r, 0));
+    uint8_t rr[] = {0xc0,12,0,28,0,1,0,0,0,0,0,16,0x20,1,0xd,0xb8,0,0,0,0,0,0,0,0,0,0,0,1};
+    md_write32(rr + 6, ttl); memcpy(r->data + r->len, rr, sizeof(rr)); r->len += sizeof(rr);
+    md_write16(r->data + 6, 1);
+}
+/* A newer valid answer revokes old data even when the answer cannot be cached.
+ * Check A/AAAA, fresh/stale old answers and both foreground/background writes. */
+static void replacement_revocation_tests(void) {
+    md_packet q, r, hit;
+    for (unsigned family = 0; family < 2; ++family) for (unsigned stale = 0; stale < 2; ++stale)
+        for (unsigned background = 0; background < 2; ++background) for (unsigned kind = 0; kind < 4; ++kind) {
+            md_cache_options o = {0}; o.stale_ttl[1] = 60; o.max_bytes = 200;
+            md_cache *c = md_cache_new_ex(4, &o); assert(c);
+            query(&q, "revoke.test", 0x0100, 1); positive_family(&q, &r, 10, family != 0);
+            assert(put_g(c, &q, &r, 100, 1, -1, false));
+            uint64_t now = stale ? 110 : 105;
+            assert(get_g(c, &q, &hit, now, 1, 0, NULL) == (stale ? 2 : 1));
+            if (kind == 0) positive_family(&q, &r, 0, family != 0);
+            else if (kind == 1) assert(!md_dns_error(&q, &r, 0)); /* no SOA, no cache TTL */
+            else {
+                assert(!md_dns_error(&q, &r, kind == 3 ? 3 : 0));
+                for (unsigned j = 0; j < 12; ++j) add_a(&r, 60, kind == 3 ? 1 : 0);
+            }
+            assert(!put_g(c, &q, &r, now, 1, -1, background != 0));
+            assert(!get_g(c, &q, &hit, now, 1, 0, NULL));
+            md_cache_stats s; md_cache_get_stats(c, &s); assert(!s.entries[1] && !s.bytes[1]);
+            md_cache_free(c);
+        }
+    /* Invalid/incomplete/mismatched responses and transient errors cannot revoke. */
+    md_cache_options o = {0}; o.stale_ttl[1] = 60;
+    md_cache *c = md_cache_new_ex(4, &o); assert(c);
+    query(&q, "protect.test", 0x0100, 1); positive(&q, &r, 10); assert(put_g(c, &q, &r, 100, 1, -1, false));
+    for (unsigned kind = 0; kind < 6; ++kind) {
+        positive(&q, &r, 0);
+        if (kind == 0) md_write16(r.data, 0x4321); /* unrelated transaction */
+        if (kind == 1) r.data[13] = 'z'; /* unrelated question */
+        if (kind == 2) md_write16(r.data + 2, (uint16_t)(md_read16(r.data + 2) | 0x0200));
+        if (kind == 3) { add_opt(&r, false, false); r.data[r.len - 6] = 1; } /* extended RCODE */
+        if (kind == 4) assert(!md_dns_error(&q, &r, 5)); /* REFUSED */
+        if (kind == 5) assert(!md_dns_error(&q, &r, 2)); /* SERVFAIL */
+        assert(!put_g(c, &q, &r, 110, 1, -1, true));
+        assert(get_g(c, &q, &hit, 110, 1, 0, NULL) == 2 && hit.data[hit.len - 1] == 1);
+    }
+    positive(&q, &r, 0); --r.len; md_cache_put(c, &q, &r, 110); /* malformed RDATA */
+    assert(get_g(c, &q, &hit, 110, 1, 0, NULL) == 2);
+    md_cache_free(c);
+}
+static void refresh_backoff_tests(void) {
+    md_packet q, other, r, hit; md_cache_options o = {0}; o.stale_ttl[1] = 300;
+    md_cache *c = md_cache_new_ex(4, &o); assert(c);
+    query(&q, "backoff.test", 0x0100, 1); positive(&q, &r, 10); assert(put_g(c, &q, &r, 100, 1, -1, false));
+    query(&other, "other.test", 0x0100, 1); positive(&other, &r, 10); assert(put_g(c, &other, &r, 100, 1, -1, false));
+    const unsigned delays[] = {5, 10, 20, 30, 30}; uint64_t now = 110;
+    for (size_t i = 0; i < sizeof(delays) / sizeof(delays[0]); ++i) {
+        assert(md_cache_refresh_begin_at(c, &q, NULL, now));
+        assert(!md_cache_refresh_begin_at(c, &q, NULL, now));
+        md_cache_refresh_finish(c, &q, NULL, now, false);
+        md_cache_refresh_finish(c, &q, NULL, now, false); /* duplicate completion is harmless */
+        assert(stat_of(c, 1, MD_CS_REFRESH_KEPT) == i + 1);
+        assert(!md_cache_refresh_begin_at(c, &q, NULL, now + delays[i] - 1));
+        assert(get_g(c, &q, &hit, now + delays[i] - 1, 1, 0, NULL) == 2);
+        assert(md_cache_refresh_begin_at(c, &other, NULL, now)); md_cache_refresh_end_q(c, &other, NULL);
+        now += delays[i];
+    }
+    /* Successful refresh resets the exponent; cancelled work neither delays nor counts. */
+    assert(md_cache_refresh_begin_at(c, &q, NULL, now)); md_cache_refresh_finish(c, &q, NULL, now, true);
+    assert(md_cache_refresh_begin_at(c, &q, NULL, now)); md_cache_refresh_end_q(c, &q, NULL);
+    assert(md_cache_refresh_begin_at(c, &q, NULL, now)); md_cache_refresh_finish(c, &q, NULL, now, false);
+    assert(!md_cache_refresh_begin_at(c, &q, NULL, now + 4));
+    assert(md_cache_refresh_begin_at(c, &q, NULL, now + 5));
+    /* A failed older refresh cannot back off a new foreground answer. */
+    positive(&q, &r, 20); r.data[r.len - 1] = 77; assert(put_g(c, &q, &r, now + 5, 1, -1, false));
+    uint64_t kept = stat_of(c, 1, MD_CS_REFRESH_KEPT);
+    md_cache_refresh_finish(c, &q, NULL, now + 5, false);
+    assert(stat_of(c, 1, MD_CS_REFRESH_KEPT) == kept);
+    assert(md_cache_refresh_begin_at(c, &q, NULL, now + 5)); md_cache_refresh_end_q(c, &q, NULL);
+    assert(get_g(c, &q, &hit, now + 5, 1, 0, NULL) == 1 && hit.data[hit.len - 1] == 77);
+    md_cache_free(c);
+
+    /* Neither failures nor retry deadlines extend the positive answer's hard deadline. */
+    o.stale_ttl[1] = 60; c = md_cache_new_ex(4, &o); assert(c);
+    positive(&q, &r, 10); assert(put_g(c, &q, &r, 100, 1, -1, false));
+    assert(md_cache_refresh_begin_at(c, &q, NULL, 169)); md_cache_refresh_finish(c, &q, NULL, 169, false);
+    assert(!md_cache_refresh_begin_at(c, &q, NULL, 169));
+    assert(get_g(c, &q, &hit, 169, 1, 0, NULL) == 2);
+    assert(!get_g(c, &q, &hit, 170, 1, 0, NULL));
+    assert(md_cache_refresh_begin_at(c, &q, NULL, 170)); md_cache_refresh_finish(c, &q, NULL, 170, false);
+    assert(stat_of(c, 1, MD_CS_REFRESH_KEPT) == 1);
+    md_cache_free(c);
+}
+static void logical_hit_tests(void) {
+    md_packet q, r, hit; bool due; md_cache_options o = {0}; o.prefetch_percent = 10;
+    md_cache *c = md_cache_new_ex(4, &o); assert(c);
+    query(&q, "probe.test", 0x0100, 1); positive(&q, &r, 100); assert(put_g(c, &q, &r, 100, 0, -1, false));
+    for (unsigned i = 0; i < 3; ++i) assert(get_g(c, &q, &hit, 195, 0, 0, &due) == 1 && !due);
+    char names[128]; assert(!md_cache_hot_names(c, names, sizeof(names), 10));
+    assert(get_g(c, &q, &hit, 195, 0, MD_CACHE_COUNT | MD_CACHE_CLAIM, &due) == 1 && !due);
+    for (unsigned i = 0; i < 3; ++i) assert(get_g(c, &q, &hit, 195, 0, 0, &due) == 1 && !due);
+    assert(stat_of(c, 0, MD_CS_FRESH) == 1);
+    assert(get_g(c, &q, &hit, 195, 0, MD_CACHE_COUNT | MD_CACHE_CLAIM, &due) == 1 && due);
+    assert(stat_of(c, 0, MD_CS_FRESH) == 2 && stat_of(c, 0, MD_CS_PREFETCH) == 0);
+    md_cache_free(c);
+
+    /* Rejected admission can retry; a duplicate cannot cancel an in-flight
+     * claim, and failure re-arms only after the retry deadline. */
+    o.prefetch_percent = 50; o.stale_ttl[0] = 60; c = md_cache_new_ex(4, &o); assert(c);
+    positive(&q, &r, 100); assert(put_g(c, &q, &r, 100, 0, -1, false));
+    assert(get_g(c, &q, &hit, 170, 0, MD_CACHE_COUNT | MD_CACHE_CLAIM, &due) == 1 && !due);
+    assert(get_g(c, &q, &hit, 170, 0, MD_CACHE_COUNT | MD_CACHE_CLAIM, &due) == 1 && due);
+    md_cache_prefetch_cancel(c, &q, NULL);
+    assert(get_g(c, &q, &hit, 170, 0, MD_CACHE_CLAIM, &due) == 1 && due);
+    assert(md_cache_refresh_begin_at(c, &q, NULL, 170));
+    md_cache_prefetch_cancel(c, &q, NULL);
+    assert(get_g(c, &q, &hit, 170, 0, MD_CACHE_CLAIM, &due) == 1 && !due);
+    md_cache_refresh_finish(c, &q, NULL, 170, false);
+    md_cache_prefetch_cancel(c, &q, NULL); /* cannot bypass the failure deadline */
+    assert(get_g(c, &q, &hit, 174, 0, MD_CACHE_CLAIM, &due) == 1 && !due);
+    assert(!md_cache_refresh_begin_at(c, &q, NULL, 174));
+    assert(get_g(c, &q, &hit, 175, 0, MD_CACHE_CLAIM, &due) == 1 && due);
+    assert(md_cache_refresh_begin_at(c, &q, NULL, 175));
+    md_cache_refresh_end_q(c, &q, NULL);
+    assert(stat_of(c, 0, MD_CS_PREFETCH) == 0 && stat_of(c, 0, MD_CS_REFRESH_KEPT) == 1);
+    md_cache_free(c);
 }
 static void counter_capacity_tests(void) {
     md_packet q, r, hit, m1, m2, m3, m4;
@@ -259,22 +390,23 @@ static void prefetch_and_warm_tests(void) {
     md_packet q, r, hit; bool due; md_cache_options o = {0}; o.prefetch_percent = 10;
     md_cache *c = md_cache_new_ex(16, &o); assert(c);
     query(&q, "pf.test", 0x0100, 1); positive(&q, &r, 100); assert(put_g(c, &q, &r, 1000, 1, -1, false));
-    assert(get_g(c, &q, &hit, 1001, 1, MD_CACHE_CLAIM, &due) == 1 && !due);   /* first use: not reused yet */
-    assert(get_g(c, &q, &hit, 1050, 1, MD_CACHE_CLAIM, &due) == 1 && !due);   /* 50 s left > threshold (7..12) */
-    assert(get_g(c, &q, &hit, 1095, 1, MD_CACHE_CLAIM, &due) == 1 && due);    /* 5 s left: claim */
-    assert(get_g(c, &q, &hit, 1096, 1, MD_CACHE_CLAIM, &due) == 1 && !due);   /* deduped: once per answer */
-    assert(stat_of(c, 1, MD_CS_PREFETCH) == 1);
+    unsigned use = MD_CACHE_COUNT | MD_CACHE_CLAIM;
+    assert(get_g(c, &q, &hit, 1001, 1, use, &due) == 1 && !due);   /* first use: not reused yet */
+    assert(get_g(c, &q, &hit, 1050, 1, use, &due) == 1 && !due);   /* 50 s left > threshold (7..12) */
+    assert(get_g(c, &q, &hit, 1095, 1, use, &due) == 1 && due);    /* 5 s left: claim */
+    assert(get_g(c, &q, &hit, 1096, 1, use, &due) == 1 && !due);   /* deduped: once per answer */
+    assert(stat_of(c, 1, MD_CS_PREFETCH) == 0); /* engine counts only an actually started refresh */
     positive(&q, &r, 100); assert(put_g(c, &q, &r, 1096, 1, -1, true));       /* refreshed answer re-arms */
-    assert(get_g(c, &q, &hit, 1190, 1, MD_CACHE_CLAIM, &due) == 1 && !due);
-    assert(get_g(c, &q, &hit, 1191, 1, MD_CACHE_CLAIM, &due) == 1 && due);
+    assert(get_g(c, &q, &hit, 1190, 1, use, &due) == 1 && !due);
+    assert(get_g(c, &q, &hit, 1191, 1, use, &due) == 1 && due);
     /* jittered threshold stays within 0.75..1.25 of 10% */
     query(&q, "edge.test", 0x0100, 1); positive(&q, &r, 100); assert(put_g(c, &q, &r, 1000, 1, -1, false));
-    assert(get_g(c, &q, &hit, 1000, 1, 0, &due) == 1 && !due);
-    assert(get_g(c, &q, &hit, 1087, 1, 0, &due) == 1 && !due);                /* 13 s left */
+    assert(get_g(c, &q, &hit, 1000, 1, MD_CACHE_COUNT, &due) == 1 && !due);
+    assert(get_g(c, &q, &hit, 1087, 1, MD_CACHE_COUNT, &due) == 1 && !due);     /* 13 s left */
     assert(get_g(c, &q, &hit, 1093, 1, 0, &due) == 1 && due);                 /* 7 s left, peek only */
     assert(get_g(c, &q, &hit, 1093, 1, 0, &due) == 1 && due);
     query(&q, "once.test", 0x0100, 1); positive(&q, &r, 100); assert(put_g(c, &q, &r, 1000, 1, -1, false));
-    assert(get_g(c, &q, &hit, 1095, 1, MD_CACHE_CLAIM, &due) == 1 && !due);
+    assert(get_g(c, &q, &hit, 1095, 1, use, &due) == 1 && !due);
     query(&q, "tiny.test", 0x0100, 1); positive(&q, &r, 1); assert(put_g(c, &q, &r, 1000, 1, -1, false));
     assert(get_g(c, &q, &hit, 1000, 1, MD_CACHE_CLAIM, &due) == 1 && !due);
     assert(get_g(c, &q, &hit, 1000, 1, MD_CACHE_CLAIM, &due) == 1 && !due);
@@ -289,7 +421,7 @@ static void prefetch_and_warm_tests(void) {
     query(&a, "hot.test", 0x0100, 1); positive(&a, &r, 60); md_cache_put(c, &a, &r, 1);
     query(&b, "cold.test", 0x0100, 1); positive(&b, &r, 60); md_cache_put(c, &b, &r, 1);
     query(&d, "dnssec.test", 0x0100, 1); add_opt(&d, true, false); positive(&d, &r, 60); md_cache_put(c, &d, &r, 1);
-    assert(md_cache_get(c, &a, &hit, 2) == 1); assert(md_cache_get(c, &d, &hit, 3) == 1);
+    assert(get_g(c, &a, &hit, 2, 0, MD_CACHE_COUNT, NULL) == 1); assert(get_g(c, &d, &hit, 3, 0, MD_CACHE_COUNT, NULL) == 1);
     char out[512]; assert(md_cache_hot_names(c, out, sizeof(out), 10) == 2);
     assert(!strcmp(out, "4 1 dnssec.test\n0 1 hot.test\n"));
     assert(!strstr(out, "192.0.2") && !strstr(out, "cold"));
@@ -473,6 +605,6 @@ int main(void) {
 #ifndef MD_REGEX_POSIX
     regex_budget_tests();
 #endif
-    regex_profile_tests(); direct_list_regex_tests(); regex_concurrency_tests(); domain_tests(); cache_tests(); stale_and_refresh_tests(); counter_capacity_tests(); prefetch_and_warm_tests(); concurrency_tests(); nft_tests();
+    regex_profile_tests(); direct_list_regex_tests(); regex_concurrency_tests(); domain_tests(); cache_tests(); stale_and_refresh_tests(); replacement_revocation_tests(); refresh_backoff_tests(); logical_hit_tests(); counter_capacity_tests(); prefetch_and_warm_tests(); concurrency_tests(); nft_tests();
     puts("domain/cache/nftset parser tests passed"); return 0;
 }

@@ -19,10 +19,10 @@
  * 旧 cache_lazy_ttl 从 stored 起算总留存；新 cache_stale_ttl 在 expires 之后追加。 */
 typedef struct cache_entry {
     struct cache_entry *hash_next, *prev, *next;
-    uint64_t hash, stored, expires, retained, tick;
+    uint64_t hash, stored, expires, retained, tick, retry_after, generation;
     size_t key_len, response_len, ttl_count, cost;
     uint32_t hits, prefetch_left; /* prefetch_left: remaining-TTL threshold, 0 = never */
-    unsigned char group; bool positive, claimed;
+    unsigned char group, refresh_failures; bool positive, claimed;
     /* exact question key, then a validated DNS response without OPT, then
      * ttl_count big-endian 16-bit TTL offsets (all RRs) recorded at put time,
      * so a hit adjusts TTLs without re-parsing the stored response. */
@@ -32,13 +32,15 @@ typedef struct cache_entry {
  * 缓存项即使被替换或淘汰，刷新任务仍需成对调用 begin/end。 */
 typedef struct refresh_entry {
     struct refresh_entry *next;
-    uint64_t hash; size_t key_len;
+    /* Pin the answer generation, so an old failed refresh cannot delay/count
+     * a newer foreground answer inserted while that refresh was in flight. */
+    uint64_t hash, generation; size_t key_len;
     uint8_t key[];
 } refresh_entry;
 struct md_cache {
     pthread_mutex_t lock;
     size_t capacity, count, bucket_count, refresh_count, group_count[2];
-    uint64_t bytes[2], tick, seed;
+    uint64_t bytes[2], tick, seed, generation;
     md_cache_options o;
     cache_entry **buckets, *head[2], *tail[2];
     refresh_entry **refreshes;
@@ -211,11 +213,12 @@ int md_cache_get_ex(md_cache *c, const md_packet *q, const md_dns_query *qv, md_
             uint32_t ttl = md_dns_ttl(md_read32(t));
             md_write32(t, hit == 2 ? c->o.stale_answer_ttl : age < ttl ? ttl - (uint32_t)age : 0);
         }
-        if (e->hits < UINT32_MAX) e->hits++;
+        if ((flags & MD_CACHE_COUNT) && e->hits < UINT32_MAX) e->hits++;
         /* Prefetch only for reused entries (>=2 hits) and once per stored answer. */
-        if (hit == 1 && e->prefetch_left && !e->claimed && e->hits >= 2 && e->expires - now <= e->prefetch_left) {
+        if (hit == 1 && e->prefetch_left && !e->claimed && now >= e->retry_after &&
+            e->hits >= 2 && e->expires - now <= e->prefetch_left) {
             due = true;
-            if (flags & MD_CACHE_CLAIM) { e->claimed = true; stat_add(c, group, MD_CS_PREFETCH); }
+            if (flags & MD_CACHE_CLAIM) e->claimed = true;
         }
         unlink_lru(c, e); push_front(c, e);
     }
@@ -242,6 +245,15 @@ void md_cache_put_view(md_cache *c, const md_packet *q, const md_packet *r, cons
 }
 void md_cache_put_q(md_cache *c, const md_packet *q, const md_dns_query *qv, const md_packet *r, const md_dns_view *rv, uint64_t now) {
     (void)md_cache_put_ex(c, q, qv, r, rv, now, NULL);
+}
+/* A validated, matching NOERROR/NXDOMAIN answer supersedes the old answer even
+ * when it cannot be stored. Never use this path for a malformed/truncated or
+ * transient-error response: those do not establish that the old data changed. */
+static void revoke_answer(md_cache *c, const uint8_t *key, size_t len, uint64_t hash) {
+    pthread_mutex_lock(&c->lock);
+    cache_entry *old = find_entry(c, key, len, hash);
+    if (old) { ghost_put(c, hash, 0); remove_entry(c, old); }
+    pthread_mutex_unlock(&c->lock);
 }
 bool md_cache_put_ex(md_cache *c, const md_packet *q, const md_dns_query *qv, const md_packet *r,
                      const md_dns_view *rv, uint64_t now, const md_cache_put_opts *po) {
@@ -276,18 +288,19 @@ bool md_cache_put_ex(md_cache *c, const md_packet *q, const md_dns_query *qv, co
             else retention = (uint64_t)ttl + (uint64_t)(stale > 0 ? stale : 0);
         }
     } else return false;
-    if (!ttl || !retention) return false;
+    uint64_t hash = hash_key(key, len);
+    if (!ttl || !retention) goto not_stored;
     /* 与 md_dns_strip_opt 相同：只去除末尾 OPT，非末尾 OPT 不缓存。 */
     size_t response_len = r->len;
-    if (rv->has_opt) { if (rv->opt_end != r->len) return false; response_len = rv->opt_start; }
+    if (rv->has_opt) { if (rv->opt_end != r->len) goto not_stored; response_len = rv->opt_start; }
     size_t cost = ENTRY_OVERHEAD + len + response_len + 2 * ttl_count;
-    if (c->o.max_bytes && cost > c->o.max_bytes) return false;
+    if (c->o.max_bytes && cost > c->o.max_bytes) goto not_stored;
     cache_entry *e = malloc(sizeof(*e) + len + response_len + 2 * ttl_count);
-    if (!e) return false;
-    e->hash = hash_key(key, len); e->key_len = len; e->response_len = response_len; e->ttl_count = ttl_count;
+    if (!e) goto not_stored;
+    e->hash = hash; e->key_len = len; e->response_len = response_len; e->ttl_count = ttl_count;
     e->stored = now; e->expires = deadline(now, ttl); e->retained = deadline(now, retention);
     e->cost = cost; e->hits = 0; e->claimed = false; e->group = (unsigned char)group; e->positive = positive;
-    e->prefetch_left = 0;
+    e->prefetch_left = 0; e->retry_after = 0; e->refresh_failures = 0;
     memcpy(e->bytes, key, len); memcpy(e->bytes + len, r->data, response_len);
     uint8_t *stored = e->bytes + len, *offsets = stored + response_len;
     if (rv->has_opt) md_write16(stored + 10, (uint16_t)(md_read16(stored + 10) - 1));
@@ -300,7 +313,7 @@ bool md_cache_put_ex(md_cache *c, const md_packet *q, const md_dns_query *qv, co
     /* 后台刷新得到 SERVFAIL 时，硬截止前保留仍有效的正向旧答案；
      * NXDOMAIN、NODATA 与地址变化是合法新答案，正常替换。 */
     if (refresh && old && old->positive && rcode == 2 && now < old->retained) {
-        pthread_mutex_unlock(&c->lock); free(e); stat_add(c, group, MD_CS_REFRESH_KEPT); return false;
+        pthread_mutex_unlock(&c->lock); free(e); return false;
     }
     if (positive && c->o.prefetch_percent && ttl >= 2) {
         /* threshold = TTL * percent, jittered by 0.75..1.25, at least 1 s, below TTL. */
@@ -319,10 +332,14 @@ bool md_cache_put_ex(md_cache *c, const md_packet *q, const md_dns_query *qv, co
         evict(c, v, now);
     }
     size_t i = e->hash & (c->bucket_count - 1);
+    e->generation = ++c->generation;
     e->hash_next = c->buckets[i]; c->buckets[i] = e; push_front(c, e);
     ++c->count; ++c->group_count[group]; c->bytes[group] += cost;
     pthread_mutex_unlock(&c->lock);
     return true;
+not_stored:
+    if (rcode == 0 || rcode == 3) revoke_answer(c, key, len, hash);
+    return false;
 }
 /* 兼容入口：自行解析一次 r（堆上 view，避免占用小线程栈）。 */
 void md_cache_put(md_cache *c, const md_packet *q, const md_packet *r, uint64_t now) {
@@ -386,26 +403,34 @@ size_t md_cache_hot_names(md_cache *c, char *out, size_t out_size, size_t max) {
 /* 只有成功取得占位的调用方才可启动刷新；达到容量或分配失败时拒绝。
  * 所有结束路径（含任务启动失败）都须调用 refresh_end 释放占位。 */
 bool md_cache_refresh_begin(md_cache *c, const md_packet *q) { return md_cache_refresh_begin_q(c, q, NULL); }
-bool md_cache_refresh_begin_q(md_cache *c, const md_packet *q, const md_dns_query *qv) {
+static bool refresh_begin(md_cache *c, const md_packet *q, const md_dns_query *qv, uint64_t now, bool timed) {
     if (!c) return false;
     md_dns_query local; qv = query_view(q, qv, &local);
     uint8_t key[KEY_SIZE]; size_t len = qv ? make_key_q(q, qv, key) : 0;
     if (!len) return false;
     uint64_t h = hash_key(key, len); size_t i = h & (c->bucket_count - 1); bool ok = false;
     pthread_mutex_lock(&c->lock);
+    cache_entry *cached = find_entry(c, key, len, h);
+    if (timed && cached && now < cached->retained && now < cached->retry_after) goto done;
     for (refresh_entry *e = c->refreshes[i]; e; e = e->next)
         if (e->hash == h && e->key_len == len && !memcmp(e->key, key, len)) goto done;
     if (c->refresh_count < c->capacity) {
         refresh_entry *e = malloc(sizeof(*e) + len);
-        if (e) { e->hash = h; e->key_len = len; memcpy(e->key, key, len);
+        if (e) { e->hash = h; e->key_len = len; e->generation = cached ? cached->generation : 0; memcpy(e->key, key, len);
             e->next = c->refreshes[i]; c->refreshes[i] = e; ++c->refresh_count; ok = true; }
     }
 done:
     pthread_mutex_unlock(&c->lock); return ok;
 }
+bool md_cache_refresh_begin_q(md_cache *c, const md_packet *q, const md_dns_query *qv) {
+    return refresh_begin(c, q, qv, 0, false);
+}
+bool md_cache_refresh_begin_at(md_cache *c, const md_packet *q, const md_dns_query *qv, uint64_t now) {
+    return refresh_begin(c, q, qv, now, true);
+}
 /* 使用与 begin 相同的问题重建 key；不存在占位时安全返回。 */
 void md_cache_refresh_end(md_cache *c, const md_packet *q) { md_cache_refresh_end_q(c, q, NULL); }
-void md_cache_refresh_end_q(md_cache *c, const md_packet *q, const md_dns_query *qv) {
+static void refresh_end(md_cache *c, const md_packet *q, const md_dns_query *qv, uint64_t now, bool finished, bool success) {
     if (!c) return;
     md_dns_query local; qv = query_view(q, qv, &local);
     uint8_t key[KEY_SIZE]; size_t len = qv ? make_key_q(q, qv, key) : 0;
@@ -416,10 +441,46 @@ void md_cache_refresh_end_q(md_cache *c, const md_packet *q, const md_dns_query 
     while (*p) {
         refresh_entry *e = *p;
         if (e->hash == h && e->key_len == len && !memcmp(e->key, key, len)) {
-            *p = e->next; free(e); --c->refresh_count; break;
+            uint64_t generation = e->generation;
+            *p = e->next; free(e); --c->refresh_count;
+            cache_entry *cached = find_entry(c, key, len, h);
+            if (finished && cached && cached->positive && now < cached->retained) {
+                if (success) { cached->retry_after = 0; cached->refresh_failures = 0; }
+                else if (cached->generation == generation) {
+                    cached->claimed = false;
+                    if (cached->refresh_failures < 4) ++cached->refresh_failures;
+                    unsigned delay = cached->refresh_failures == 4 ? 30 : 5u << (cached->refresh_failures - 1);
+                    cached->retry_after = deadline(now, delay);
+                    if (cached->retry_after > cached->retained) cached->retry_after = cached->retained;
+                    stat_add(c, cached->group, MD_CS_REFRESH_KEPT);
+                }
+            }
+            break;
         }
         p = &e->next;
     }
+    pthread_mutex_unlock(&c->lock);
+}
+void md_cache_refresh_end_q(md_cache *c, const md_packet *q, const md_dns_query *qv) {
+    refresh_end(c, q, qv, 0, false, false);
+}
+void md_cache_refresh_finish(md_cache *c, const md_packet *q, const md_dns_query *qv, uint64_t now, bool success) {
+    refresh_end(c, q, qv, now, true, success);
+}
+/* Admission failure is not a completed prefetch. Re-arm only if no refresh
+ * owns the key; never let a rejected duplicate cancel another live worker. */
+void md_cache_prefetch_cancel(md_cache *c, const md_packet *q, const md_dns_query *qv) {
+    if (!c) return;
+    md_dns_query local; qv = query_view(q, qv, &local);
+    uint8_t key[KEY_SIZE]; size_t len = qv ? make_key_q(q, qv, key) : 0;
+    if (!len) return;
+    uint64_t h = hash_key(key, len); size_t i = h & (c->bucket_count - 1);
+    pthread_mutex_lock(&c->lock);
+    for (refresh_entry *e = c->refreshes[i]; e; e = e->next)
+        if (e->hash == h && e->key_len == len && !memcmp(e->key, key, len)) goto done;
+    cache_entry *cached = find_entry(c, key, len, h);
+    if (cached) cached->claimed = false;
+done:
     pthread_mutex_unlock(&c->lock);
 }
 void md_cache_free(md_cache *c) {

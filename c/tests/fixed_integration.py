@@ -360,13 +360,15 @@ class FixedIntegration(unittest.TestCase):
                         self.assertEqual(address(response), "203.0.113.77")
                         self.assertEqual(struct.unpack_from("!I", response, question(response)[3] + 6)[0], 30)
                         deadline = time.monotonic() + 3
-                        while mock.count(name) < ident - 800 and time.monotonic() < deadline:
+                        while mock.count(name) < 2 and time.monotonic() < deadline:
                             time.sleep(0.02)
                         time.sleep(0.1)
-                self.assertGreaterEqual(mock.count(name), 3)
+                # Failed refreshes back off for 5 seconds; the second stale
+                # hit must preserve the answer without sending another query.
+                self.assertEqual(mock.count(name), 2)
                 stats = output["stderr"]
                 self.assertRegex(stats, r"cache stats foreign: .*fresh_hit=1 stale_hit=2 miss_cold=1")
-                self.assertRegex(stats, r"refresh_kept_old=[12]\b")
+                self.assertRegex(stats, r"refresh_kept_old=1\b")
                 text = warm.read_text()
                 self.assertIn(f"0 1 {name}\n", text)
                 self.assertNotIn("203.0.113", text)

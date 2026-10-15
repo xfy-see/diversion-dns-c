@@ -77,6 +77,8 @@ unit: $(addprefix $(BUILD)/tests/,$(TESTS) $(DRIVERS))
 	python3 tests/nft_cli_test.py --driver $(BUILD)/tests/nft_cli_driver --output $(BUILD)/nft-cli-$$(date +%s)-$$$$ $(if $(filter 1,$(SANITIZE)),--sanitize)
 integration: $(BUILD)/mosdns-c
 	python3 tests/fixed_integration.py $(BUILD)/mosdns-c
+	python3 tests/cache_refresh_safety_test.py --application $(BUILD)/mosdns-c --output $(BUILD)/cache-refresh-$$(date +%s)-$$$$
+	python3 tests/cache_warm_safety_test.py --application $(BUILD)/mosdns-c --output $(BUILD)/cache-warm-$$(date +%s)-$$$$
 test: unit integration
 clean:
 	rm -f $(BUILD)/mosdns-c $(BUILD)/libmosdns-c.a $(LIBOBJ) $(APPOBJ) $(addprefix $(BUILD)/tests/,$(TESTS) $(DRIVERS))

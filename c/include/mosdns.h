@@ -124,6 +124,14 @@ int md_cache_get_q(md_cache *c, const md_packet *q, const md_dns_query *qv, md_p
 void md_cache_put_q(md_cache *c, const md_packet *q, const md_dns_query *qv, const md_packet *r, const md_dns_view *rv, uint64_t now);
 bool md_cache_refresh_begin_q(md_cache *c, const md_packet *q, const md_dns_query *qv);
 void md_cache_refresh_end_q(md_cache *c, const md_packet *q, const md_dns_query *qv);
+/* Timed begin also observes the key's failed-refresh backoff. After a started
+ * refresh, finish releases the claim and resets backoff on success or applies
+ * 5/10/20/30-second delays to a retained positive answer on failure. It never
+ * extends the hard deadline. Use end_q for work that was not actually started. */
+bool md_cache_refresh_begin_at(md_cache *c, const md_packet *q, const md_dns_query *qv, uint64_t now);
+void md_cache_refresh_finish(md_cache *c, const md_packet *q, const md_dns_query *qv, uint64_t now, bool success);
+/* Re-arm a prefetch rejected before start, unless another refresh owns the key. */
+void md_cache_prefetch_cancel(md_cache *c, const md_packet *q, const md_dns_query *qv);
 /* begin 成功表示获得该 key 的刷新标记，必须由 end 配对释放；
  * false 还可能表示容量不足或 key 不支持缓存，不能只理解为重复刷新。 */
 bool md_cache_refresh_begin(md_cache *c, const md_packet *q);
@@ -158,13 +166,15 @@ typedef struct { uint64_t v[2][MD_CS_COUNT]; size_t entries[2]; uint64_t bytes[2
 extern const char *const md_cache_stat_names[MD_CS_COUNT];
 typedef struct { bool prefetch_due; } md_cache_hit;
 /* flags for md_cache_get_ex */
-#define MD_CACHE_COUNT 1u     /* account this lookup in the group counters */
+#define MD_CACHE_COUNT 1u     /* count one logical request, including entry hotness */
 #define MD_CACHE_CLAIM 2u     /* claim a due prefetch (only one claimer wins) */
 int md_cache_get_ex(md_cache *c, const md_packet *q, const md_dns_query *qv, md_packet *r, md_dns_view *rv,
                     uint64_t now, unsigned group, unsigned flags, md_cache_hit *info);
 /* stale_ttl < 0 uses the group default; refresh=true means this answer came
  * from a background refresh/prefetch: a SERVFAIL then never replaces a live
- * positive entry before its hard deadline. Returns false when not stored. */
+ * positive entry before its hard deadline. A valid matching NOERROR/NXDOMAIN
+ * revokes the old entry even if the new answer cannot be stored (TTL 0, empty
+ * NODATA, byte budget or allocation failure). Returns false when not stored. */
 typedef struct { unsigned group; int64_t stale_ttl; bool refresh; } md_cache_put_opts;
 bool md_cache_put_ex(md_cache *c, const md_packet *q, const md_dns_query *qv, const md_packet *r,
                      const md_dns_view *rv, uint64_t now, const md_cache_put_opts *o);
@@ -244,6 +254,8 @@ typedef struct { char listen[256]; bool tcp; size_t entry; unsigned idle_timeout
 /* Both modes load rule files and resolve named IPv6 scopes. check=true
  * never opens listeners/upstream connections or writes nft. */
 md_engine *md_engine_load(const char *path, bool check, char *err);
+/* Call after listeners/workers are ready; enables maintenance and shutdown save. */
+int md_engine_start(md_engine *e, char *err);
 size_t md_engine_listener_count(const md_engine *e);
 const md_listener *md_engine_listener(const md_engine *e, size_t i);
 /* 服务端过载保护，配置加载时已校验范围。queue_timeout_ms=0 表示排队任务不过期；

@@ -65,6 +65,7 @@ static md_engine *test_engine(const char *extra, bool nft) {
     assert(n > 0 && (size_t)n < sizeof(text)); test_write(test_config, text);
     md_engine *e = md_engine_load(test_config, false, err);
     if (!e) { fprintf(stderr, "test config: %s\n", err); abort(); }
+    assert(!md_engine_start(e, err));
     assert(md_engine_listener_count(e) == 2);
     assert(md_engine_listener(e, 0)->entry == 0 && md_engine_listener(e, 1)->entry == 0);
     return e;
@@ -334,30 +335,36 @@ static void test_stale_refresh_failure(void) {
     r = test_resolve(e, &q); assert(r.data[r.len-1] == 9 && test_answer_ttl(&r) == 30 && !(md_read16(r.data+2) & 15));
     test_wait_stat(e, 1, MD_CS_REFRESH_FAIL, 1); assert(test_stat(e, 1, MD_CS_REFRESH_KEPT) == 1);
     r = test_resolve(e, &q); assert(r.data[r.len-1] == 9 && !(md_read16(r.data+2) & 15));
+    assert(test_calls[1] == 2 && test_stat(e, 1, MD_CS_REFRESH_FAIL) == 1);
+    atomic_store(&test_clock, 116); (void)test_resolve(e, &q); assert(test_calls[1] == 2);
+    atomic_store(&test_clock, 117); (void)test_resolve(e, &q);
     test_wait_stat(e, 1, MD_CS_REFRESH_FAIL, 2);
-    /* transport timeout refresh: old answer kept */
+    /* Second failure waits 10 s; transport timeout then also keeps old data. */
     test_rcode = 0; test_forward_fails = true; atomic_store(&test_clock, 120);
     r = test_resolve(e, &q); assert(r.data[r.len-1] == 9 && test_answer_ttl(&r) == 30);
+    assert(test_calls[1] == 3);
+    atomic_store(&test_clock, 127); (void)test_resolve(e, &q);
     test_wait_stat(e, 1, MD_CS_REFRESH_FAIL, 3);
-    r = test_resolve(e, &q); assert(r.data[r.len-1] == 9); test_wait_stat(e, 1, MD_CS_REFRESH_FAIL, 4);
+    assert(test_stat(e, 1, MD_CS_REFRESH_KEPT) == 3);
+    r = test_resolve(e, &q); assert(r.data[r.len-1] == 9 && test_calls[1] == 4);
     /* legitimate NXDOMAIN replaces */
-    test_forward_fails = false; test_rcode = 3; atomic_store(&test_clock, 130);
+    test_forward_fails = false; test_rcode = 3; atomic_store(&test_clock, 147);
     r = test_resolve(e, &q); assert(r.data[r.len-1] == 9); test_wait_stat(e, 1, MD_CS_REFRESH_OK, 1);
     r = test_resolve(e, &q); assert((md_read16(r.data+2) & 15) == 3);
     /* address change replaces */
     test_rcode = 0; q = test_question("move.foreign.test", 1, 0x0100); r = test_resolve(e, &q); assert(r.data[r.len-1] == 9);
-    atomic_store(&test_clock, 141); test_addr = 77;
+    atomic_store(&test_clock, 158); test_addr = 77;
     r = test_resolve(e, &q); assert(r.data[r.len-1] == 9); test_wait_stat(e, 1, MD_CS_REFRESH_OK, 2);
     r = test_resolve(e, &q); assert(r.data[r.len-1] == 77 && test_answer_ttl(&r) == 10);
-    /* hard deadline: 10 s TTL + 60 s stale after insertion at 130 -> gone at 200 */
+    /* A failure retry deadline cannot extend the original hard cache deadline. */
     unsigned before = test_calls[1]; q = test_question("deadline.foreign.test", 1, 0x0100);
-    atomic_store(&test_clock, 130); (void)test_resolve(e, &q);
-    test_rcode = 2; atomic_store(&test_clock, 199); (void)test_resolve(e, &q); test_wait_stat(e, 1, MD_CS_REFRESH_FAIL, 5);
-    atomic_store(&test_clock, 200); r = test_resolve(e, &q); assert((md_read16(r.data+2) & 15) == 2);
+    atomic_store(&test_clock, 200); (void)test_resolve(e, &q);
+    test_rcode = 2; atomic_store(&test_clock, 269); (void)test_resolve(e, &q); test_wait_stat(e, 1, MD_CS_REFRESH_FAIL, 4);
+    atomic_store(&test_clock, 270); r = test_resolve(e, &q); assert((md_read16(r.data+2) & 15) == 2);
     assert(test_calls[1] == before + 3);
     /* CN group has no stale by default: expiry is a miss */
     test_rcode = 0; q = test_question("nostale.cn", 1, 0x0100); before = test_calls[0];
-    (void)test_resolve(e, &q); atomic_store(&test_clock, 210); (void)test_resolve(e, &q); assert(test_calls[0] == before + 2);
+    (void)test_resolve(e, &q); atomic_store(&test_clock, 280); (void)test_resolve(e, &q); assert(test_calls[0] == before + 2);
     md_engine_free(e);
 }
 static void test_stale_override(void) {
@@ -459,6 +466,24 @@ static void test_warm_file(void) {
     assert(test_calls[0] + test_calls[1] == 2); /* only the two valid names were prewarmed */
     md_engine_free(e); assert(!unlink(warm));
 }
+static void test_warm_lifecycle(void) {
+    test_reset(); char warm[600], extra[1400], text[8192], err[MD_ERROR_SIZE];
+    snprintf(warm, sizeof(warm), "%s/warm-lifecycle.txt", test_directory);
+    snprintf(extra, sizeof(extra), "cache_warm_file=%s\ncache_warm_qps=100\n", warm);
+    /* Obtain a complete valid configuration, then leave its next engine in the
+     * pre-listener stage, as when bind/worker setup fails. */
+    md_engine *e = test_engine(extra, false); md_engine_free(e);
+    const char *original = "# saved by an earlier run\n0 1 retained.foreign.test\n";
+    test_write(warm, original);
+    e = md_engine_load(test_config, false, err); assert(e && !e->runtime_started && !e->maintenance_running);
+    md_engine_free(e); test_read_file(warm, text, sizeof(text)); assert(!strcmp(text, original));
+    assert(!test_calls[0] && !test_calls[1]);
+    /* Config validation may allocate a cache before a later option fails. */
+    FILE *f = fopen(test_config, "a"); assert(f); assert(fputs("udp_sport_reuse=2\n", f) >= 0); assert(!fclose(f));
+    assert(!md_engine_load(test_config, false, err));
+    test_read_file(warm, text, sizeof(text)); assert(!strcmp(text, original));
+    assert(!unlink(warm));
+}
 int main(void) {
     strcpy(test_directory, "/tmp/mosdns-fixed-engine-XXXXXX"); assert(mkdtemp(test_directory));
     snprintf(test_rules, sizeof(test_rules), "%s/cn.txt", test_directory);
@@ -466,7 +491,7 @@ int main(void) {
     test_write(test_rules, "domain:cn\nfull:exact.test\nkeyword:needle\nregexp:^asset-[0-9]+\\.test$\n");
     test_split_and_cnames(); test_cache_keeps_nft(); test_negative_and_isolation();
     test_disabled_cache_and_group_options(); test_failures_and_entry(); test_deadlines_and_null_errors(); test_lazy_refresh();
-    test_stale_refresh_failure(); test_stale_override(); test_prefetch(); test_counters_and_bypass(); test_warm_file();
+    test_stale_refresh_failure(); test_stale_override(); test_prefetch(); test_counters_and_bypass(); test_warm_file(); test_warm_lifecycle();
     assert(!unlink(test_config)); assert(!unlink(test_rules)); assert(!rmdir(test_directory));
     assert(!pthread_cond_destroy(&test_ready)); assert(!pthread_mutex_destroy(&test_lock));
     puts("fixed engine: QNAME split, CNAME, cache+nft, A/AAAA, errors and lazy refresh passed"); return 0;
