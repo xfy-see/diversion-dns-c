@@ -234,6 +234,9 @@ while :; do
  [ "$(cat /proc/sys/kernel/random/boot_id)" = "$(cat "$rf_run/boot-id")" ] || rf_abort boot_id_changed
  rf_timeout sha256sum -c "$rf_base/protected.sha256" > "$rf_run/protected-current.txt" 2>&1 || rf_abort production_hash_changed
  rf_timeout sha256sum -c "$rf_run/inputs.sha256" > "$rf_run/inputs-current.txt" 2>&1 || rf_abort input_hash_changed
+ read -r rf_prod_pid rf_prod_start rf_prod_exe < "$rf_run/production.identity" || rf_abort production_identity_unreadable
+ [ "$(rf_proc_start "$rf_prod_pid")" = "$rf_prod_start" ] && [ "$(rf_exe "$rf_prod_pid")" = "$rf_prod_exe" ] || rf_abort production_dns_identity_changed
+ [ ! -e /etc/diversion-dns-c/degraded ] && [ ! -e /etc/diversion-dns-c/recovering ] || rf_abort production_dns_degraded_or_recovering
  if ! rf_match runner; then
   rf_launch=$(cat "$rf_run/runner-launch.monotonic")
   [ "$rf_now" -ge "$((rf_launch+rf_duration))" ] || rf_abort runner_exited_early
