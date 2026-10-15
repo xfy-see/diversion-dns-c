@@ -57,6 +57,7 @@ static uint8_t fake_reply[MD_NL_BUFFER_SIZE];static size_t fake_length;
 static unsigned opens,closes,sends,generations,batches,key_count,post_receive_clocks;static uint64_t late_ms;static bool batch_received;
 static const char *fake_mode(void){const char *s=getenv("FAKE_MODE");return s?s:"normal";}
 static bool fail_gen; /* window-error: the next generation read fails (EPERM). */
+static bool race_on_pipeline,in_pipeline; /* fast-pipeline-race: bump gen once on the pipelined GETGEN */
 /* FAST_V6 selects one family; FAST_BOTH decides per request by the set name (…6). */
 static bool fake_v6(const uint8_t *p){
     if(getenv("FAST_V6"))return true;
@@ -81,11 +82,12 @@ static int __attribute__((unused)) fake_getsockopt(int fd, int level, int opt, v
 static int __attribute__((unused)) fake_close(int fd){if(fd==fake_fd){++closes;return 0;}return close(fd);}
 static int __attribute__((unused)) fake_poll(struct pollfd *p,nfds_t n,int ms){if(n==1&&p->fd==fake_fd){assert(ms>0&&ms<=5000);if(!strcmp(fake_mode(),"late-wake")||(!strcmp(fake_mode(),"late-add-wake")&&batches))late_ms=6000;p->revents=p->events;return 1;}return poll(p,n,ms);}
 static size_t __attribute__((unused)) fake_ack(const uint8_t *q,uint8_t *out,int error){memset(out,0,36);md_nl_put32(out,36);md_nl_put16(out+4,2);if(error)md_nl_put16(out+6,0x100);md_nl_put32(out+8,md_nl_u32(q+8));md_nl_put32(out+12,41771);int32_t e=error;memcpy(out+16,&e,4);memcpy(out+20,q,16);return 36;}
-static ssize_t __attribute__((unused)) fake_send(int fd,const void *data,size_t n,int flags,const struct sockaddr *peer,socklen_t size){
+static ssize_t fake_send_one(int fd,const void *data,size_t n,int flags,const struct sockaddr *peer,socklen_t size){
     assert(fd==fake_fd&&!flags&&size==sizeof(struct sockaddr_nl));const struct sockaddr_nl *k=(const struct sockaddr_nl *)peer;assert(k->nl_family==16&&!k->nl_pid&&!k->nl_groups);++sends;fake_length=0;const uint8_t *p=data;
     if(md_nl_u16(p+4)==0xA10){++generations;assert(n==20&&md_nl_u16(p+6)==1&&md_nl_u32(p+12)==41771);
         uint32_t seq=md_nl_u32(p+8);assert(seq);if(seq>UINT32_MAX-64u)seq_high=true;else if(seq_high&&seq<64u)seq_wrapped=true;
         if(!strcmp(fake_mode(),"gen-error")||fail_gen){fake_length=fake_ack(p,fake_reply,-EPERM);return (ssize_t)n;}
+        if(race_on_pipeline&&in_pipeline){race_on_pipeline=false;++fast_gen;}
         if (fast_mode() && ((!strcmp(fake_mode(), "fast-reset") && generations == 5) ||
             (!strcmp(fake_mode(), "fast-permanent-reset") && generations == 4) ||
             (!strcmp(fake_mode(), "fast-race-before") && generations == 3) ||
@@ -106,7 +108,7 @@ static ssize_t __attribute__((unused)) fake_send(int fd,const void *data,size_t 
     }
     if(fast_mode()&&md_nl_u16(p+4)==0xA0D){
         ++element_reads;
-        if(strcmp(fake_mode(),"fast-existing") && strcmp(fake_mode(),"fast-permanent") && strcmp(fake_mode(),"fast-permanent-reset") && !(batches && (!strcmp(fake_mode(),"fast-race-after") || !strcmp(fake_mode(),"fast-race-before")))){fake_length=fake_ack(p,fake_reply,-ENOENT);return (ssize_t)n;}
+        if(strcmp(fake_mode(),"fast-existing") && strcmp(fake_mode(),"fast-permanent") && strcmp(fake_mode(),"fast-permanent-reset") && !(batches && (!strcmp(fake_mode(),"fast-race-after") || !strcmp(fake_mode(),"fast-race-before") || !strcmp(fake_mode(),"fast-pipeline-race")))){fake_length=fake_ack(p,fake_reply,-ENOENT);return (ssize_t)n;}
         md_nl_requests q={0};q.port=41771;md_nl_writer w={fake_reply,sizeof(fake_reply),0};size_t at,es,el,key;
         assert(!md_nl_message_start(&w,&q,0xA0C,0,md_nl_u32(p+8),p[16],0,&at));size_t a=20;
         for(unsigned i=1;i<=2;i++){size_t z=md_nl_u16(p+a);assert(!md_nl_attr(&w,(uint16_t)i,p+a+4,z-4));a+=md_nl_align(z);}
@@ -141,6 +143,25 @@ static ssize_t __attribute__((unused)) fake_send(int fd,const void *data,size_t 
     if(!strcmp(fake_mode(),"duplicate-ack")){memcpy(fake_reply+fake_length,fake_reply,fake_length);fake_length*=2;}
     if(!strcmp(fake_mode(),"short-send"))return (ssize_t)n-1;
     return (ssize_t)n;
+}
+/* Pipelined readback: one datagram of REQUEST-only GETSETELEM/GETGEN messages is
+ * handled message by message in order (as nfnetlink does); the replies are
+ * returned together in one receive. pipelined counts such multi-message sends. */
+static unsigned pipelined;
+static ssize_t __attribute__((unused)) fake_send(int fd,const void *data,size_t n,int flags,const struct sockaddr *peer,socklen_t size){
+    const uint8_t *p=data;size_t first=md_nl_u32(p);
+    if(n>md_nl_align(first)&&(md_nl_u16(p+4)==0xA0D||md_nl_u16(p+4)==0xA10)){
+        static uint8_t acc[MD_NL_BUFFER_SIZE];size_t al=0,off=0;unsigned parts=0;
+        while(off<n){size_t len=md_nl_u32(p+off);assert(len>=20&&off+len<=n);
+            unsigned t=md_nl_u16(p+off+4);assert(t==0xA0D||t==0xA10);
+            /* GETGEN may only be the last message of a pipelined datagram. */
+            if(t==0xA10)assert(off+md_nl_align(len)>=n);
+            in_pipeline=true;assert(fake_send_one(fd,p+off,len,flags,peer,size)==(ssize_t)len);in_pipeline=false;
+            assert(al+fake_length<=sizeof(acc));memcpy(acc+al,fake_reply,fake_length);al+=fake_length;
+            off+=md_nl_align(len);++parts;}
+        sends-=parts-1;++pipelined;memcpy(fake_reply,acc,al);fake_length=al;return (ssize_t)n;
+    }
+    return fake_send_one(fd,data,n,flags,peer,size);
 }
 static ssize_t __attribute__((unused)) fake_receive(int fd,struct msghdr *m,int flags){assert(fd==fake_fd&&!flags&&m->msg_iovlen==1&&fake_length<=m->msg_iov->iov_len);struct sockaddr_nl *s=m->msg_name;memset(s,0,sizeof(*s));s->nl_family=16;m->msg_namelen=sizeof(*s);memcpy(m->msg_iov->iov_base,fake_reply,fake_length);if(batches)batch_received=true;if(!strcmp(fake_mode(),"late-recv")||(!strcmp(fake_mode(),"late-add-recv")&&batches))late_ms=6000;if(!strcmp(fake_mode(),"wrong-source"))s->nl_pid=1;if(!strcmp(fake_mode(),"wrong-groups"))s->nl_groups=1;if(!strcmp(fake_mode(),"wrong-family"))s->nl_family=2;if(!strcmp(fake_mode(),"truncate"))m->msg_flags=MSG_TRUNC;return (ssize_t)fake_length;}
 #define uname fake_uname
@@ -310,6 +331,29 @@ int main(int argc, char **argv) {
             /* Window off: the repeat is served from the verified cache (no write). */
             if (!rc) rc = md_nft_apply(n, &response, error);
             assert(rc || (batches == 1 && key_count == 2));
+        }
+        else if (!rc && !strcmp(fake_mode(), "fast-pipeline")) {
+            /* Cold answer with 12 new addresses: readback is pipelined 8 + 4 per
+             * datagram and the pre-commit GETGEN rides on the last one. Before:
+             * gen, meta, gen, 12 readbacks, gen, batch, gen = 18 sends. Now:
+             * gen, meta, gen, 2 pipelined readback datagrams, batch, gen = 7. */
+            many_records(&response, v6, 12, 0);
+            unsigned s0 = sends, g0 = generations;
+            rc = md_nft_apply(n, &response, error);
+            assert(rc || (element_reads == 12 && pipelined == 2 && sends - s0 == 7 &&
+                          generations - g0 == 4 && batches == 1 && key_count == 12));
+            /* Warm repeat: every key cached; no readback, no write. */
+            unsigned e0 = element_reads, b0 = batches;
+            if (!rc) rc = md_nft_apply(n, &response, error);
+            assert(rc || (element_reads == e0 && batches == b0));
+        }
+        else if (!rc && !strcmp(fake_mode(), "fast-pipeline-race")) {
+            /* The GETGEN riding on the readback datagram reports another writer's
+             * commit: the cohort adopts it, commits, and confirms (N3) as before. */
+            many_records(&response, v6, 3, 0);
+            race_on_pipeline = true;
+            rc = md_nft_apply(n, &response, error);
+            assert(rc || (pipelined >= 1 && batches == 1 && key_count == 3));
         }
         else if (!rc && (!strcmp(fake_mode(), "fast-window") || !strcmp(fake_mode(), "fast-window-renew") || !strcmp(fake_mode(), "fast-window-error"))) {
             md_nft_set_hit_window(n, 60000);

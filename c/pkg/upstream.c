@@ -379,10 +379,23 @@ static int socket_options(int fd, const md_upstream *u, char *err) {
     int one = 1;
     if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one))) return syserr(err, "set SO_NOSIGPIPE");
 #endif
+#if defined(SOCK_NONBLOCK) && defined(SOCK_CLOEXEC)
+    (void)0; /* upstream_socket() already created it nonblocking + close-on-exec. */
+#else
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0 || fcntl(fd, F_SETFD, FD_CLOEXEC) < 0)
         return syserr(err, "set socket flags");
+#endif
     return 0;
+}
+/* One syscall instead of socket + 3 fcntl per fresh upstream socket (M4 opens
+ * one per UDP query). Flags are identical: O_NONBLOCK and FD_CLOEXEC. */
+static int upstream_socket(int family, int type) {
+#if defined(SOCK_NONBLOCK) && defined(SOCK_CLOEXEC)
+    return socket(family, type | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+#else
+    return socket(family, type, 0);
+#endif
 }
 /* Hand out a parked or pre-opened UDP socket for this upstream. Default M4 only
  * accepts virgin (uses==0) spares; opt-in reuse also accepts quiet sockets under
@@ -446,7 +459,7 @@ void md_forward_worker_idle(void) {
             worker_tcp->spare_wanted[i] = false; continue;
         }
         const md_upstream *u = &worker_tcp->spare_key[i];
-        int fd = socket(u->address.ss_family, SOCK_DGRAM, 0);
+        int fd = upstream_socket(u->address.ss_family, SOCK_DGRAM);
         if (fd < 0) continue;
         if (socket_options(fd, u, NULL) || connect(fd, (const struct sockaddr *)&u->address, u->address_len)) {
             close(fd); continue;
@@ -474,7 +487,7 @@ static int begin_connection(exchange *x, const md_upstream *u, bool tcp, bool al
             x->udp_uses = uses; x->udp_born = born; x->state = SENDING; return 0;
         }
     }
-    x->fd = socket(u->address.ss_family, tcp ? SOCK_STREAM : SOCK_DGRAM, 0);
+    x->fd = upstream_socket(u->address.ss_family, tcp ? SOCK_STREAM : SOCK_DGRAM);
     if (x->fd < 0) { syserr(err, "create upstream socket"); stop(x); return -1; }
     if (socket_options(x->fd, u, err)) { stop(x); return -1; }
     if (!connect(x->fd, (const struct sockaddr *)&u->address, u->address_len)) x->state = SENDING;
