@@ -6,6 +6,8 @@ of its YAML/plugin tests are selected by this test module.
 """
 import concurrent.futures
 import contextlib
+import os
+import sys
 from pathlib import Path
 import signal
 import socket
@@ -46,15 +48,24 @@ def config_text(config, rules):
 
 
 @contextlib.contextmanager
-def running(config):
+def running(config, *, nofile=None, process_info=None):
     with tempfile.TemporaryDirectory(prefix="fixed-dns-integration-") as tmp:
         root = Path(tmp)
         rules = root / "cn.txt"
         rules.write_text(RULES)
         path = root / "config.conf"
         path.write_text(config_text(config, rules))
-        process = subprocess.Popen([str(BIN), "start", "-c", str(path), "--cpu", "4"],
-                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        argv = [str(BIN), "start", "-c", str(path), "--cpu", "4"]
+        if nofile is not None:
+            # Set the child limit in a fresh interpreter, not preexec_fn in this
+            # threaded fixture. The exec keeps the PID used for /proc checks.
+            argv = [sys.executable, "-c",
+                    "import os,resource,sys; n=int(sys.argv[1]); "
+                    "resource.setrlimit(resource.RLIMIT_NOFILE,(n,n)); "
+                    "os.execv(sys.argv[2],sys.argv[2:])", str(nofile)] + argv
+        process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if process_info is not None:
+            process_info["pid"] = process.pid
         port = int(config["listen_tcp"].rsplit(":", 1)[1])
         try:
             deadline = time.monotonic() + 5
@@ -234,6 +245,35 @@ class FixedIntegration(unittest.TestCase):
                 for ident in (121, 122):
                     response = receive_exact(sock, struct.unpack("!H", receive_exact(sock, 2))[0])
                     self.assertEqual(struct.unpack_from("!H", response)[0], ident)
+
+        if sys.platform.startswith("linux"):
+            info = {}
+            config = self.config(tcp_max_connections=64, tcp_max_connections_per_ip=64)
+            with running(config, nofile=128, process_info=info) as port:
+                # A listening socket can precede worker/signal-handler startup,
+                # particularly under QEMU. Prove application readiness first;
+                # one UDP answer stays far below the fd-capacity boundary.
+                self.assertEqual(address(udp_exchange(port, query("fd-ready.foreign.test"))), "203.0.113.9")
+                root = Path("/proc") / str(info["pid"])
+                def capacity():
+                    return int(next(line.split()[1] for line in
+                                    (root / "status").read_text().splitlines()
+                                    if line.startswith("FDSize:")))
+                before = capacity()
+                self.assertGreaterEqual(before, 128)
+                # The high duplicate used to grow the table must already be closed.
+                self.assertNotIn("127", os.listdir(root / "fd"))
+                with contextlib.ExitStack() as stack:
+                    clients = [stack.enter_context(socket.create_connection(
+                        ("127.0.0.1", port), timeout=4)) for _ in range(64)]
+                    packet = query("fd-capacity.foreign.test", 63001)
+                    for client in clients:
+                        client.sendall(struct.pack("!H", len(packet)) + packet)
+                        response = receive_exact(client, struct.unpack("!H", receive_exact(client, 2))[0])
+                        self.assertEqual(response[:2], packet[:2])
+                        self.assertEqual(struct.unpack_from("!H", response, 2)[0] & 15, 0)
+                    self.assertEqual(capacity(), before)
+                self.assertNotIn("127", os.listdir(root / "fd"))
 
     def test_tcp_upstream_and_parallel_clients(self):
         config = self.config(foreign_upstream=f"tcp://127.0.0.1:{self.foreign.port}")

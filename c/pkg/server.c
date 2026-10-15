@@ -18,6 +18,10 @@
 #include <string.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <limits.h>
+#include <sys/resource.h>
+#endif
 
 #define MAX_JOBS 64
 #define MAX_IDLE_JOBS 8
@@ -84,6 +88,41 @@ static int nonblock(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     return flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0 ||
            fcntl(fd, F_SETFD, FD_CLOEXEC) < 0 ? -1 : 0;
+}
+/* Linux expands a shared fd table with synchronize_rcu(). Even an empty
+ * nonblocking accept can trigger that before returning EAGAIN, stalling the
+ * event loop at the first capacity boundary (32 descriptors on MIPS).
+ * Grow once while single-threaded. F_DUPFD_CLOEXEC reserves a table slot, not
+ * a connection; closing the duplicate immediately retains the table capacity.
+ * Budget for configured clients/listeners, worker socket pools and concurrent
+ * refreshes. This is headroom, not a new fd limit or a promise for arbitrary
+ * inherited descriptors. Respect RLIMIT_NOFILE and retain old behaviour if
+ * this optional optimization cannot be applied. */
+static void preallocate_fdtable(int fd, size_t listeners, unsigned clients, unsigned workers) {
+#ifdef __linux__
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_NOFILE, &limit)) {
+        fprintf(stderr, "fd table preallocation: getrlimit: %s\n", strerror(errno));
+        return;
+    }
+    if (!limit.rlim_cur) return;
+    /* Worker pools: 8 TCP + 8 UDP spare + 16 retired + active/netlink margin.
+     * 320 also covers up to 64 refresh jobs (up to 3 upstream sockets each)
+     * and baseline/temporary descriptors. No sockets are kept open here. */
+    uint64_t wanted = (uint64_t)clients + listeners + 40ull * workers + 320;
+    if (limit.rlim_cur != RLIM_INFINITY && wanted >= limit.rlim_cur)
+        wanted = limit.rlim_cur - 1;
+    if (wanted > INT_MAX) wanted = INT_MAX;
+    int reserved = fcntl(fd, F_DUPFD_CLOEXEC, (int)wanted);
+    if (reserved < 0) {
+        fprintf(stderr, "fd table preallocation: fcntl: %s (continuing)\n", strerror(errno));
+        return;
+    }
+    close(reserved);
+    fprintf(stderr, "fd table preallocated through descriptor %d\n", reserved);
+#else
+    (void)fd; (void)listeners; (void)clients; (void)workers;
+#endif
 }
 /* 只缓存少量空闲大报文对象，平衡每次 malloc 的成本和空闲内存占用。 */
 static job *acquire_job(pool *p) {
@@ -468,6 +507,7 @@ int md_server_run(md_engine *e, unsigned workers, char *err) {
     if (pipe(p.wake) || nonblock(p.wake[0]) || nonblock(p.wake[1])) {
         snprintf(err, MD_ERROR_SIZE, "completion pipe: %s", strerror(errno)); goto cleanup;
     }
+    preallocate_fdtable(p.wake[0], count, max_connections, total);
     for (size_t i = 0; i < count; i++) {
         const md_listener *l = md_engine_listener(e, i);
         struct sockaddr_storage a; socklen_t alen;
