@@ -39,7 +39,7 @@ class CorpusVersionContracts(unittest.TestCase):
             verify.nft_cases({"VERSION": b"0.1.1", "c/plugin/nft_fast.h": b""})
 
 class Evidence:
-    def __init__(self, root, arch="aarch64_cortex-a53"):
+    def __init__(self, root, arch="aarch64_cortex-a53", version="0.1.0"):
         self.root, self.arch = root, arch
         self.checkout, self.folder = root / "checkout", root / "artifact"
         self.checkout.mkdir()
@@ -53,6 +53,11 @@ class Evidence:
             "c/plugin/nft_fast.h": b"synthetic historical fast source\n",
             "c/tests/fixed_integration.py": (ROOT / "c/tests/fixed_integration.py").read_bytes(),
         }
+        self.source["VERSION"] = (version + "\n").encode()
+        self.source["packaging/openwrt/Makefile"] = ("PKG_VERSION:=" + version + "\nPKG_RELEASE:=1\n").encode()
+        if version != "0.1.0":
+            self.source["c/tests/nft_cli_contract.json"] = (ROOT / "c/tests/nft_cli_contract.json").read_bytes()
+        cases = verify.nft_cases(self.source)
         for name, data in self.source.items():
             path = self.checkout / name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -61,7 +66,7 @@ class Evidence:
         self.git("add", ".")
         self.git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "synthetic evidence fixture")
         self.commit = self.git("rev-parse", "HEAD").decode().strip()
-        self.apk_name = "diversion-dns-c-lite-0.1.0-r1_" + arch + "_" + self.commit[:12] + ".apk"
+        self.apk_name = "diversion-dns-c-lite-" + version + "-r1_" + arch + "_" + self.commit[:12] + ".apk"
         self.apkpath = "/ci/out/" + self.apk_name
         self.files = {"LICENSE": self.source["LICENSE"], "README.txt": b"Synthetic verifier fixture\n",
                       self.apk_name: b"not a real APK; never execute", "logs/sdk-no-unused-signing-keys.patch": b"synthetic patch\n",
@@ -88,7 +93,7 @@ class Evidence:
         argv("qemu-final-apk-integration", ["python3", "/ci/source/c/tests/fixed_integration.py", "/ci/wrappers/packaged-app"])
         argv("qemu-pcre2-differential", ["python3", "/ci/source/c/tests/regex_differential.py", "--pcre2", "/ci/reference/domain_driver", "--posix-lite", "/ci/wrappers/domain_driver", "--output", "/ci/out/regex-differential.json"])
         self.outputs.update({
-            "apk-version": "mosdns-c 0.1.0 fixed-splitter\n",
+            "apk-version": "mosdns-c " + version + " fixed-splitter\n",
             "apk-untrusted-as-expected": self.apkpath + ": UNTRUSTED signature\n",
             "qemu-dns_test": "dns/upstream tests passed\n",
             "qemu-fixed_config_test": "fixed config: strict keys, bounds, lists, diagnostics and rules preflight passed\n",
@@ -97,12 +102,12 @@ class Evidence:
             "qemu-nft_netlink_test": '{"passed":true,"assertions":170,"sockets_used":false}\n',
             "qemu-domain-fixture": "shared domain fixture: 11 cases / 70 assertions passed; 4 Unicode/RE2-specific cases explicitly skipped with reasons\nPOSIX-lite profile: 7 byte/ASCII cases and 5 required Unicode rejections / 37 assertions passed\n",
             "native-reference-budget-unit": "PCRE2 operational budget: 2 direct MATCHLIMIT(-47) errors verified; bool API returns false\n",
-            "qemu-nft-cli": '{"ok":true,"checks":30,"sanitized":false,"device_or_kernel_evidence":false}\n',
+            "qemu-nft-cli": json.dumps(dict(ok=True, checks=len(cases), sanitized=False, device_or_kernel_evidence=False)) + "\n",
         })
         test_names = verify.re.findall(rb"(?m)^    def (test_[a-z0-9_]+)\(self\):", self.source["c/tests/fixed_integration.py"])
         self.outputs["qemu-final-apk-integration"] = "".join(name.decode() + " (__main__.FixedIntegration." + name.decode() + ") ... ok\n" for name in test_names) + "\nRan 12 tests in 1.234s\n\nOK\n"
         app_record, list_record = record(), record(b"/usr/sbin/diversion-dns-c-lite\n")
-        metadata = {"info": {"name": "diversion-dns-c-lite", "arch": arch, "version": "0.1.0-r1", "license": "GPL-3.0-or-later",
+        metadata = {"info": {"name": "diversion-dns-c-lite", "arch": arch, "version": version + "-r1", "license": "GPL-3.0-or-later",
                               "depends": ["libc", "libpthread"], "installed-size": app_record["bytes"] + list_record["bytes"]}, "paths": []}
         for name, item in ((verify.APP, app_record), ("lib/apk/packages/diversion-dns-c-lite.list", list_record)):
             metadata["paths"].append({"name": str(Path(name).parent), "acl": {"mode": 0o755}, "files": [
@@ -117,8 +122,8 @@ class Evidence:
         self.state = {"source_commit": self.commit, "source_tree": self.git("rev-parse", "HEAD^{tree}").decode().strip(), "architecture": arch,
                       "github": {"GITHUB_REPOSITORY": verify.REPOSITORY, "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "2", "GITHUB_SHA": self.commit},
                       "status": "passed", "unsigned": True, "signing_keys_created": False, "same_sdk_application_matches_apk": True,
-                      "application_version": "0.1.0", "package_version": "0.1.0-r1", "apk": {"filename": self.apk_name, **record(self.files[self.apk_name])},
-                      "target": verify.builder.TARGETS[arch], "commands": self.commands, "elf": elf, "tests": dict(verify.TEST_COUNTS),
+                      "application_version": version, "package_version": version + "-r1", "apk": {"filename": self.apk_name, **record(self.files[self.apk_name])},
+                      "target": verify.builder.TARGETS[arch], "commands": self.commands, "elf": elf, "tests": dict(verify.TEST_COUNTS, nft_cli_checks=len(cases)),
                       "sdk_archive": {"bytes": 100, "sha256": verify.builder.TARGETS[arch]["sdk_sha256"]}, "sdk_libc": record(b"libc"),
                       "compiler_binary": record(), "qemu": record(), "static_libatomic": record(),
                       "build_flags": {"CFLAGS": "-Os -UNDEBUG -flto -fstack-protector -D_FORTIFY_SOURCE=1 -Wformat -Werror=format-security -Wl,-z,now -Wl,-z,relro",
@@ -129,9 +134,9 @@ class Evidence:
                       "not_tested": ["router installation", "real kernel nftables", "hardware compatibility", "RSS/QPS", "sustained stability", "actual flash increment"]}
         self.manifest = {"source_commit": self.commit, "recipe_sha256": record(self.source["packaging/openwrt/Makefile"])["sha256"],
                          "source_files_sha256": {n: record(d)["sha256"] for n, d in self.source.items() if n == "LICENSE" or n.startswith("c/")}}
-        self.nft = {"ok": True, "count": 30, "sanitized": False, "device_or_kernel_evidence": False, "commands": [],
+        self.nft = {"ok": True, "count": len(cases), "sanitized": False, "device_or_kernel_evidence": False, "commands": [],
                     "source_sha256": record(self.source["c/plugin/nftset.c"])["sha256"], "checks": []}
-        for name, (code, calls) in verify.NFT_CASES.items():
+        for name, (code, calls) in cases.items():
             self.nft["checks"].append({"label": name, "exit": code, "calls": calls, "passed": True})
             for suffix in (".stdout", ".stderr"):
                 self.files["nft-cli/" + name + suffix] = b""
@@ -179,10 +184,10 @@ class Evidence:
 
 
 class ReleaseInputs(unittest.TestCase):
-    def fixture(self, arch="aarch64_cortex-a53"):
+    def fixture(self, arch="aarch64_cortex-a53", version="0.1.0"):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        return Evidence(Path(temporary.name), arch)
+        return Evidence(Path(temporary.name), arch, version)
 
     def test_both_architectures_accept_exact_evidence_without_execution(self):
         for arch in verify.builder.TARGETS:
@@ -194,6 +199,18 @@ class ReleaseInputs(unittest.TestCase):
                     return real(argv, **kwargs)
                 with mock.patch.object(verify.subprocess, "run", side_effect=git_only):
                     self.assertEqual(fixture.check(), fixture.state)
+
+    def test_current_release_both_architectures_accept_complete_evidence(self):
+        for arch in verify.builder.TARGETS:
+            with self.subTest(arch=arch):
+                fixture = self.fixture(arch, "0.1.2")
+                self.assertEqual(fixture.check(), fixture.state)
+                self.assertEqual(fixture.state["tests"]["nft_cli_checks"], 86)
+                fixture.state["application_version"] = "0.1.1"
+                fixture.state["package_version"] = "0.1.1-r1"
+                fixture.refresh()
+                with self.assertRaises(ValueError):
+                    fixture.check()
 
     def test_identity_inputs_must_be_exact(self):
         fixture = self.fixture()
