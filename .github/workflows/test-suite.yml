@@ -50,7 +50,12 @@ jobs:
             GOARCH="$arch" go build -trimpath -ldflags='-s -w' -o "dist/$arch/load" benchmarks/suite/load.go
             GOARCH="$arch" go build -trimpath -ldflags='-s -w' -o "dist/$arch/fixture" benchmarks/suite/fixture.go
             GOARCH="$arch" go build -trimpath -ldflags='-s -w' -o "dist/$arch/diagload" benchmarks/suite/diagload.go
+            GOARCH="$arch" go build -trimpath -ldflags='-s -w' -o "dist/$arch/realflow-capture" benchmarks/suite/realflow_capture.go
+            GOARCH="$arch" go build -trimpath -ldflags='-s -w' -o "dist/$arch/realflow-runner" benchmarks/suite/realflow_runner.go
           done
+          CGO_ENABLED=1 GOARCH=amd64 go test -race benchmarks/suite/realflow_capture.go benchmarks/suite/realflow_capture_test.go
+          CGO_ENABLED=1 GOARCH=amd64 go test -race benchmarks/suite/realflow_runner.go benchmarks/suite/realflow_runner_test.go
+          dist/amd64/realflow-runner -fixture-smoke
           cp benchmarks/suite/*.go dist/
           go version > dist/toolchain.txt
           python3 - <<'PYTHON'
@@ -82,6 +87,22 @@ jobs:
           s=d['samples']
           assert d['schema']=='diversion-diagload-v1' and len(s)==20,d
           assert all(not x.get('error') and not x.get('unsent') and x['slot_ns']<=x['pickup_ns']<=x['send_ns']<x['recv_ns'] for x in s),s
+          PYTHON
+          sudo dist/amd64/realflow-capture -iface lo -dst-port 15531 -seconds 4 -stats-seconds 1 > capture-smoke.jsonl 2> capture-smoke.stderr &
+          capture_pid=$!
+          sleep 0.5
+          dist/amd64/load -addr 127.0.0.1:15531 -rate 5 -seconds 1 -workers 2 > capture-udp-load.json
+          dist/amd64/load -addr 127.0.0.1:15531 -net tcp -rate 5 -seconds 1 -workers 2 > capture-tcp-load.json
+          wait "$capture_pid"
+          python3 - <<'PYTHON'
+          import json
+          rows=[json.loads(line) for line in open('capture-smoke.jsonl')]
+          queries=[x for x in rows if x.get('type')=='dns_query']
+          final=[x for x in rows if x.get('type')=='capture_stats' and x.get('final')]
+          assert len(queries)==10,queries
+          assert {x['transport'] for x in queries}=={'udp','tcp'},queries
+          assert len(final)==1 and final[0]['kernel_drops']==0,final
+          assert not any(v for k,v in final[0]['counters'].items() if 'queue_full' in k),final
           PYTHON
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
