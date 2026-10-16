@@ -18,6 +18,11 @@ if [ "$mode" = --automatic ]; then
  [ "$(cat "$base/recovery-auto")" = service-health ] || exit 1
 fi
 
+# The legacy init applies policy before C starts. Verify while owning the
+# deployment lock and BEFORE creating recovering (policy audit rejects active
+# DNS transactions). Reconciliation above only stops C and remains unblocked.
+verify_managed_policy || exit 1
+
 # Snapshot before starting C; the switching marker precedes the first mutation.
 mkdir "$base/recovering" || exit 1
 committed=0
@@ -37,7 +42,7 @@ uci -q get 'dhcp.@dnsmasq[0].cachesize' > "$base/recovering/cachesize" || exit 1
 printf '%s\n' "$mode" > "$base/recovering/mode" || exit 1
 sync || exit 1
 # The durable transaction permits C after reboot too. Client DNS stays on ISP.
-"$initdir/diversion-dns-c" start || exit 1
+DIVERSION_CN_DEPLOY_LOCK_HELD=1 "$initdir/diversion-dns-c" start || exit 1
 ready=0
 for attempt in 1 2 3 4 5 6 7 8 9 10; do
  if probe 127.0.0.1 "$c_port" health.diversion-dns-c.qq.com A allow-response; then ready=1; break; fi

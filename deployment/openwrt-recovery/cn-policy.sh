@@ -14,7 +14,6 @@ if [ "${DIVERSION_CN_DEPLOY_LOCK_HELD:-0}" != 1 ]; then
  exec 9>"${DIVERSION_DNS_LOCK:-/var/lock/diversion-dns-deploy.lock}"
  flock 9
 fi
-[ ! -d "$base/recovering" ] || exit 75
 chains='split classify guard router_output router_guard dns_redirect'
 files='policy.nft helper.sha256 table split.chain classify.chain guard.chain router_output.chain router_guard.chain dns_redirect.chain'
 mkdir -p "$store/generations"
@@ -121,7 +120,7 @@ audit() {
  log 'restored and verified six owned policy chains from approved baseline'
 }
 case "${1:-}" in
- seed) shift; seed "$@";;
+ seed) [ ! -d "$base/recovering" ] || exit 75; shift; seed "$@";;
  audit-runtime) shift; case "${1:-}" in ''|--repair) audit "${1:-}";; *) exit 2;; esac;;
  *) echo 'usage: cn-policy.sh seed [--replace] | audit-runtime [--repair]' >&2; exit 2;;
 esac

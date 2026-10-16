@@ -718,6 +718,14 @@ done''')
         self.execute("guard.sh", "--once", expected=0)
         self.assertEqual((self.root / "cn-hook").read_text().splitlines(), ["1 audit-runtime"])
 
+    def test_cn_data_generation_without_markers_keeps_audit_active(self):
+        self.activate_normal_service()
+        self.install_cn_data_hook()
+        (self.base / "cn-data/current").unlink()
+        (self.base / "cn-data/generations").mkdir()
+        self.execute("guard.sh", "--once", expected=0)
+        self.assertEqual((self.root / "cn-hook").read_text().splitlines(), ["1 audit-runtime"])
+
     def test_cn_data_hook_waits_for_interrupted_dns_transaction_reconciliation(self):
         self.install_cn_data_hook()
         self.make_transaction(switching=True)
@@ -776,6 +784,43 @@ done''')
         self.assertFalse(self.calls("diversion-dns-c"))
         self.assertEqual((self.root / "policy-actions").read_text().splitlines(),
                          ["enable-rescue"] * 3)
+
+    def test_policy_generation_without_markers_cannot_bypass_guard_verification(self):
+        self.activate_normal_service()
+        self.install_policy_hook(result=1)
+        (self.base / "cn-policy/enabled").unlink()
+        (self.base / "cn-policy/generations").mkdir()
+        self.execute("guard.sh", "--once", expected=0)
+        self.assertEqual((self.root / "policy-hook").read_text().splitlines(), ["1 audit-runtime"])
+        self.assertEqual((self.root / "policy-actions").read_text().splitlines(), ["enable-rescue"])
+        self.assertFalse(self.calls("diversion-dns-c"))
+
+    def test_recovery_rejects_bad_managed_policy_before_transaction_or_c_start(self):
+        self.install_policy_hook(result=1)
+        self.execute("recover.sh", "--automatic", expected=1)
+        self.assertFalse((self.base / "recovering").exists())
+        self.assertFalse(self.calls("diversion-dns-c"))
+        self.assertFalse(self.calls("dnsmasq"))
+        self.assertEqual((self.root / "policy-hook").read_text().splitlines(), ["1 audit-runtime"])
+        self.assert_original_dns()
+
+    def test_recovery_missing_policy_verifier_keeps_fallback_unchanged(self):
+        self.install_policy_hook()
+        (self.base / "cn-policy.sh").unlink()
+        self.execute("recover.sh", "--automatic", expected=1)
+        self.assertFalse((self.base / "recovering").exists())
+        self.assertFalse(self.calls("diversion-dns-c"))
+        self.assert_original_dns()
+
+    def test_recovery_checks_managed_policy_before_creating_dns_transaction(self):
+        self.install_policy_hook()
+        script = self.base / "cn-policy.sh"
+        script.write_text(script.read_text().replace(
+            'exit 0', '[ ! -d "$DIVERSION_DNS_BASE/recovering" ] || exit 75\nexit 0'))
+        self.execute("recover.sh", "--automatic", expected=0)
+        self.assertTrue(self.state()["c_running"])
+        self.assertFalse((self.base / "recovering").exists())
+        self.assertEqual((self.root / "policy-hook").read_text().splitlines(), ["1 audit-runtime"])
 
     def test_managed_policy_is_not_applied_during_dns_reconciliation(self):
         self.install_policy_hook(result=1)

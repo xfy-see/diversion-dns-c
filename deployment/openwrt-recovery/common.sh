@@ -30,6 +30,32 @@ fi
 log() { logger -t diversion-dns-c "$*"; }
 probe() { lua "$base/dns-probe.lua" "$@" >/dev/null 2>&1; }
 
+# Missing marker(s) must not turn an existing managed generation into an
+# unmanaged policy. This also fails closed on partial/failed policy adoption.
+managed_cn_data_enabled() {
+ [ -e "$base/cn-data/enabled" ] || [ -L "$base/cn-data/enabled" ] ||
+ [ -e "$base/cn-data/current" ] || [ -L "$base/cn-data/current" ] ||
+ [ -d "$base/cn-data/generations" ] ||
+ [ -e "$base/cn-data/pending" ] || [ -L "$base/cn-data/pending" ] ||
+ [ -e "$base/cn-data/repair-pending" ] || [ -L "$base/cn-data/repair-pending" ]
+}
+managed_policy_enabled() {
+ [ -e "$base/cn-policy/enabled" ] || [ -L "$base/cn-policy/enabled" ] ||
+ [ -e "$base/cn-policy/current" ] || [ -L "$base/cn-policy/current" ] ||
+ [ -d "$base/cn-policy/generations" ]
+}
+verify_managed_policy() {
+ managed_policy_enabled || return 0
+ if [ ! -x "$base/cn-policy.sh" ]; then
+  log "CRITICAL: managed policy verifier missing; refusing resolver activation"
+  return 1
+ fi
+ DIVERSION_CN_DEPLOY_LOCK_HELD=1 "$base/cn-policy.sh" audit-runtime || {
+  log "CRITICAL: managed policy unverified; refusing resolver activation"
+  return 1
+ }
+}
+
 read_state() {
  recovery_failures=0; recovery_next=0; recovery_stable=0
  recovery_boot=$(boot_id)

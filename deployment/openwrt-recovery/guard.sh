@@ -35,15 +35,16 @@ while [ -f "$base/active" ]; do
  # The data wrapper takes its own lock second. Never overlap a durable DNS
  # switchover, including an interrupted one which must be reconciled first.
  # A data repair failure is an alert, not a reason to stop CN-site learning.
- if [ ! -d "$base/recovering" ] && [ -x "$base/cn-data.sh" ] &&
-    { [ -f "$base/cn-data/enabled" ] || [ -L "$base/cn-data/current" ] || [ -f "$base/cn-data/pending" ] || [ -f "$base/cn-data/repair-pending" ]; }; then
-  DIVERSION_CN_DEPLOY_LOCK_HELD=1 "$base/cn-data.sh" audit-runtime ||
-   log "CRITICAL: CN data audit/repair failed; keeping DNS service available"
+ if [ ! -d "$base/recovering" ] && managed_cn_data_enabled; then
+  if [ ! -x "$base/cn-data.sh" ] ||
+     ! DIVERSION_CN_DEPLOY_LOCK_HELD=1 "$base/cn-data.sh" audit-runtime; then
+   log "CRITICAL: CN data verifier missing or repair failed; keeping DNS service available"
+  fi
  fi
  healthy=1
  if [ ! -d "$base/recovering" ]; then
   policy_managed=0
-  if [ -L "$base/cn-policy/current" ] || [ -f "$base/cn-policy/enabled" ]; then
+  if managed_policy_enabled; then
    policy_managed=1
    if [ ! -x "$base/cn-policy.sh" ] ||
       ! DIVERSION_CN_DEPLOY_LOCK_HELD=1 "$base/cn-policy.sh" audit-runtime; then healthy=0; fi

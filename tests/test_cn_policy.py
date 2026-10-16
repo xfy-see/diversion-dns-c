@@ -216,11 +216,13 @@ class PolicyFixture(unittest.TestCase):
                 self.run_script("seed", expected=1)
                 self.assertFalse((self.base / "cn-policy/current").exists())
 
-    def test_dns_recovery_transaction_prevents_policy_mutation(self):
+    def test_policy_audit_can_repair_during_dns_transaction_but_seed_is_held(self):
         self.run_script("seed")
         (self.base / "recovering").mkdir()
-        self.run_script("audit-runtime", "--repair", expected=75)
-        self.assertEqual(self.state()["applied"], 0)
+        self.run_script("audit-runtime", "--repair")
+        self.assertEqual(self.state()["applied"], 1)
+        self.run_script("seed", "--replace", expected=75)
+        self.assertEqual(self.state()["applied"], 1)
 
     def test_changed_table_binding_refuses_snapshot(self):
         self.run_script("seed")

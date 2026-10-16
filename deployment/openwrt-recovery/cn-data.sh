@@ -14,9 +14,13 @@ if [ "${DIVERSION_CN_DEPLOY_LOCK_HELD:-0}" != 1 ]; then
  exec 9>"$lock"
  flock 9
 fi
-mkdir -p "$store/generations"
-exec 7>"$store/lock"
-flock 7
+# Startup verification can run recursively from reload_cn -> init while this
+# process owns data lock 7. It is read-only and serialized by deployment lock 9.
+if [ "${1:-}" != check-start ]; then
+ mkdir -p "$store/generations"
+ exec 7>"$store/lock"
+ flock 7
+fi
 say() { printf '%s\n' "$*"; }
 log() { logger -t diversion-cn-data "$*"; }
 valid_id() { case "$1" in ''|*[!0-9a-f]*) return 1;; esac; [ "${#1}" -eq 64 ]; }
@@ -55,8 +59,25 @@ reload_cn() {
   log "CN files repaired/updated; resolver restart deferred while DNS is held degraded"
   return 0
  fi
+ # The legacy init applies policy before starting C. Validate managed policy
+ # BEFORE restart stops the current resolver, including standalone activate and
+ # journal recovery calls. This process already owns the deployment lock; pass
+ # it through rather than recursively acquiring a second lock descriptor.
+ policy_store="$base/cn-policy"
+ if [ -e "$policy_store/enabled" ] || [ -L "$policy_store/enabled" ] ||
+    [ -e "$policy_store/current" ] || [ -L "$policy_store/current" ] ||
+    [ -d "$policy_store/generations" ]; then
+  if [ ! -x "$base/cn-policy.sh" ]; then
+   log "CRITICAL: managed policy verifier missing; refusing C restart"
+   return 1
+  fi
+  if ! DIVERSION_CN_DEPLOY_LOCK_HELD=1 "$base/cn-policy.sh" audit-runtime; then
+   log "CRITICAL: managed policy unverified; keeping C running and CN transaction for retry"
+   return 1
+  fi
+ fi
  # The custom probe is only allowed in an isolated test layout.
- "$initdir/diversion-dns-c" restart || return 1
+ DIVERSION_CN_DEPLOY_LOCK_HELD=1 "$initdir/diversion-dns-c" restart || return 1
  if [ "$base" != /etc/diversion-dns-c ] && [ -n "${DIVERSION_CN_TEST_PROBE:-}" ]; then
   "$DIVERSION_CN_TEST_PROBE"; return $?
  fi
@@ -186,6 +207,14 @@ audit() {
  esac
 }
 case "${1:-}" in
+ check-start)
+  [ "$#" -eq 1 ] || exit 2
+  startup_id=$(current_id) || exit 1
+  verified "$startup_id" || exit 1
+  for file in cn-ip.txt cn-site.txt sets.nft; do
+   [ "$(readlink "$base/$file" 2>/dev/null || true)" = "cn-data/current/$file" ] || exit 1
+  done
+  printf '%s\n' 'CN startup data verified';;
  stage) shift; stage "$@";;
  seed)
   shift; [ "$#" -eq 2 ] || exit 2
@@ -242,5 +271,5 @@ case "${1:-}" in
    [ "$(wc -c < "$tmp/$kind")" -le 8388608 ] || exit 1
   done
   stage "$tmp/ip" "$tmp/site" "$3" "$4";;
- *) say 'usage: cn-data.sh seed IP_SHA SITE_SHA | stage IP SITE IP_SHA SITE_SHA | activate ID | rollback | reconcile | audit-runtime [--force] | fetch HTTPS_IP HTTPS_SITE IP_SHA SITE_SHA' >&2; exit 2;;
+ *) say 'usage: cn-data.sh check-start | seed IP_SHA SITE_SHA | stage IP SITE IP_SHA SITE_SHA | activate ID | rollback | reconcile | audit-runtime [--force] | fetch HTTPS_IP HTTPS_SITE IP_SHA SITE_SHA' >&2; exit 2;;
 esac

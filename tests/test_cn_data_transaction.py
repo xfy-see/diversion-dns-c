@@ -16,7 +16,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "deployment/openwrt-recovery/cn-data.sh"
 DOUBLE = r'''
-import fcntl, hashlib, json, os, pathlib, shutil, sys
+import fcntl, hashlib, json, os, pathlib, shutil, subprocess, sys
 r=pathlib.Path(os.environ['CN_TX_TEST'])
 n=pathlib.Path(sys.argv[0]).name
 a=sys.argv[1:]
@@ -36,7 +36,26 @@ elif n=='mv':
  os.replace(a[0],a[1])
 elif n=='resolver':
  sys.exit(1 if control.get('check_fail') else 0)
+elif n=='cn-policy.sh':
+ if os.environ.get('DIVERSION_CN_DEPLOY_LOCK_HELD') != '1': sys.exit(97)
+ # The child must receive the already-held deployment lock. Opening a new file
+ # description must observe it locked; attempting another blocking flock would
+ # deadlock a real verifier without the explicit handoff above.
+ with open(os.environ['DIVERSION_DNS_LOCK'], 'a') as lock:
+  try:
+   fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+  except BlockingIOError:
+   pass
+  else:
+   sys.exit(98)
+ sys.exit(1 if control.get('policy_fail') else 0)
 elif n=='diversion-dns-c':
+ if control.get('init_check_start'):
+  try:
+   checked=subprocess.run(['sh', os.environ['CN_TX_SOURCE'], 'check-start'], env=os.environ,
+                          close_fds=False, capture_output=True, timeout=3)
+  except subprocess.TimeoutExpired: sys.exit(99)
+  if checked.returncode: sys.exit(checked.returncode)
  generation=os.readlink(r/'base/cn-data/current')
  with (r/'restarts').open('a') as f: f.write(generation+'\n')
  sys.exit(1 if control.get('restart_fail')==generation else 0)
@@ -91,7 +110,7 @@ class CNTransactionTest(unittest.TestCase):
         (self.base / "config.conf").write_text(f"cn_domain_file={self.base}/cn-site.txt\n")
         (self.base / "unrelated").write_text("must survive")
         self.env = dict(os.environ, PATH=str(self.bin)+os.pathsep+os.environ["PATH"],
-                        CN_TX_TEST=str(self.root), DIVERSION_DNS_BASE=str(self.base),
+                        CN_TX_TEST=str(self.root), CN_TX_SOURCE=str(SCRIPT), DIVERSION_DNS_BASE=str(self.base),
                         DIVERSION_DNS_INITDIR=str(self.init), DIVERSION_DNS_LOCK=str(self.root / "lock"),
                         DIVERSION_DNS_RUN=str(self.root / "run"), DIVERSION_CN_BINARY=str(self.bin / "resolver"),
                         DIVERSION_CN_TEST_PROBE=str(self.bin / "probe"), DIVERSION_CN_TEST_UPTIME=str(self.root / "uptime"))
@@ -101,7 +120,7 @@ class CNTransactionTest(unittest.TestCase):
         p.chmod(0o755)
 
     def call(self, *args, ok=True):
-        p = subprocess.run(["sh", str(SCRIPT), *args], env=self.env, text=True, capture_output=True)
+        p = subprocess.run(["sh", str(SCRIPT), *args], env=self.env, text=True, capture_output=True, timeout=15)
         if ok:
             self.assertEqual(p.returncode, 0, p.stdout+p.stderr)
         else:
@@ -234,6 +253,109 @@ class CNTransactionTest(unittest.TestCase):
         requested = self.call("stage", str(ip), str(site), self.sha(ip), self.sha(site)).stdout.strip()
         self.call("activate", requested)
         self.assertEqual(self.active(), requested)
+
+    def managed_policy(self):
+        store = self.base / "cn-policy"
+        (store / "generations").mkdir(parents=True)
+        (store / "enabled").touch()
+        (store / "current").symlink_to("generations/approved")
+        self.double(self.base / "cn-policy.sh")
+
+    def test_managed_policy_is_checked_with_lock_handoff_before_restart(self):
+        self.seed()
+        new = self.stage()
+        self.managed_policy()
+        self.call("activate", new)
+        calls = [json.loads(line) for line in (self.root / "calls").read_text().splitlines()]
+        policy = next(i for i, call in enumerate(calls) if call[0] == "cn-policy.sh")
+        restart = next(i for i, call in enumerate(calls) if call[0] == "diversion-dns-c")
+        self.assertLess(policy, restart)
+        self.assertEqual(calls[policy], ["cn-policy.sh", "audit-runtime"])
+
+    def test_untrusted_policy_blocks_candidate_and_rollback_restart_until_repaired(self):
+        old = self.seed()
+        new = self.stage()
+        self.managed_policy()
+        self.control(policy_fail=True)
+        self.call("activate", new, ok=False)
+        self.assertEqual(self.active(), old)
+        self.assertFalse((self.root / "restarts").exists())
+        self.assertTrue((self.base / "cn-data/pending").exists())
+        self.control()
+        self.call("reconcile")
+        self.assertFalse((self.base / "cn-data/pending").exists())
+        self.assertEqual((self.root / "restarts").read_text().splitlines(), ["generations/"+old])
+
+    def test_simultaneous_cn_file_and_policy_damage_keeps_c_until_verified_repair(self):
+        old = self.seed()
+        self.managed_policy()
+        site = self.base / "cn-site.txt"
+        site.unlink(); site.write_text("")
+        self.control(policy_fail=True)
+        self.call("audit-runtime", "--force", ok=False)
+        self.assertFalse((self.root / "restarts").exists())
+        self.assertTrue((self.base / "cn-data/repair-pending").exists())
+        self.control()
+        self.call("audit-runtime", "--force")
+        self.assertFalse((self.base / "cn-data/repair-pending").exists())
+        self.assertEqual((self.root / "restarts").read_text().splitlines(), ["generations/"+old])
+
+    def test_missing_managed_policy_script_does_not_fall_back_to_unchecked_init(self):
+        self.seed()
+        new = self.stage()
+        self.managed_policy()
+        (self.base / "cn-policy.sh").unlink()
+        self.call("activate", new, ok=False)
+        self.assertFalse((self.root / "restarts").exists())
+        self.assertTrue((self.base / "cn-data/pending").exists())
+
+    def test_lost_policy_markers_do_not_bypass_existing_managed_generation(self):
+        self.seed()
+        new = self.stage()
+        self.managed_policy()
+        (self.base / "cn-policy/enabled").unlink()
+        (self.base / "cn-policy/current").unlink()
+        self.control(policy_fail=True)
+        self.call("activate", new, ok=False)
+        self.assertFalse((self.root / "restarts").exists())
+        self.assertTrue((self.base / "cn-data/pending").exists())
+
+    def test_readonly_start_check_needs_no_kernel_and_makes_no_mutations(self):
+        self.seed()
+        (self.root / "kernel").unlink()
+        before = {str(p.relative_to(self.base)): (p.is_symlink(), p.read_bytes())
+                  for p in self.base.rglob("*") if p.is_file()}
+        self.call("check-start")
+        after = {str(p.relative_to(self.base)): (p.is_symlink(), p.read_bytes())
+                 for p in self.base.rglob("*") if p.is_file()}
+        self.assertEqual(after, before)
+        self.assertFalse((self.root / "kernel").exists())
+        self.assertFalse((self.root / "restarts").exists())
+
+    def test_start_check_rejects_corrupt_payload_and_broken_pointer_without_repair(self):
+        self.seed()
+        site = self.base / "cn-site.txt"
+        site.unlink(); site.write_text("")
+        self.call("check-start", ok=False)
+        self.assertFalse(site.is_symlink())
+        self.assertFalse((self.root / "restarts").exists())
+        self.assertFalse((self.base / "cn-data/repair-pending").exists())
+
+    def test_start_check_allows_existing_dns_recovery_transaction(self):
+        self.seed()
+        (self.base / "recovering").mkdir()
+        (self.base / "degraded").touch()
+        self.call("check-start")
+        self.assertTrue((self.base / "recovering").exists())
+
+    def test_nested_init_start_check_inherits_deploy_lock_without_data_lock_deadlock(self):
+        self.seed()
+        new = self.stage()
+        self.managed_policy()
+        self.control(init_check_start=True)
+        self.call("activate", new)
+        self.assertEqual(self.active(), new)
+        self.assertEqual((self.root / "restarts").read_text().splitlines(), ["generations/"+new])
 
     def test_manual_fallback_is_not_restarted_by_data_update(self):
         self.seed()

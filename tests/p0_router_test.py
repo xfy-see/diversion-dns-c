@@ -88,7 +88,7 @@ def load_config(path):
     root = Path(source["path"]).resolve()
     # The supplied source may be an artifact extraction without .git. Its
     # authenticated receipt must bind every script executed on the target.
-    names = ["common.sh", "guard.sh", "recover.sh", "rollback.sh", "dns-probe.lua", "cn-data.lua", "cn-data.sh", "cn-policy.sh"]
+    names = ["common.sh", "guard.sh", "recover.sh", "rollback.sh", "dns-probe.lua", "cn-data.lua", "cn-data.sh", "cn-policy.sh", "diversion-dns-c.init"]
     scripts = {}
     for name in names:
         rel = "deployment/openwrt-recovery/" + name
@@ -402,7 +402,9 @@ foreign_upstream=$upstream
 cache_size=0
 EOF
  fi
- sh -c 'trap "" HUP; echo $$ > "$1"; exec "$2" start -c "$3" --cpu 1' sh "$R/$role.pid" "$R/app" "$cfg" > "$R/$role.log" 2>&1 < /dev/null &
+ # procd launches services independently; emulate that descriptor boundary so
+ # the fixture daemon cannot inherit and retain a recovery/data flock.
+ sh -c 'trap "" HUP; exec 7>&- 9>&-; echo $$ > "$1"; exec "$2" start -c "$3" --cpu 1' sh "$R/$role.pid" "$R/app" "$cfg" > "$R/$role.log" 2>&1 < /dev/null &
  sleep .2
  p=$(cat "$R/$role.pid"); kill -0 "$p"
 }
@@ -458,6 +460,40 @@ for role in guard front app; do
   if kill -0 "$p" 2>/dev/null; then
    case "$(tr '\\0' ' ' < /proc/$p/cmdline)" in *"$R/"*) kill "$p";; *) exit 92;; esac
   fi
+ fi
+done
+# A timed-out SSH invocation may leave a recovery/init child behind after its
+# tracked guard exits. Stop only commands naming this exact owned directory;
+# never use a global process name or kill another test's resolver.
+owned_command() {
+ case "$1" in
+  *"$R/base/guard.sh"*|*"$R/base/recover.sh"*|*"$R/base/rollback.sh"*|*"$R/base/cn-data.sh"*|*"$R/base/cn-data.lua"*|*"$R/base/cn-policy.sh"*|*"$R/init.d/"*|"$R/app "*) return 0;;
+  *) return 1;;
+ esac
+}
+owned_pids=
+for file in /proc/[0-9]*/cmdline; do
+ p=${file#/proc/}; p=${p%%/*}
+ [ "$p" != "$$" ] && [ "$p" != "$PPID" ] || continue
+ cmd=$(tr '\\0' ' ' < "$file" 2>/dev/null) || continue
+ if owned_command "$cmd"; then
+  printf 'TERM %%s %%s\\n' "$p" "$cmd" >> "$R/cleanup-processes.log"
+  kill "$p" 2>/dev/null || true
+  owned_pids="$owned_pids $p"
+ fi
+done
+sleep 1
+for p in $owned_pids; do
+ if [ -f "/proc/$p/cmdline" ]; then
+  cmd=$(tr '\\0' ' ' < "/proc/$p/cmdline" 2>/dev/null) || continue
+  if owned_command "$cmd"; then kill -KILL "$p" 2>/dev/null || true; fi
+ fi
+done
+sleep .2
+for p in $owned_pids; do
+ if [ -f "/proc/$p/cmdline" ]; then
+  cmd=$(tr '\\0' ' ' < "/proc/$p/cmdline" 2>/dev/null) || continue
+  owned_command "$cmd" && exit 96
  fi
 done
 if [ -f "$R/full-group" ]; then
@@ -574,12 +610,20 @@ date > "$R/cleaned"
             while time.monotonic() < deadline:
                 # Fallback probe requires localhost; fixture answers it even
                 # during CN failure once fallback action begins below.
-                state = self.rem("test -f " + self.base + "/degraded", expected=None)
+                state = self.rem("test -f " + self.base + "/degraded && test \"$(cat " + self.base
+                                 + "/recovery-auto 2>/dev/null || true)\" = service-health", expected=None)
                 if state["returncode"] == 0:
                     break
                 time.sleep(1)
             self.rem("test -f " + self.base + "/degraded; test \"$(cat " + self.base + "/recovery-auto)\" = service-health")
             self.rem("p=$(cat " + self.root + "/guard.pid); kill \"$p\"; rm " + self.root + "/guard.pid")
+            deadline = time.monotonic() + 10
+            while True:
+                ready = self.rem("exec 8>" + self.root + "/deploy.lock; flock -n 8", expected=None)
+                if ready["returncode"] == 0:
+                    break
+                require(time.monotonic() < deadline, "fallback child retained deployment lock")
+                time.sleep(.2)
         with self.case("cn-recovery-succeeds-while-foreign-is-still-blackholed"):
             self.fixture.cn_ok = True
             self.fixture.foreign_ok = False
@@ -625,6 +669,54 @@ date > "$R/cleaned"
             require(result["returncode"] != 0, "modified apply helper executed")
             self.rem("cp " + self.root + "/saved-helper " + self.base + "/apply-policy.sh")
             self.script("cn-policy.sh", "audit-runtime")
+        for item in ("apply-policy.sh", "cn-policy/current/policy.nft"):
+            with self.case("cn-repair-refuses-unsafe-policy-" + item.split("/")[-1]) as row:
+                pid = self.rem("cat " + self.root + "/app.pid")["stdout"].strip()
+                calls = self.rem("cat " + self.root + "/service-calls")["stdout"]
+                self.rem("cp " + self.base + "/" + item + " " + self.root + "/saved-policy-component; "
+                         "printf '%s\\n' '# corrupt' >> " + self.base + "/" + item + "; "
+                         "rm " + self.base + "/cn-site.txt; : > " + self.base + "/cn-site.txt")
+                result = self.script("cn-data.sh", "audit-runtime", "--force", expected=None, timeout=90)
+                require(result["returncode"] != 0, "CN repair bypassed managed policy rejection")
+                require(self.rem("cat " + self.root + "/app.pid")["stdout"].strip() == pid, "unsafe policy triggered C restart")
+                require(self.rem("cat " + self.root + "/service-calls")["stdout"] == calls, "unsafe policy invoked init service")
+                row["cn_during_policy_fault"] = self.assert_cn("unsafe-policy-" + str(len(self.rows)))
+                self.rem("cp " + self.root + "/saved-policy-component " + self.base + "/" + item)
+                self.audit()
+                self.script("cn-policy.sh", "audit-runtime")
+                self.assert_cn("safe-policy-" + str(len(self.rows)))
+
+    def init_cases(self):
+        probe = ('. "$DIVERSION_DNS_BASE/diversion-dns-c.init"; '
+                 'procd_open_instance() { printf "open %s\\n" "$*" >> "$P0_ROOT/procd-calls"; }; '
+                 'procd_set_param() { printf "param %s\\n" "$*" >> "$P0_ROOT/procd-calls"; }; '
+                 'procd_close_instance() { printf "close\\n" >> "$P0_ROOT/procd-calls"; }; '
+                 'start_service')
+        with self.case("real-init-managed-start-does-not-reapply-healthy-policy"):
+            calls = self.rem("cat " + self.root + "/policy-calls")["stdout"]
+            self.shell(probe)
+            require(calls == self.rem("cat " + self.root + "/policy-calls")["stdout"], "init reapplied healthy managed policy")
+            self.rem("grep -q '^param command /usr/sbin/diversion-dns-c ' " + self.root + "/procd-calls")
+        with self.case("real-init-repairs-empty-chain-with-one-approved-apply"):
+            calls = self.rem("cat " + self.root + "/policy-calls")["stdout"].splitlines().count("apply-policy.sh")
+            self.rem("nft flush chain inet " + self.table + " classify")
+            self.shell(probe)
+            after = self.rem("cat " + self.root + "/policy-calls")["stdout"].splitlines().count("apply-policy.sh")
+            require(after == calls + 1, "init bypassed/repeated approved policy apply")
+        with self.case("real-init-refuses-untrusted-helper-before-procd-dispatch"):
+            calls = self.rem("cat " + self.root + "/procd-calls")["stdout"]
+            self.rem("cp " + self.base + "/apply-policy.sh " + self.root + "/saved-init-helper; "
+                     "printf '%s\\n' '# corrupt' >> " + self.base + "/apply-policy.sh")
+            result = self.shell(probe, expected=None)
+            require(result["returncode"] != 0, "init accepted modified policy helper")
+            require(calls == self.rem("cat " + self.root + "/procd-calls")["stdout"], "unsafe init reached procd dispatch")
+            self.rem("cp " + self.root + "/saved-init-helper " + self.base + "/apply-policy.sh")
+        with self.case("real-init-managed-recovery-transaction-allows-safe-start"):
+            self.rem("mkdir " + self.base + "/recovering; touch " + self.base + "/degraded")
+            calls = self.rem("cat " + self.root + "/procd-calls")["stdout"]
+            self.shell(probe)
+            require(calls != self.rem("cat " + self.root + "/procd-calls")["stdout"], "safe transactional init failed to dispatch")
+            self.rem("rmdir " + self.base + "/recovering; rm " + self.base + "/degraded")
 
     def full_size_cases(self):
         data = self.cfg.get("full_datasets")
@@ -722,6 +814,7 @@ date > "$R/cleaned"
                 self.prepare()
                 self.data_cases()
                 self.policy_cases()
+                self.init_cases()
                 self.guard_cases()
                 self.full_size_cases()
         except Exception as exc:
@@ -734,7 +827,7 @@ date > "$R/cleaned"
         result = dict(schema_version=1, status=status, error=error, cases=self.rows, cleanup=cleanup,
                       target=self.cfg["target"]["address"], token=self.token, verification=self.cfg["_verification"],
                       limitations=["No production DNS/UCI/routing or WAN/WG fault injection.",
-                                   "Service/UCI adapters are fixtures; UDP DNS, C processes and nft kernel writes are real.",
+                                   "Service/UCI adapters and procd dispatch callbacks are fixtures; shipped init control flow, UDP DNS, C processes and nft kernel writes are real.",
                                    "Interruption test reconstructs durable transaction state; no device reboot or power cut.",
                                    "A/AAAA use IPv4 DNS transport; no website or performance acceptance."])
         save(self.output / "result.json", result)
