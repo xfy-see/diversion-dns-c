@@ -3,6 +3,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
@@ -11,6 +12,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "deployment/openwrt-recovery/cn-policy.sh"
+BUSYBOX = shutil.which("busybox")
 CHAINS = ("split", "classify", "guard", "router_output", "router_guard", "dns_redirect")
 DOUBLE = r'''
 import fcntl, hashlib, json, os, pathlib, sys
@@ -59,6 +61,8 @@ else:
 
 
 class PolicyFixture(unittest.TestCase):
+    shell = ("/bin/sh",)
+
     def setUp(self):
         temp = tempfile.TemporaryDirectory(prefix="cn-policy-test-")
         self.addCleanup(temp.cleanup)
@@ -97,7 +101,7 @@ class PolicyFixture(unittest.TestCase):
         (self.root / "state.json").write_text(json.dumps(state))
 
     def run_script(self, *args, expected=0):
-        result = subprocess.run(["/bin/sh", str(self.base / "cn-policy.sh"), *args],
+        result = subprocess.run([*self.shell, str(self.base / "cn-policy.sh"), *args],
                                 env=self.env, text=True, capture_output=True, timeout=15)
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         return result
@@ -115,9 +119,14 @@ class PolicyFixture(unittest.TestCase):
         self.assertTrue(all(c[1:3] == ["-s", "-nn"] for c in calls if c[0] == "nft"))
 
     def test_existing_base_chain_syntax_can_be_adopted(self):
-        source = self.policy.replace(
-            "add chain inet ddns_p0_policy classify\n",
-            "add chain inet ddns_p0_policy classify { type filter hook prerouting priority -130; policy accept; }\n")
+        source = self.policy
+        for chain, declaration in (
+                ("classify", "type filter hook prerouting priority -130; policy accept;"),
+                ("router_output", "type route hook output priority 0; policy accept;"),
+                ("dns_redirect", "type nat hook prerouting priority 100; policy drop;")):
+            source = source.replace(
+                "add chain inet ddns_p0_policy " + chain + "\n",
+                "add chain inet ddns_p0_policy " + chain + " { " + declaration + " }\n")
         (self.base / "policy.nft").write_text(source)
         self.run_script("seed")
         self.run_script("audit-runtime")
@@ -210,7 +219,10 @@ class PolicyFixture(unittest.TestCase):
                        "add chain inet ddns_p0_policy unrelated\n",
                        "add rule inet ddns_p0_policy split counter return; flush ruleset\n",
                        "add chain inet ddns_p0_policy guard { type filter hook forward priority 0; }; flush ruleset\n",
-                       "add chain inet ddns_p0_policy guard { type filter hook forward priority 0; policy accept; }; delete table inet other; add chain inet other x {}\n"):
+                       "add chain inet ddns_p0_policy guard { type filter hook forward priority 0; policy accept; }; delete table inet other; add chain inet other x {}\n",
+                       "add chain inet ddns_p0_policy guard { type filter hook forward priority 0; policy accept;\n",
+                       "add chain inet ddns_p0_policy guard { type filter hook forward priority 0; policy accept; }}\n",
+                       "add chain inet ddns_p0_policy guard { type filter hook forward priority 0; policy accept; } unexpected\n"):
             with self.subTest(source=source):
                 (self.base / "policy.nft").write_text(source)
                 self.run_script("seed", expected=1)
@@ -229,6 +241,28 @@ class PolicyFixture(unittest.TestCase):
         self.env["DIVERSION_DNS_POLICY_TABLE"] = "unrelated"
         self.run_script("audit-runtime", expected=1)
         self.assertEqual(self.state()["applied"], 0)
+
+
+@unittest.skipUnless(BUSYBOX, "BusyBox absent locally; Linux suite CI installs it")
+class BusyBoxPolicyFixture(PolicyFixture):
+    """Run every policy transaction test with actual BusyBox ash and awk."""
+    shell = (BUSYBOX, "ash")
+
+    def setUp(self):
+        super().setUp()
+        wrapper = self.bin / "awk"
+        wrapper.write_text("#!/bin/sh\nexec " + shlex.quote(BUSYBOX) + " awk \"$@\"\n")
+        wrapper.chmod(0o755)
+
+    def test_all_recovery_shell_files_parse_with_busybox_ash(self):
+        directory = SCRIPT.parent
+        for path in sorted(directory.iterdir()):
+            if path.suffix not in (".sh", ".init"):
+                continue
+            with self.subTest(script=path.name):
+                result = subprocess.run([BUSYBOX, "ash", "-n", str(path)],
+                                        text=True, capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

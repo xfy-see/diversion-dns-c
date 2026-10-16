@@ -60,7 +60,9 @@ source_scope() {
   $2 == "rule" && index($0, ";") { exit 1 }
   $2 == "chain" && index($0, "{") {
    tail=substr($0, index($0, "{"))
-   if (tail !~ /^{[[:space:]]*type (filter|route|nat) hook (prerouting|input|forward|output|postrouting|ingress) priority -?[0-9]+;[[:space:]]*policy (accept|drop);[[:space:]]*}[[:space:]]*$/) exit 1
+   # BusyBox awk rejects bare interval braces even when other awk variants
+   # accept them as literals. Bracket expressions are portable ERE literals.
+   if (tail !~ /^[{][[:space:]]*type (filter|route|nat) hook (prerouting|input|forward|output|postrouting|ingress) priority -?[0-9]+;[[:space:]]*policy (accept|drop);[[:space:]]*[}][[:space:]]*$/) exit 1
   }
   $2 == "chain" && !index($0, "{") && NF != 5 { exit 1 }
   { n++ } END { if (!n) exit 1 }
