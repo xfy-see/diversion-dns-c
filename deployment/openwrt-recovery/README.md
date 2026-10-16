@@ -1,77 +1,78 @@
-# OpenWrt DNS 降级后的自动恢复
+# OpenWrt 国内优先的 DNS 与分流保护
 
-这是针对主路由 `192.168.100.1` 现有定制部署的脚本覆盖层，依赖 `/etc/diversion-dns-c/`、本机 C DNS 的 `15363` 端口，以及现有策略和守护服务。它不是通用 APK 安装器，不更新 C 可执行文件，也不适用于未经核对的其他安装布局。
+此目录是 `.1` 现有定制部署的脚本覆盖层，依赖 `/etc/diversion-dns-c/`、本机 C DNS 的 `15363` 端口及现有策略服务。它不是通用 APK 安装器，不更新 C 可执行文件，不适用于未经核对的其他布局。
 
-保留现有 `dns-mode.sh`、`apply-policy.sh`、`enable-rescue.sh`、`refresh-monitor.sh` 和 DDNS 配置。降级仍由已有 `fallback_dns` 切换到 ISP DNS；本改动补充探测、自动回切及中断恢复，不增加境外流量自动绕过隧道走 WAN 的规则。
+目标是优先维持国内 DNS、CN-IP 直连和 CN-site 学习。境外故障独立记录和探测，不停止国内服务，不增加境外流量自动绕过隧道走 WAN 的规则。
 
-## 文件与安装位置
+## 文件与依赖
 
-| 仓库文件 | 设备安装位置 |
-| --- | --- |
-| `common.sh` | `/etc/diversion-dns-c/common.sh` |
-| `guard.sh` | `/etc/diversion-dns-c/guard.sh` |
-| `recover.sh` | `/etc/diversion-dns-c/recover.sh` |
-| `rollback.sh` | `/etc/diversion-dns-c/rollback.sh` |
-| `dns-probe.lua` | `/etc/diversion-dns-c/dns-probe.lua` |
-| `diversion-dns-c.init` | `/etc/init.d/diversion-dns-c` |
+`common.sh`、`guard.sh`、`recover.sh`、`rollback.sh`、`dns-probe.lua`、`cn-data.sh`、`cn-data.lua`、`cn-policy.sh` 放入 `/etc/diversion-dns-c/`；已有 `diversion-dns-c.init` 对应 `/etc/init.d/diversion-dns-c`。保留原 `dns-mode.sh`、`apply-policy.sh`、`enable-rescue.sh`、`refresh-monitor.sh`、独立直连名单及 DDNS 配置。
 
-需要 OpenWrt 的 `procd`、UCI、`flock`、`nft`、Lua 和 `nixio`。既有守护服务应继续调用上述 `guard.sh`；部署前核对实际路径、配置、端口及依赖。
+运行需要 procd、UCI、flock、nft、Lua 5.1、sha256sum、BusyBox mv 的 `-T`。DNS 探测依赖 nixio；名单引擎不依赖 nixio/LuCI/Python。端口、表名及快速计时的测试覆盖只用于隔离布局，生产仍使用既定端口和表。
 
-## 自动恢复条件与流程
+## 国内与境外故障隔离
 
-只有服务健康检查触发的降级才会写入 `recovery-auto`，内容必须为 `service-health`，并且策略检查正常时才自动尝试恢复。手工降级、来源不明的旧 `degraded` 标记，或其他内容的授权文件，都保持降级，避免覆盖管理员选择。
+正常守护分别检查本地 DNS、国内新鲜 A/AAAA 与境外新鲜 A/AAAA。查询采用随机子域，防止缓存掩盖上游故障。
 
-1. 守护发现符合条件的降级后，先安排至少 120 秒的冷却期。正常轮询间隔为 20 秒，实际开始时间受轮询和探测耗时影响。
-2. 保持客户端 DNS 使用 ISP，启动 C DNS，在独立端口 `15363` 验证候选服务。
-3. 连续进行三轮国内、境外的 A / AAAA 查询，每轮间隔 10 秒。查询使用 `qq.com` 和 `example.com` 下的随机子域，避免缓存掩盖上游故障；安装的域名规则必须将两者分别归为国内、境外。
-4. 三轮都成功后，将 dnsmasq 转发改为 `127.0.0.1#15363`，缓存设为 0，再通过客户端入口 `53` 验证新鲜查询和固定域名正答案。固定域名分别是国内 `www.baidu.com` 和境外 `example.com`。
-5. 验证成功才清除降级和事务标记，写入 `recovered`；失败则恢复此前的 DNS 设置。后续重试间隔依次为 60、120、240、480、900 秒，最大 900 秒。持续健康 600 秒后重置失败次数，避免反复切换。
+- 仅境外失败：保留 C、dnsmasq 配置及国内 nft 学习，写入运行时 `foreign-degraded`。境外复测独立按 20、40、80、160、300 秒退避；恢复后清除状态。
+- 国内或本地 DNS 连续三轮失败：在策略可信且可用时沿用原 ISP DNS 降级。此时停止 C 的旧行为仍存在，完整的国内备用解析和学习兜底属于后续工作。
+- 从全局降级恢复：只要求 C 国内探测就绪、三轮国内 A/AAAA 及切换后的国内正答案成功，境外故障不再阻止国内服务恢复。切回后独立记录境外状态。
+- 人工/未知来源的降级保持，不被自动恢复覆盖。
 
-健康探测接受匹配查询的 `NOERROR` 或 `NXDOMAIN`，拒绝 `SERVFAIL`、超时及截断回答。最后的固定域名探测必须取得所请求类型的地址记录，仅有 CNAME 或空回答不算成功。启动就绪检查只确认进程能够响应，不能替代后续上游健康检查。
+首次自动恢复至少等待 120 秒；三轮间隔 10 秒。失败退避 60、120、240、480、900 秒，持续健康 600 秒后重置。正常轮询间隔为 20 秒，加上探测与修复耗时，不是严格的恢复时限。
 
-A / AAAA 均经本机 IPv4 DNS 传输查询。这验证两种记录类型，不证明 IPv6 DNS 传输、IPv6 隧道或真实网页连接可用。域名本身不再提供相应正答案时，会阻止自动回切，需要核对探测目标，不能据此直接判定整个服务故障。
+DNS 探测接受匹配查询的 NOERROR/NXDOMAIN，拒绝 SERVFAIL、超时和截断；最终国内固定域名必须有请求类型的地址。A/AAAA 均经 IPv4 DNS 传输，不证明 IPv6 DNS 传输或网页连接可用。域名不再提供相应记录时需要核对探测目标。
 
-## 中断与回退保护
+## CN 名单的验证、更新与回退
 
-`/etc/diversion-dns-c/recovering/` 是持久事务目录，保存切换前 dnsmasq 的 `server` 列表和 `cachesize`；`switching` 标记先于配置修改落盘。失败只恢复这两个设置，不导入整份旧 DHCP 配置，避免覆盖其他 DHCP 改动。
+`cn-data.lua` 校验真实文本、IPv4/IPv6 前缀、域名规则和校验和。它拒绝空文件、缺少末尾换行、非法/重复条目、缺少地址族、异常宽网段、关键样例丢失或错误分类。默认最低数量是 IPv4 1000、IPv6 100、域名 10000；相对上一代的数量/覆盖变化和替换比例限制为 20%。这些门槛是保守的异常检测，不证明全球地址归属绝对准确。
 
-恢复脚本、守护和降级脚本共用部署锁。异常退出或重启遗留事务时，init 允许 C 服务启动，守护跳过通常的启动等待，优先恢复原 DNS 配置。若备用 DNS 恢复不完整，则保留事务和 C 进程并记录 `CRITICAL`，下一轮继续修复，避免提前停止仍可能承接查询的 C 服务。
+既有 8 条正则保持允许；新增/修改正则、未知规则类型、新增单标签后缀须另行审核，不能通过放宽校验自动上线。其他自定义直连名单由原配置继续管理，不被 CN 数据更新覆盖。
 
-手工降级并禁止自动回切：
+初次采用前先核对现有名单的可信 SHA256、有效配置、实际内核集合及剩余空间：
 
 ```sh
-/etc/diversion-dns-c/rollback.sh
+/etc/diversion-dns-c/cn-data.sh seed IP_SHA256 SITE_SHA256
+/etc/diversion-dns-c/cn-policy.sh seed
 ```
 
-手工触发一次完整恢复验证：
+`seed` 建立独立已验证快照，将 `cn-ip.txt`、`cn-site.txt`、`sets.nft` 接到同一 generation 指针。原文件另存供撤回，另有一份独立已验证副本供首次更新前的损坏恢复。不得从已知损坏的数据初始化信任基线。
+
+更新分为两个动作：
 
 ```sh
-/etc/diversion-dns-c/recover.sh
+# 输出 generation ID；不会修改生效版本、内核集合或 DNS 服务。
+/etc/diversion-dns-c/cn-data.sh stage /tmp/candidate-ip /tmp/candidate-site IP_SHA256 SITE_SHA256
+# 验证成功后显式激活；失败自动回到上一代。
+/etc/diversion-dns-c/cn-data.sh activate GENERATION_ID
+# 撤回最近一次激活。
+/etc/diversion-dns-c/cn-data.sh rollback
 ```
 
-不要直接删除 `degraded` 或 `recovering` 来强制恢复，也不要为旧的未知原因降级补写 `service-health` 标记。手工恢复仍需通过相同的探测和最终验证。
+可使用 `fetch HTTPS_IP_URL HTTPS_SITE_URL IP_SHA256 SITE_SHA256` 下载并暂存候选，失败保留当前数据。摘要应来自受信任的发布记录；计算下载文件自身摘要只能检查传输/处理一致性，不能证明来源可信。本补丁不猜测数据源、不启用定时下载；定期来源和更新策略需另行配置。
 
-## 部署与脚本撤回
+激活前运行实际 C 的 `check`，随后通过单个 nft 事务替换自有 `cn4/cn6` 元素、切换 generation 指针、重启并验证国内 DNS。动态 `cnsite4/6` 和其他集合保持。内核、文件指针、进程并非一个跨系统原子事务，因此切换前持久记录 journal；失败/中断会重试恢复上一代。可能有 C 重启窗口，不承诺零丢包。
 
-先备份上述六个目标的内容、权限和原先是否存在，以及当前 UCI DNS 设置、守护配置、运行标记和文件哈希。保存独立的撤回脚本，并在变更前安排设备端定时撤回；验证成功后再取消。
+`pending` 保存未完成激活；`repair-pending` 保存未完成文件修复及 C 重载。恢复未成功前不删除 journal，避免下次看见文件正确却忘记重载内存规则。人工降级时仅修复数据，推迟启动 C；与 DNS 切换事务互斥。
 
-在设备上暂存新文件，检查 shell 语法、Lua 可加载性和依赖；暂停守护并确认没有正在执行的恢复事务，再逐个同文件系统原子替换。六个文件的替换整体不是单一原子操作，因此必须保持守护暂停，直到全部到位。保留原 C 二进制和既有策略脚本，完成读回哈希校验后再启动守护。
+## 运行中完整性检查
 
-撤回覆盖层时，停止新守护，先用新恢复脚本的 `--reconcile` 处理未完成事务，确认 DNS 可用后恢复原脚本、权限和服务状态；原先不存在的覆盖文件才可删除。事务恢复失败时先处理 DNS 故障，不应强行移除保护。`rollback.sh` 是切换到备用 DNS 的操作，不等于撤回脚本版本。
+名单审计默认每 60 秒一次，由守护驱动，实际延迟还包括轮询与执行时间。审计验证快照与文件指针，并把内核 CN-IP 转换为合并区间后比较，避免把 nft auto-merge 导致的条数减少误判为损坏。清空、部分删除、额外地址或缺失集合会触发只针对自有 CN 集合的原子修复。整张表缺失交由可信策略恢复。
 
-## 状态与验收
+规则完整性检查核对自有六条关键链及已批准的 `policy.nft`/应用脚本。链存在但内容被清空也能发现。可信快照损坏或应用脚本漂移时拒绝盲目执行，记录严重错误；不会用旧的无条件应用路径绕过验证。已有策略助手会刷新自有监测/VPN 集合并撤下自有应急表，不触及其他表和全局连接跟踪。
 
-运行时退避状态在 `/var/run/diversion-dns-recovery/state`，字段依次为启动 ID、失败次数、下次尝试的单调时钟秒数、持续健康起点。重启后旧运行时计时不沿用；持久事务仍会被处理。
+当前/上一代快照均不可验证时报警并保留可用状态，不清空内核。无法确认归属的流量继续使用原有隧道策略，不自动放开所有 WAN 直连。完全无快照时的关键国内白名单救援属于后续工作。
 
-```sh
-cat /var/run/diversion-dns-recovery/state
-ls -ld /etc/diversion-dns-c/degraded /etc/diversion-dns-c/recovery-auto \
-  /etc/diversion-dns-c/recovering /etc/diversion-dns-c/recovered
-logread -e diversion-dns-c
-uci -q get 'dhcp.@dnsmasq[0].server'
-uci -q get 'dhcp.@dnsmasq[0].cachesize'
-```
+## 部署与撤回
 
-状态文件不存在不代表故障；应同时检查当前 DNS 配置、真实查询和日志。`recovered` 记录最近一次成功时间，不单独证明当前健康。
+先在测试设备的自有目录、无 hook 的 nft 表和独立 DNS 端口测试。不能为了模拟故障清空正式集合、停止真实 WAN/WireGuard 或改全局 conntrack。
 
-验收需覆盖自动降级与恢复、三轮中途失败、最终验证失败、手工降级保持、退避与稳定期重置、锁竞争、切换期间退出或重启、恢复失败保留 C，以及策略、DDNS、正常客户端 DNS 不受影响。脚本测试和真机结果必须分别记录；本说明本身不代表这些测试已经通过。
+部署前记录源码提交、CI run/attempt、下载校验、设备架构/boot ID，以及正式 C 二进制、配置和政策文件摘要。备份目标文件的内容、权限、链接及原先是否存在，保存原数据和独立回退脚本。部署期间暂停守护，确保没有 DNS/CN 未完成事务，原子替换各文件并校验；多文件部署整体不原子，因此必须先安排独立 procd 定时回退。
+
+只在本地 DNS、国内/境外 A/AAAA、CN 学习、CN-IP/实际出口、守护和受保护文件均验收后取消定时回退。撤回时停止新守护、处理未完成事务、恢复原文件及规则快照、验证 DNS，再恢复旧守护。`rollback.sh` 是 DNS 降级，不是覆盖层版本撤回；`cn-data.sh rollback` 只撤回名单版本。
+
+若主路由正在运行需要固定生产配置的长时实验，应等实验结束并归档后部署，不把改过配置的剩余时段算作同一轮对照。
+
+## 证据范围
+
+Python/Lua 测试、BusyBox 场景、真实内核 nft、实际 C 查询、设备服务切换和正式部署分别记录。命令替身验证 UCI/进程事务，不等同于真实生产服务重启；HTTP GET 不等同于浏览器完整渲染。测试不通过或资源不足时停止晋级，不将准备好的脚本描述为已部署。
