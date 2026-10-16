@@ -38,12 +38,15 @@ if args[:2]==['list','table']:
 if args[:2]==['list','set']:
  name=args[-1]
  if not state.get('table',True) or name not in state:sys.exit(1)
+ if 'raw_listing' in state:
+  print(state['raw_listing'][name]);sys.exit(0)
  fam=int(name[-1]);typ=state.get('badtype',f'ipv{fam}_addr')
  vals=list(ipaddress.collapse_addresses(ipaddress.ip_network(x) for x in state[name]))
  if state.get('as_ranges'):
   values=', '.join(str(v.network_address)+'-'+str(v.broadcast_address) for v in vals)
  else: values=', '.join(str(v) for v in vals)
- print(f'table inet cn_test {{\n set {name} {{\n type {typ};\n flags interval;\n auto-merge;\n elements = {{ {values} }}\n }}\n}}')
+ # Match the real OpenWrt nft 1.1.6 pretty printer: no attribute semicolons.
+ print(f'table inet cn_test {{\n set {name} {{\n type {typ}\n flags interval\n auto-merge\n elements = {{ {values} }}\n }}\n}}')
  sys.exit(0)
 if '-f' in args:
  content=pathlib.Path(args[args.index('-f')+1]).read_text()
@@ -111,6 +114,71 @@ class CNDataTests(unittest.TestCase):
         self.invoke('audit',out)
         self.assertIn('unrelated { 198.51.100.1 }',(out/'sets.nft').read_text())
         self.assertNotIn('unrelated',(out/'replace.nft').read_text())
+
+    def listing(self, fam, metadata=None, contents=None):
+        if metadata is None:metadata=f'type ipv{fam}_addr\nflags interval\nauto-merge\n'
+        if contents is None:contents=', '.join(self.state['cn'+str(fam)])
+        return f'table inet cn_test {{\n set cn{fam} {{\n{metadata}elements = {{ {contents} }}\n }}\n}}\n'
+
+    def test_captured_openwrt_1_1_6_pretty_output(self):
+        # Captured on both .122 and .131; only the isolated table name differs.
+        self.ip.write_text('119.29.29.0/24\n223.5.5.0/24\n2400:3200::/32\n')
+        self.state['raw_listing']={
+            'cn4': 'table inet cn_test {\n\tset cn4 {\n\t\ttype ipv4_addr\n\t\tflags interval\n'
+                   '\t\tauto-merge\n\t\telements = { 119.29.29.0/24, 223.5.5.0/24 }\n\t}\n}\n',
+            'cn6': 'table inet cn_test {\n\tset cn6 {\n\t\ttype ipv6_addr\n\t\tflags interval\n'
+                   '\t\tauto-merge\n\t\telements = { 2400:3200::/32 }\n\t}\n}\n'}
+        self.save_state();out=self.prepare();self.invoke('audit',out)
+
+    def test_real_nft_newlines_semicolons_ranges_and_wrapped_elements(self):
+        out=self.prepare()
+        for style in ('pretty','semicolons','inline','reordered','empty','empty-omitted','ranges','single-address'):
+            with self.subTest(style=style):
+                raw={}
+                for fam in (4,6):
+                    metadata=f'type ipv{fam}_addr\nflags interval\nauto-merge\n'
+                    contents=',\n\t\t'.join(self.state['cn'+str(fam)])
+                    if style=='semicolons':metadata=metadata.replace('\n',';\n')
+                    if style=='inline':metadata=metadata.replace('\n','; ')
+                    if style=='reordered':metadata=f'policy memory\nsize 65536\nauto-merge\nflags interval\ntype ipv{fam}_addr\n'
+                    if style in ('empty','empty-omitted'):contents=''
+                    if style=='single-address':contents='223.5.5.5' if fam==4 else '2400:3200::1'
+                    if style=='ranges':
+                        nets=(ipaddress.ip_network(v) for v in self.state['cn'+str(fam)])
+                        contents=', '.join(str(v.network_address)+'-'+str(v.broadcast_address) for v in nets)
+                    raw['cn'+str(fam)]=self.listing(fam,metadata,contents)
+                    if style=='empty-omitted':raw['cn'+str(fam)]=raw['cn'+str(fam)].replace('elements = {  }\n','')
+                self.state['raw_listing']=raw;self.save_state()
+                self.invoke('audit',out,rc=2 if style in ('empty','empty-omitted','single-address') else 0)
+        self.state.pop('raw_listing');self.save_state()
+        self.invoke('repair',out)
+
+    def test_unsafe_nft_metadata_and_wrong_scope_never_repaired(self):
+        out=self.prepare()
+        metadata=[
+            'type integer\nflags interval\nauto-merge\n',
+            'type ipv4_addr . ipv4_addr\nflags interval\nauto-merge\n',
+            'type ipv4_addr\nflags interval,timeout\nauto-merge\n',
+            'type ipv4_addr\nflags interval,dynamic\nauto-merge\n',
+            'type ipv4_addr\nflags interval\nauto-merge\ntimeout 1h\n',
+            'type ipv4_addr\nflags interval\n',
+            'type ipv4_addr\nflags interval\nauto-merge\nflags timeout\n',
+            'type ipv4_addr\nflags interval\nauto-merge garbage\n',
+            'type integer\ncomment "type ipv4_addr; flags interval;"\n',
+        ]
+        variants=[self.listing(4,m) for m in metadata]
+        variants.extend([self.listing(4).replace('inet cn_test','inet other'),
+                         self.listing(4).replace('set cn4','set unrelated'),
+                         self.listing(4).replace('elements =','elements = { 1.1.1.1 }\nelements ='),
+                         self.listing(4,contents='2400:3200::1')])
+        for i,text in enumerate(variants):
+            with self.subTest(variant=i):
+                self.state['raw_listing']={'cn4':text,'cn6':self.listing(6)};self.save_state()
+                before=(self.root/'nft.json').read_bytes()
+                self.invoke('audit',out,rc=1);self.invoke('repair',out,rc=1)
+                self.assertEqual(before,(self.root/'nft.json').read_bytes())
+        calls=[json.loads(v) for v in (self.root/'nft.calls').read_text().splitlines()]
+        self.assertFalse(any('-f' in call for call in calls))
 
     def test_reordered_and_overlapping_intervals_compare_by_coverage(self):
         old=self.prepare()

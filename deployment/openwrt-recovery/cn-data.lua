@@ -281,8 +281,29 @@ local function live(f)
   if not exists then fail('owned table unavailable; policy restoration required') end
   return nil,'missing'
  end
- if not s:find('type ipv'..f..'_addr;',1,true) or not s:match('flags%s+interval%s*;') then fail('unsafe owned set type or flags: '..name) end
- local contents=s:match('elements%s*=%s*{(.-)}');if not contents then return '',s end
+ -- nft's pretty printer separates set attributes with newlines, while saved
+ -- command syntax may use semicolons. Parse complete attributes, not a loose
+ -- substring: timeout/dynamic/concatenated sets are not safe static CN sets.
+ local body=s:match('^%s*table%s+inet%s+'..tab..'%s*{%s*set%s+'..name..'%s*{(.*)}%s*}%s*$')
+ if not body then fail('unexpected owned set listing: '..name) end
+ local contents,count
+ body,count=body:gsub('elements%s*=%s*{([^{}]*)}',function(value) contents=value;return '' end)
+ if count>1 then fail('duplicate owned set elements: '..name) end
+ local attrs={}
+ for line in body:gmatch('[^;\n]+') do
+  line=line:match('^%s*(.-)%s*$')
+  if line~='' then
+   local key,value=line:match('^(%S+)%s+(.+)$')
+   if line=='auto-merge' then key='auto-merge';value=true end
+   local valid=(key=='type' and value=='ipv'..f..'_addr') or (key=='flags' and value=='interval')
+    or (key=='auto-merge' and value==true) or (key=='size' and value:match('^%d+$'))
+    or (key=='policy' and (value=='performance' or value=='memory'))
+   if not valid or attrs[key] then fail('unsafe owned set type or flags: '..name) end
+   attrs[key]=value
+  end
+ end
+ if not attrs.type or not attrs.flags or not attrs['auto-merge'] then fail('unsafe owned set type or flags: '..name) end
+ if not contents then return '',s end
  local ranges={}
  for token in (contents..','):gmatch('(.-),') do
   token=token:match('^%s*(.-)%s*$')
