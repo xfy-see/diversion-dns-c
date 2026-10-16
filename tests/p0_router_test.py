@@ -602,6 +602,11 @@ date > "$R/cleaned"
                 row.setdefault("queries", []).extend(self.assert_cn("repeat-snapshot-" + str(turn)))
 
     def guard_cases(self):
+        # Earlier fault cases exercise the guard and leave a healthy probe
+        # backoff. Reset only this isolated run's foreign-health fixture state
+        # so the injected outage receives an immediate real DNS probe.
+        self.rem("rm -f " + self.root + "/run/foreign-state "
+                 + self.root + "/run/foreign-degraded")
         with self.case("foreign-blackhole-preserves-cn-process-and-learning") as row:
             pid = self.rem("cat " + self.root + "/app.pid")["stdout"].strip()
             before_calls = self.rem("cat " + self.root + "/service-calls")["stdout"]
