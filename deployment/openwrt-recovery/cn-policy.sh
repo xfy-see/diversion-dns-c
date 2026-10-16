@@ -44,6 +44,24 @@ verify() {
  valid_hash "$(cat "$snapshot/helper.sha256")" || return 1
 }
 helper_intact() { [ "$(sha "$base/apply-policy.sh")" = "$(cat "$snapshot/helper.sha256")" ]; }
+helper_data_intact() {
+ # The approved legacy helper reads sets.nft when recreating a missing table.
+ # A prior failed data audit must not authorize that read. This also runs from
+ # cn-data -> reload_cn with data lock 7 held: check-start is read-only, takes
+ # no data lock, and inherits deployment lock 9 rather than acquiring it again.
+ if [ -e "$base/cn-data/enabled" ] || [ -L "$base/cn-data/enabled" ] ||
+    [ -e "$base/cn-data/current" ] || [ -L "$base/cn-data/current" ] ||
+    [ -d "$base/cn-data/generations" ] ||
+    [ -e "$base/cn-data/pending" ] || [ -L "$base/cn-data/pending" ] ||
+    [ -e "$base/cn-data/repair-pending" ] || [ -L "$base/cn-data/repair-pending" ]; then
+  if [ ! -x "$base/cn-data.sh" ] ||
+     ! DIVERSION_CN_DEPLOY_LOCK_HELD=1 "$base/cn-data.sh" check-start; then
+   log 'CRITICAL: managed CN data unverified; refusing approved policy helper'
+   return 1
+  fi
+ fi
+ return 0
+}
 capture() { nft -s -nn list chain inet "$table" "$1" > "$2"; }
 nonempty_chain() {
  # Stateless output removes packet counters but retains rules. Do not adopt a
@@ -112,7 +130,7 @@ audit() {
  [ "$changed" -eq 1 ] || return 0
  # The helper applies a checked nft batch and refreshes its owned monitor/VPN
  # exceptions. It does not reload the global firewall or change DNS settings.
- helper_intact && "$base/apply-policy.sh" || return 1
+ helper_data_intact && helper_intact && "$base/apply-policy.sh" || return 1
  for chain in $chains; do
   capture "$chain" "$temporary/$chain.chain" && cmp -s "$temporary/$chain.chain" "$snapshot/$chain.chain" || {
    log "CRITICAL: policy repair verification failed for $chain"; return 1;

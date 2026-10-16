@@ -19,9 +19,13 @@ if [ "$mode" = --automatic ]; then
 fi
 
 # The legacy init applies policy before C starts. Verify while owning the
-# deployment lock and BEFORE creating recovering (policy audit rejects active
-# DNS transactions). Reconciliation above only stops C and remains unblocked.
-verify_managed_policy || exit 1
+# deployment lock and BEFORE creating recovering. Read-only data verification
+# can inherit this lock safely. Reconciliation above does not apply policy and
+# remains unblocked even if managed data or policy needs a separate repair.
+if ! verify_managed_data || ! verify_managed_policy; then
+ "$base/enable-rescue.sh" || log "CRITICAL: emergency protection failed"
+ exit 1
+fi
 
 # Snapshot before starting C; the switching marker precedes the first mutation.
 mkdir "$base/recovering" || exit 1

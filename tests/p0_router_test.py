@@ -584,6 +584,22 @@ date > "$R/cleaned"
             self.audit()
             require(self.current() == first, "corrupt active snapshot not rolled back")
             self.assert_cn("snapshot-repair")
+        with self.case("consecutive-snapshot-corruption-retains-independent-recovery") as row:
+            for turn in range(2):
+                before = self.current()
+                previous = self.rem("readlink " + self.base + "/cn-data/previous")["stdout"].strip().split("/")[-1]
+                require(SHA.fullmatch(previous) and previous != before, "CN recovery copies alias the same generation")
+                self.shell("lua " + self.base + "/cn-data.lua verify " + self.base + "/cn-data/generations/" + previous)
+                self.rem(": > " + self.generation() + "/cn-site.txt")
+                self.audit()
+                after = self.current()
+                standby = self.rem("readlink " + self.base + "/cn-data/previous")["stdout"].strip().split("/")[-1]
+                require(after != before and SHA.fullmatch(standby) and standby != after,
+                        "snapshot recovery did not retain an independent standby")
+                self.script("cn-data.sh", "check-start")
+                self.shell("lua " + self.base + "/cn-data.lua verify " + self.base + "/cn-data/generations/" + standby)
+                row.setdefault("recoveries", []).append(dict(before=before, current=after, previous=standby))
+                row.setdefault("queries", []).extend(self.assert_cn("repeat-snapshot-" + str(turn)))
 
     def guard_cases(self):
         with self.case("foreign-blackhole-preserves-cn-process-and-learning") as row:
@@ -685,6 +701,43 @@ date > "$R/cleaned"
                 self.audit()
                 self.script("cn-policy.sh", "audit-runtime")
                 self.assert_cn("safe-policy-" + str(len(self.rows)))
+        with self.case("unrecoverable-cn-and-policy-damage-preserves-c-with-rescue") as row:
+            current = self.current()
+            previous = self.rem("readlink " + self.base + "/cn-data/previous")["stdout"].strip().split("/")[-1]
+            require(SHA.fullmatch(previous) and previous != current, "combination test needs two independent generations")
+            row["damaged_generations"] = [current, previous]
+            self.script("cn-data.sh", "check-start")
+            self.shell("lua " + self.base + "/cn-data.lua verify " + self.base + "/cn-data/generations/" + previous)
+            pid = self.rem("cat " + self.root + "/app.pid")["stdout"].strip()
+            service_calls = self.rem("cat " + self.root + "/service-calls")["stdout"]
+            policy_calls = self.rem("cat " + self.root + "/policy-calls")["stdout"].splitlines()
+            for label, identity in (("current", current), ("previous", previous)):
+                path = self.base + "/cn-data/generations/" + identity + "/sets.nft"
+                self.rem("cp " + path + " " + self.root + "/input/combined-" + label + ".sets; : > " + path)
+            self.rem("nft flush chain inet " + self.table + " classify")
+            result = self.script("cn-data.sh", "audit-runtime", "--force", expected=None, timeout=90)
+            require(result["returncode"] != 0, "both invalid CN recovery copies unexpectedly accepted")
+            self.script("guard.sh", "--once", timeout=60)
+            after_calls = self.rem("cat " + self.root + "/policy-calls")["stdout"].splitlines()
+            require(after_calls.count("apply-policy.sh") == policy_calls.count("apply-policy.sh"),
+                    "guard policy repair read unverified CN data")
+            require(after_calls.count("enable-rescue.sh") > policy_calls.count("enable-rescue.sh"),
+                    "guard did not request emergency containment")
+            require(self.rem("cat " + self.root + "/app.pid")["stdout"].strip() == pid,
+                    "combined data/policy failure restarted or stopped C")
+            require(self.rem("cat " + self.root + "/service-calls")["stdout"] == service_calls,
+                    "combined data/policy failure changed DNS services")
+            self.rem("test ! -e " + self.base + "/degraded; test ! -e " + self.base + "/recovering")
+            row["queries_during_failure"] = self.assert_cn("combined-data-policy-failure")
+            for label, identity in (("current", current), ("previous", previous)):
+                self.rem("cp " + self.root + "/input/combined-" + label + ".sets "
+                         + self.base + "/cn-data/generations/" + identity + "/sets.nft")
+            self.audit()
+            self.script("cn-policy.sh", "audit-runtime")
+            repaired_calls = self.rem("cat " + self.root + "/policy-calls")["stdout"].splitlines()
+            require(repaired_calls.count("apply-policy.sh") == policy_calls.count("apply-policy.sh") + 1,
+                    "healthy CN data did not allow the pending chain repair")
+            row["queries_after_repair"] = self.assert_cn("combined-data-policy-recovered")
 
     def init_cases(self):
         probe = ('. "$DIVERSION_DNS_BASE/diversion-dns-c.init"; '

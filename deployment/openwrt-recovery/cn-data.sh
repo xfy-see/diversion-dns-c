@@ -47,12 +47,58 @@ links() {
  done
  sync || return 1
 }
+regular_generation() {
+ [ -d "$1" ] && [ ! -L "$1" ] || return 1
+ for regular_file in manifest.tsv cn-ip.txt cn-site.txt sets.nft replace.nft ranges4.txt ranges6.txt; do
+  [ -f "$1/$regular_file" ] && [ ! -L "$1/$regular_file" ] || return 1
+ done
+}
 verified() {
+ regular_generation "$store/generations/$1" || return 1
  manifest_hash=$(sha256sum "$store/generations/$1/manifest.tsv" | cut -d ' ' -f 1)
  valid_id "$manifest_hash" || return 1
  rescue_hash=$(printf '%s bootstrap\n' "$manifest_hash" | sha256sum | cut -d ' ' -f 1)
  [ "$1" = "$manifest_hash" ] || [ "$1" = "$rescue_hash" ] || return 1
  lua "$engine" verify "$store/generations/$1" >/dev/null
+}
+ensure_previous() {
+ # A restored previous can become current. Replenish its independent standby
+ # before reporting recovery complete; otherwise the next corruption has no
+ # usable backup. Only the verified active content can authorize a new copy.
+ sp_active=$1
+ valid_id "$sp_active" && verified "$sp_active" || return 1
+ sp_previous=$(current_id previous 2>/dev/null || true)
+ if [ -n "$sp_previous" ] && [ "$sp_previous" != "$sp_active" ] && verified "$sp_previous"; then return 0; fi
+ sp_manifest=$(sha256sum "$store/generations/$sp_active/manifest.tsv" | cut -d ' ' -f 1)
+ sp_peer=$sp_manifest
+ if [ "$sp_active" = "$sp_manifest" ]; then
+  sp_peer=$(printf '%s bootstrap\n' "$sp_manifest" | sha256sum | cut -d ' ' -f 1)
+ fi
+ valid_id "$sp_peer" && [ "$sp_peer" != "$sp_active" ] || return 1
+ if ! verified "$sp_peer"; then
+  sp_draft=$(mktemp -d "$store/.standby.XXXXXX") || return 1
+  if ! cp -Rp "$store/generations/$sp_active/." "$sp_draft/" ||
+     ! regular_generation "$sp_draft" ||
+     [ "$(sha256sum "$sp_draft/manifest.tsv" | cut -d ' ' -f 1)" != "$sp_manifest" ] ||
+     ! lua "$engine" verify "$sp_draft" >/dev/null || ! verified "$sp_active"; then
+   rm -rf "$sp_draft"; return 1
+  fi
+  sync || { rm -rf "$sp_draft"; return 1; }
+  if [ -e "$store/generations/$sp_peer" ] || [ -L "$store/generations/$sp_peer" ]; then
+   [ ! -L "$store/quarantine" ] && mkdir -p "$store/quarantine" || { rm -rf "$sp_draft"; return 1; }
+   sp_bad=$(mktemp -d "$store/quarantine/damaged.XXXXXX") || { rm -rf "$sp_draft"; return 1; }
+   printf '%s\n' "$sp_peer" > "$sp_bad/original-id" || { rm -rf "$sp_draft"; return 1; }
+   mv "$store/generations/$sp_peer" "$sp_bad/generation" || { rm -rf "$sp_draft"; return 1; }
+   sync || { rm -rf "$sp_draft"; return 1; }
+  fi
+  # Same-filesystem rename publishes a fully verified copy. A crash before this
+  # point leaves active intact; the next audit retries these same two slot IDs.
+  mv "$sp_draft" "$store/generations/$sp_peer" || { rm -rf "$sp_draft"; return 1; }
+  sync || return 1
+  verified "$sp_peer" || return 1
+ fi
+ point previous "$sp_peer" || return 1
+ log "independent CN standby retained for $sp_active as $sp_peer"
 }
 reload_cn() {
  if [ -f "$base/degraded" ] && [ ! -d "$base/recovering" ]; then
@@ -133,6 +179,7 @@ restore_pending() {
  links || return 1
  lua "$engine" repair "$store/generations/$prior" || return 1
  reload_cn || return 1
+ ensure_previous "$prior" || return 1
  rm -f "$store/pending" || return 1
  sync || return 1
  log "interrupted/failed CN activation restored generation $prior"
@@ -145,6 +192,7 @@ finish_repair() {
  links || return 1
  lua "$engine" repair "$store/generations/$repair_id" || return 1
  reload_cn || return 1
+ ensure_previous "$repair_id" || return 1
  rm -f "$store/repair-pending" || return 1
  sync || return 1
  log "CN file/snapshot repair completed, resolver synchronized"
@@ -173,6 +221,7 @@ activate() {
  sync || return 1
  if lua "$engine" repair "$store/generations/$next" && point current "$next" && links && reload_cn; then
   point previous "$prior" || return 1
+  ensure_previous "$next" || return 1
   rm -f "$store/pending" || return 1
   sync || return 1
   log "CN generation activated $next; previous $prior retained"
@@ -205,6 +254,7 @@ audit() {
   2) lua "$engine" repair "$store/generations/$active" || return 1; log "restored CN-IP kernel contents from verified generation";;
   *) return 1;;
  esac
+ ensure_previous "$active" || return 1
 }
 case "${1:-}" in
  check-start)
@@ -227,10 +277,7 @@ case "${1:-}" in
   for file in cn-ip.txt cn-site.txt sets.nft; do
    [ -e "$store/bootstrap/$file" ] || cp -p "$base/$file" "$store/bootstrap/$file"
   done
-  rescue=$(printf '%s bootstrap\n' "$new" | sha256sum | cut -d ' ' -f 1)
-  [ -d "$store/generations/$rescue" ] || cp -Rp "$store/generations/$new" "$store/generations/$rescue"
-  verified "$rescue"
-  point previous "$rescue"
+  ensure_previous "$new"
   sync
   : > "$store/enabled"
   sync

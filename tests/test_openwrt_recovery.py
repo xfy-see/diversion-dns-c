@@ -126,7 +126,7 @@ elif name == "mv":
         sys.exit(0)
     finish()
 elif name == "nft":
-    finish()
+    finish(1 if control.get("missing_policy") else 0)
 elif name == "flock":
     fd = int(args[-1])
     operation = fcntl.LOCK_UN if "-u" in args else fcntl.LOCK_EX
@@ -784,6 +784,58 @@ done''')
         self.assertFalse(self.calls("diversion-dns-c"))
         self.assertEqual((self.root / "policy-actions").read_text().splitlines(),
                          ["enable-rescue"] * 3)
+
+    def test_manual_fallback_rejects_bad_data_before_mode_markers_or_helper(self):
+        original = self.activate_normal_service()
+        self.install_cn_data_hook(result=1)
+        self.install_policy_hook()
+        (self.base / "recovery-auto").write_text("service-health\n")
+        self.execute("rollback.sh", "manual", expected=1)
+        self.assertEqual((self.root / "cn-hook").read_text().splitlines(), ["1 check-start"])
+        self.assertFalse((self.root / "policy-hook").exists())
+        self.assertEqual((self.root / "policy-actions").read_text().splitlines(), ["enable-rescue"])
+        self.assertEqual((self.base / "recovery-auto").read_text(), "service-health\n")
+        self.assertEqual(self.state()["uci"], original)
+        self.assertFalse((self.root / "fallback.log").exists())
+        self.assertFalse(self.calls("diversion-dns-c"))
+        self.assertFalse(self.calls("dnsmasq"))
+
+    def test_manual_fallback_rejects_bad_policy_after_readonly_data_check(self):
+        original = self.activate_normal_service()
+        self.install_cn_data_hook()
+        self.install_policy_hook(result=1)
+        self.execute("rollback.sh", "manual", expected=1)
+        self.assertEqual((self.root / "cn-hook").read_text().splitlines(), ["1 check-start"])
+        self.assertEqual((self.root / "policy-hook").read_text().splitlines(), ["1 audit-runtime"])
+        self.assertEqual((self.root / "policy-actions").read_text().splitlines(), ["enable-rescue"])
+        self.assertEqual(self.state()["uci"], original)
+        self.assertFalse((self.root / "fallback.log").exists())
+        self.assertFalse(self.calls("diversion-dns-c"))
+
+    def test_unmanaged_policy_rebuild_also_rejects_managed_bad_data(self):
+        original = self.activate_normal_service()
+        self.install_cn_data_hook(result=1)
+        self.install_policy_hook()
+        shutil.rmtree(self.base / "cn-policy")
+        self.control(missing_policy=True)
+        self.execute("guard.sh", "--once", expected=0)
+        self.assertEqual((self.root / "cn-hook").read_text().splitlines(),
+                         ["1 audit-runtime", "1 check-start"])
+        self.assertEqual((self.root / "policy-actions").read_text().splitlines(), ["enable-rescue"])
+        self.assertEqual(self.state()["uci"], original)
+        self.assertFalse((self.root / "fallback.log").exists())
+        self.assertFalse(self.calls("diversion-dns-c"))
+
+    def test_recovery_rejects_bad_data_before_dns_transaction_and_policy_check(self):
+        self.install_cn_data_hook(result=1)
+        self.install_policy_hook()
+        self.execute("recover.sh", "--automatic", expected=1)
+        self.assertEqual((self.root / "cn-hook").read_text().splitlines(), ["1 check-start"])
+        self.assertFalse((self.root / "policy-hook").exists())
+        self.assertEqual((self.root / "policy-actions").read_text().splitlines(), ["enable-rescue"])
+        self.assertFalse((self.base / "recovering").exists())
+        self.assertTrue((self.base / "degraded").exists())
+        self.assertFalse(self.calls("diversion-dns-c"))
 
     def test_policy_generation_without_markers_cannot_bypass_guard_verification(self):
         self.activate_normal_service()

@@ -15,6 +15,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "deployment/openwrt-recovery/cn-data.sh"
+REAL_LUA = os.environ.get('LUA_TEST_BIN') or shutil.which('lua5.1') or shutil.which('lua')
 DOUBLE = r'''
 import fcntl, hashlib, json, os, pathlib, shutil, subprocess, sys
 r=pathlib.Path(os.environ['CN_TX_TEST'])
@@ -33,7 +34,11 @@ elif n in ('logger','sync','probe'): pass
 elif n=='mv':
  a=[v for v in a if not v.startswith('-')]
  if pathlib.Path(a[1]).name=='current' and control.get('mv_fail_target')==os.readlink(a[0]): sys.exit(1)
+ if control.get('standby_publish_fail') and pathlib.Path(a[0]).name.startswith('.standby.'): sys.exit(1)
  os.replace(a[0],a[1])
+elif n=='cp':
+ if control.get('standby_copy_fail') and '.standby.' in a[-1]: sys.exit(1)
+ sys.exit(subprocess.run(['/bin/cp',*a]).returncode)
 elif n=='resolver':
  sys.exit(1 if control.get('check_fail') else 0)
 elif n=='cn-policy.sh':
@@ -67,6 +72,8 @@ elif n=='lua':
   if digest(ip)!=ih or digest(site)!=sh or not ip.read_bytes() or not site.read_bytes(): sys.exit(1)
   for src,name in [(ip,'cn-ip.txt'),(site,'cn-site.txt'),(template,'sets.nft')]: shutil.copyfile(src,out/name)
   (out/'replace.nft').write_text('replace '+digest(ip))
+  (out/'ranges4.txt').write_text('range4\n')
+  (out/'ranges6.txt').write_text('range6\n')
   m={p.name:digest(p) for p in out.iterdir() if p.is_file() and p.name!='result.json'}
   (out/'manifest.tsv').write_text(json.dumps(m,sort_keys=True))
   print('{}')
@@ -97,7 +104,7 @@ class CNTransactionTest(unittest.TestCase):
         self.init = self.root / "init"
         for p in (self.base, self.bin, self.init):
             p.mkdir()
-        for name in ("lua", "flock", "sha256sum", "logger", "sync", "mv", "resolver", "probe", "wget"):
+        for name in ("lua", "flock", "sha256sum", "logger", "sync", "mv", "cp", "resolver", "probe", "wget"):
             self.double(self.bin / name)
         self.double(self.init / "diversion-dns-c")
         (self.root / "control").write_text("{}")
@@ -229,6 +236,65 @@ class CNTransactionTest(unittest.TestCase):
         self.call("audit-runtime", "--force")
         self.assertNotEqual(self.active(), old)
         self.assertIn("qq.com", (self.base / "cn-site.txt").read_text())
+
+    def assert_independent_standby(self):
+        store=self.base/'cn-data';active=self.active();previous=os.readlink(store/'previous').split('/')[-1]
+        self.assertNotEqual(active,previous)
+        for name in ('manifest.tsv','cn-ip.txt','cn-site.txt','sets.nft','replace.nft','ranges4.txt','ranges6.txt'):
+            a,b=store/'generations'/active/name,store/'generations'/previous/name
+            self.assertFalse(a.is_symlink());self.assertFalse(b.is_symlink())
+            self.assertNotEqual((a.stat().st_dev,a.stat().st_ino),(b.stat().st_dev,b.stat().st_ino))
+        return active,previous
+
+    def test_repeated_corruption_replenishes_two_slots_and_keeps_bad_evidence(self):
+        self.seed();store=self.base/'cn-data'
+        initial=set(p.name for p in (store/'generations').iterdir())
+        for i in range(4):
+            prior=self.active();(self.base/'cn-site.txt').write_text('')
+            self.call('audit-runtime','--force')
+            self.assertNotEqual(self.active(),prior);self.assert_independent_standby()
+            self.assertIn('qq.com',(self.base/'cn-site.txt').read_text())
+            self.assertEqual(set(p.name for p in (store/'generations').iterdir()),initial)
+            bad=list((store/'quarantine').glob('damaged.*/generation/cn-site.txt'))
+            self.assertEqual(len(bad),i+1);self.assertTrue(all(p.read_bytes()==b'' for p in bad))
+        before=sorted(str(p) for p in store.rglob('*'))
+        self.call('audit-runtime','--force')
+        self.assertEqual(sorted(str(p) for p in store.rglob('*')),before)
+
+    def test_two_corruptions_after_update_preserve_usable_previous(self):
+        self.seed();new=self.stage();self.call('activate',new)
+        for _ in range(2):
+            (self.base/'cn-site.txt').write_text('')
+            self.call('audit-runtime','--force');self.assert_independent_standby()
+            self.assertIn('qq.com',(self.base/'cn-site.txt').read_text())
+        self.assertEqual((self.base/'cn-data/generations'/new/'cn-site.txt').read_bytes(),b'')
+
+    def test_standby_copy_or_publish_failure_retains_valid_active_and_retries(self):
+        for mode in ('standby_copy_fail','standby_publish_fail'):
+            with self.subTest(mode=mode):
+                case=CNTransactionTest();case.setUp()
+                try:
+                    case.seed();(case.base/'cn-site.txt').write_text('');case.control(**{mode:True})
+                    case.call('audit-runtime','--force',ok=False)
+                    self.assertIn('qq.com',(case.base/'cn-site.txt').read_text())
+                    self.assertTrue((case.base/'cn-data/repair-pending').is_file())
+                    self.assertTrue((case.root/'restarts').exists())
+                    self.assertEqual((case.root/'kernel').read_text(),
+                        (case.base/'cn-data/generations'/case.active()/'replace.nft').read_text())
+                    case.control();case.call('audit-runtime','--force');case.assert_independent_standby()
+                    self.assertFalse((case.base/'cn-data/repair-pending').exists())
+                finally:case.doCleanups()
+
+    def test_generation_and_payload_symlinks_are_not_trusted_backups(self):
+        self.seed();store=self.base/'cn-data';active=self.active()
+        old_previous=os.readlink(store/'previous').split('/')[-1]
+        previous=store/'generations'/old_previous
+        payload=previous/'cn-site.txt';payload.unlink();payload.symlink_to(store/'generations'/active/'cn-site.txt')
+        self.call('audit-runtime','--force');self.assert_independent_standby()
+        quarantined=list((store/'quarantine').glob('damaged.*/generation/cn-site.txt'))
+        self.assertTrue(any(p.is_symlink() for p in quarantined))
+        shutil.rmtree(previous);previous.symlink_to(store/'generations'/active,target_is_directory=True)
+        self.call('audit-runtime','--force');self.assert_independent_standby()
 
     def test_repair_reload_failure_is_durable_and_retried(self):
         old = self.seed()
@@ -388,6 +454,58 @@ class CNTransactionTest(unittest.TestCase):
         (self.root / "kernel").write_text("empty")
         self.call("activate", current)
         self.assertTrue((self.root / "kernel").read_text().startswith("replace "))
+
+
+@unittest.skipUnless(REAL_LUA, 'Lua absent; CI/router validation covers actual manifest engine')
+class CNStandbyRealLuaTest(unittest.TestCase):
+    def setUp(self):
+        # Real shell+Lua+manifest hashes and filesystem copies. Only nft and the
+        # resolver/service adapters are doubles; no local C build or kernel write.
+        import test_cn_data as engine_fixture
+        case=CNTransactionTest();case.setUp();self.case=case;self.addCleanup(case.doCleanups)
+        self.fixtures=engine_fixture
+        shutil.copy2(ROOT/'deployment/openwrt-recovery/cn-data.lua',case.base/'cn-data.lua')
+        (case.base/'cn-ip.txt').write_text(engine_fixture.IP)
+        (case.base/'cn-site.txt').write_text(engine_fixture.SITE)
+        (case.base/'sets.nft').write_text(engine_fixture.TEMPLATE)
+        (case.root/'nft.json').write_text(json.dumps({
+            'cn4':[v for v in engine_fixture.IP.splitlines() if ':' not in v],
+            'cn6':[v for v in engine_fixture.IP.splitlines() if ':' in v],
+            'unrelated':['198.51.100.1']}))
+        lua=case.bin/'lua'
+        lua.write_text('#!'+sys.executable+'\nimport os,sys\nos.execv('+repr(REAL_LUA)+', ['+repr(REAL_LUA)+']+sys.argv[1:])\n')
+        lua.chmod(0o755)
+        nft=case.bin/'nft';nft.write_text('#!'+sys.executable+'\n'+engine_fixture.NFT_DOUBLE);nft.chmod(0o755)
+        case.env.update(CN_TEST_ROOT=str(case.root),DIVERSION_CN_TABLE='cn_test',
+                        DIVERSION_CN_MIN4='2',DIVERSION_CN_MIN6='1',DIVERSION_CN_MINSITE='2')
+
+    def test_real_manifest_two_consecutive_corruptions_after_activation(self):
+        c=self.case;c.seed()
+        site=c.root/'updated-site';site.write_text(self.fixtures.SITE+'new.cn\n')
+        ip=c.base/'cn-ip.txt'
+        new=c.call('stage',str(ip),str(site),c.sha(ip),c.sha(site)).stdout.strip()
+        c.call('activate',new)
+        for _ in range(2):
+            (c.base/'cn-site.txt').write_text('')
+            c.call('audit-runtime','--force');active,previous=c.assert_independent_standby()
+            for value in (active,previous):
+                path=c.base/'cn-data/generations'/value
+                manifest=c.sha(path/'manifest.tsv')
+                alias=hashlib.sha256((manifest+' bootstrap\n').encode()).hexdigest()
+                self.assertIn(value,(manifest,alias))
+                p=subprocess.run([REAL_LUA,str(c.base/'cn-data.lua'),'verify',str(path)],
+                                 env=c.env,capture_output=True,text=True)
+                self.assertEqual(p.returncode,0,p.stdout+p.stderr)
+        self.assertEqual((c.base/'cn-data/generations'/new/'cn-site.txt').read_bytes(),b'')
+        self.assertEqual(json.loads((c.root/'nft.json').read_text())['unrelated'],['198.51.100.1'])
+
+    def test_real_manifest_tamper_is_quarantined_and_replenished_from_active(self):
+        c=self.case;c.seed();store=c.base/'cn-data'
+        previous=os.readlink(store/'previous').split('/')[-1]
+        p=store/'generations'/previous/'manifest.tsv';p.write_text(p.read_text()+'corrupt\n')
+        c.call('audit-runtime','--force');c.assert_independent_standby()
+        bad=list((store/'quarantine').glob('damaged.*/generation/manifest.tsv'))
+        self.assertEqual(len(bad),1);self.assertTrue(bad[0].read_text().endswith('corrupt\n'))
 
 
 if __name__ == "__main__":

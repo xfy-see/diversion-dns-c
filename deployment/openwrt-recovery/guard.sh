@@ -54,7 +54,7 @@ while [ -f "$base/active" ]; do
    if [ "$policy_managed" = 1 ]; then
     DIVERSION_CN_DEPLOY_LOCK_HELD=1 "$base/cn-policy.sh" audit-runtime --repair && owned_policy_present || healthy=0
    else
-    "$base/apply-policy.sh" && owned_policy_present || healthy=0
+    verify_managed_data && "$base/apply-policy.sh" && owned_policy_present || healthy=0
    fi
   fi
   if [ "$healthy" = 0 ]; then

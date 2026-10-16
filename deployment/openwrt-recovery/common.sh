@@ -44,6 +44,14 @@ managed_policy_enabled() {
  [ -e "$base/cn-policy/current" ] || [ -L "$base/cn-policy/current" ] ||
  [ -d "$base/cn-policy/generations" ]
 }
+verify_managed_data() {
+ managed_cn_data_enabled || return 0
+ if [ ! -x "$base/cn-data.sh" ] ||
+    ! DIVERSION_CN_DEPLOY_LOCK_HELD=1 "$base/cn-data.sh" check-start; then
+  log "CRITICAL: managed CN data unverified; refusing policy application"
+  return 1
+ fi
+}
 verify_managed_policy() {
  managed_policy_enabled || return 0
  if [ ! -x "$base/cn-policy.sh" ]; then

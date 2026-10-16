@@ -1,5 +1,6 @@
 """Policy integrity transaction tests: command doubles, no firewall or compiler."""
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -42,6 +43,8 @@ elif name == "apply-policy.sh":
         state["live"]["split"] = "table inet ddns_p0_policy {\n chain split {\n }\n}\n"
     save()
 elif name == "sha256sum":
+    if not args:
+        print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest() + "  -")
     for filename in args:
         try:
             digest = hashlib.sha256(pathlib.Path(filename).read_bytes()).hexdigest()
@@ -52,7 +55,41 @@ elif name == "mv":
     args = [v for v in args if not v.startswith("-")]
     os.replace(*args)
 elif name == "flock":
-    fcntl.flock(int(args[-1]), fcntl.LOCK_EX)
+    operation = fcntl.LOCK_UN if "-u" in args else fcntl.LOCK_EX
+    if "-n" in args:
+        operation |= fcntl.LOCK_NB
+    try:
+        fcntl.flock(int(args[-1]), operation)
+    except BlockingIOError:
+        sys.exit(1)
+elif name == "lua":
+    if args[0].endswith("dns-probe.lua"):
+        print("OK")
+    else:
+        # The shell wrappers are real; Lua's independently tested manifest
+        # verifier is modelled with actual six-file hashes in this fixture.
+        if args[1] not in ("verify", "audit"):
+            sys.exit(93)
+        if os.environ.get("DIVERSION_CN_DEPLOY_LOCK_HELD") != "1":
+            sys.exit(94)
+        with open(os.environ["DIVERSION_DNS_LOCK"], "a") as lock:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pass
+            else:
+                sys.exit(95)
+        generation = pathlib.Path(args[2])
+        try:
+            lines = (generation / "manifest.tsv").read_text().splitlines()
+            if len(lines) != 6:
+                sys.exit(96)
+            for line in lines:
+                filename, expected = line.split("\t")
+                if hashlib.sha256((generation / filename).read_bytes()).hexdigest() != expected:
+                    sys.exit(1)
+        except (OSError, ValueError):
+            sys.exit(1)
 elif name in ("logger", "sync"):
     pass
 else:
@@ -108,6 +145,38 @@ class PolicyFixture(unittest.TestCase):
 
     def snapshot(self):
         return (self.base / "cn-policy/current").resolve()
+
+    def managed_data(self):
+        """Real check-start/current/manifest/link checks, no router or compiler."""
+        shutil.copy2(SCRIPT.parent / "cn-data.sh", self.base / "cn-data.sh")
+        (self.base / "cn-data.sh").chmod(0o755)
+        self.double(self.bin / "lua")
+        store = self.base / "cn-data"
+        draft = store / "generations/draft"
+        draft.mkdir(parents=True)
+        payloads = {
+            "cn-ip.txt": "223.5.5.0/24\n2400:3200::/32\n",
+            "cn-site.txt": "qq.com\nbaidu.com\n",
+            "sets.nft": "approved owned sets\n",
+            "replace.nft": "flush set inet ddns_p0_policy cn4\nflush set inet ddns_p0_policy cn6\n",
+            "ranges4.txt": "df050500 df0505ff\n",
+            "ranges6.txt": "24003200000000000000000000000000 24003200ffffffffffffffffffffffff\n",
+        }
+        for name, content in payloads.items():
+            (draft / name).write_text(content)
+        manifest = "".join(name + "\t" + hashlib.sha256(content.encode()).hexdigest() + "\n"
+                           for name, content in payloads.items())
+        (draft / "manifest.tsv").write_text(manifest)
+        identity = hashlib.sha256(manifest.encode()).hexdigest()
+        current = draft.with_name(identity); draft.rename(current)
+        rescue = current.with_name(hashlib.sha256((identity + " bootstrap\n").encode()).hexdigest())
+        shutil.copytree(current, rescue)
+        (store / "current").symlink_to("generations/" + current.name)
+        (store / "previous").symlink_to("generations/" + rescue.name)
+        (store / "enabled").touch()
+        for name in ("cn-ip.txt", "cn-site.txt", "sets.nft"):
+            (self.base / name).symlink_to("cn-data/current/" + name)
+        return current, rescue
 
     def test_seed_and_unchanged_audit_do_not_apply_or_change_source(self):
         self.run_script("seed")
@@ -241,6 +310,71 @@ class PolicyFixture(unittest.TestCase):
         self.env["DIVERSION_DNS_POLICY_TABLE"] = "unrelated"
         self.run_script("audit-runtime", expected=1)
         self.assertEqual(self.state()["applied"], 0)
+
+    def test_double_corrupt_cn_snapshots_block_policy_rebuild_before_helper(self):
+        self.run_script("seed")
+        current, previous = self.managed_data()
+        for generation in (current, previous):
+            (generation / "sets.nft").write_text("")
+        self.change(live={})
+        self.run_script("audit-runtime", expected=1)
+        self.assertEqual(self.state()["applied"], 0)
+        self.assertEqual(self.state()["live"], {})
+
+    def test_missing_cn_verifier_and_lost_markers_cannot_bypass_policy_rebuild(self):
+        self.run_script("seed")
+        self.managed_data()
+        (self.base / "cn-data.sh").unlink()
+        (self.base / "cn-data/current").unlink()
+        (self.base / "cn-data/enabled").unlink()
+        self.change(live={})
+        self.run_script("audit-runtime", expected=1)
+        self.assertEqual(self.state()["applied"], 0)
+
+    def test_healthy_cn_policy_repair_with_pending_journals_and_data_lock_held(self):
+        self.run_script("seed")
+        current, _ = self.managed_data()
+        store = self.base / "cn-data"
+        (store / "pending").write_text(current.name + " " + current.name + "\n")
+        (store / "repair-pending").write_text(current.name + "\n")
+        (self.base / "recovering").mkdir()
+        self.change(live={})
+        with (store / "lock").open("w") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            self.run_script("audit-runtime")
+        self.assertEqual(self.state()["applied"], 1)
+        self.assertEqual(self.state()["live"], self.state()["approved"])
+        self.assertTrue((store / "pending").is_file())
+        self.assertTrue((store / "repair-pending").is_file())
+
+    def test_guard_keeps_c_and_enables_rescue_when_cn_and_policy_are_damaged(self):
+        self.run_script("seed")
+        current, previous = self.managed_data()
+        for generation in (current, previous):
+            (generation / "sets.nft").write_text("")
+        for name in ("common.sh", "guard.sh"):
+            shutil.copy2(SCRIPT.parent / name, self.base / name)
+        with (self.base / "common.sh").open("a") as stream:
+            stream.write('\nnow_seconds() { echo 100; }\nboot_id() { echo fixture-boot; }\n')
+        (self.root / "uptime").write_text("100.0 0.0\n")
+        self.env.update(DIVERSION_DNS_RUN=str(self.root / "run"),
+                        DIVERSION_CN_TEST_UPTIME=str(self.root / "uptime"),
+                        DIVERSION_CN_AUDIT_INTERVAL="0", DIVERSION_DNS_INITDIR=str(self.base))
+        (self.base / "active").touch()
+        for name in ("enable-rescue", "refresh-monitor", "diversion-dns-c", "dnsmasq"):
+            script = self.base / (name + ".sh" if name in ("enable-rescue", "refresh-monitor") else name)
+            script.write_text('#!/bin/sh\nprintf "%s\\n" ' + shlex.quote(name)
+                              + ' >> "$POLICY_TEST_ROOT/service-actions"\n')
+            script.chmod(0o755)
+        self.change(live={})
+        result = subprocess.run([*self.shell, str(self.base / "guard.sh"), "--once"],
+                                env=self.env, text=True, capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.state()["applied"], 0)
+        self.assertEqual((self.root / "service-actions").read_text().splitlines(),
+                         ["enable-rescue", "refresh-monitor"])
+        self.assertFalse((self.base / "degraded").exists())
+        self.assertFalse((self.base / "recovering").exists())
 
 
 @unittest.skipUnless(BUSYBOX, "BusyBox absent locally; Linux suite CI installs it")
