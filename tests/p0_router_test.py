@@ -383,7 +383,7 @@ stop() {
   if kill -0 "$p" 2>/dev/null; then
    [ "$(readlink /proc/$p/exe)" = "$R/app" ] || exit 91
    kill "$p"
-   n=0; while kill -0 "$p" 2>/dev/null && [ "$n" -lt 50 ]; do sleep .1; n=$((n+1)); done
+   n=0; while kill -0 "$p" 2>/dev/null && [ "$n" -lt 50 ]; do sleep 1; n=$((n+1)); done
    ! kill -0 "$p" 2>/dev/null || exit 92
   fi
   rm "$R/$role.pid"
@@ -405,7 +405,7 @@ EOF
  # procd launches services independently; emulate that descriptor boundary so
  # the fixture daemon cannot inherit and retain a recovery/data flock.
  sh -c 'trap "" HUP; exec 7>&- 9>&-; echo $$ > "$1"; exec "$2" start -c "$3" --cpu 1' sh "$R/$role.pid" "$R/app" "$cfg" > "$R/$role.log" 2>&1 < /dev/null &
- sleep .2
+ sleep 1
  p=$(cat "$R/$role.pid"); kill -0 "$p"
 }
 case "${1:-}" in
@@ -489,7 +489,7 @@ for p in $owned_pids; do
   if owned_command "$cmd"; then kill -KILL "$p" 2>/dev/null || true; fi
  fi
 done
-sleep .2
+sleep 1
 for p in $owned_pids; do
  if [ -f "/proc/$p/cmdline" ]; then
   cmd=$(tr '\\0' ' ' < "/proc/$p/cmdline" 2>/dev/null) || continue
@@ -777,7 +777,7 @@ date > "$R/cleaned"
                 row["audit"] = bounded("audit", ["lua", self.base + "/cn-data.lua", "audit", out])
                 row["rollback"] = bounded("rollback", ["lua", self.base + "/cn-data.lua", "repair", self.generation()])
         finally:
-            self.rem("echo 1 > " + group + "/cgroup.kill; sleep .3; rmdir " + group + "; rm " + self.root + "/full-group")
+            self.rem("echo 1 > " + group + "/cgroup.kill; sleep 1; rmdir " + group + "; rm " + self.root + "/full-group")
 
     def cleanup(self):
         if not self.started:

@@ -129,6 +129,35 @@ class CNDataTests(unittest.TestCase):
         self.invoke('verify',new)
         self.assertEqual((new/'sets.nft').read_text(),(old/'sets.nft').read_text())
 
+    def install_sort_double(self, body):
+        sort=self.bin/'sort'
+        sort.write_text('#!'+sys.executable+'\nimport os,pathlib,sys\n'+body)
+        sort.chmod(0o755)
+
+    def test_minimal_busybox_sort_without_output_option(self):
+        # Reproduce the routers' reduced BusyBox: -o is ignored with exit 0,
+        # and sorted data goes to stdout instead of creating the named output.
+        self.install_sort_double(
+            "args=sys.argv[1:]\n"
+            "with (pathlib.Path(os.environ['CN_TEST_ROOT'])/'sort.calls').open('a') as f:f.write(repr(args)+'\\n')\n"
+            "sys.stdout.write(''.join(sorted(pathlib.Path(args[-1]).read_text().splitlines(True))))\n")
+        old=self.prepare()
+        self.site.write_text(SITE+'new.cn\n')
+        new=self.prepare('next',old)
+        self.invoke('verify',new)
+        calls=(self.root/'sort.calls').read_text()
+        self.assertNotIn("'-o'",calls)
+
+    def test_sort_failure_not_masked_by_status_marker(self):
+        self.install_sort_double("sys.stdout.write(pathlib.Path(sys.argv[-1]).read_text())\nsys.exit(1)\n")
+        out=self.prepare('failed-sort',rc=1)
+        self.assertFalse((out/'manifest.tsv').exists())
+
+    def test_successful_sort_with_empty_output_rejected(self):
+        self.install_sort_double('sys.exit(0)\n')
+        out=self.prepare('empty-sort',rc=1)
+        self.assertFalse((out/'manifest.tsv').exists())
+
     def test_failed_download_and_empty_files(self):
         for target in (self.ip,self.site):
             before=target.read_bytes();target.write_bytes(b'')

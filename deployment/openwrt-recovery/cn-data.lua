@@ -128,8 +128,14 @@ local known_regex={
 }
 local forbidden_tld={com=true,net=true,org=true,edu=true,gov=true,io=true,dev=true,app=true,uk=true,us=true,jp=true,de=true,fr=true,au=true,ru=true}
 local function sortfile(input, output)
- local ok=command('LC_ALL=C sort -o '..quote(output)..' '..quote(input))
+ -- Minimal OpenWrt BusyBox sort may silently ignore -o and still exit zero.
+ -- Shell redirection works with its [-nru] implementation as well as full sort.
+ if input==output then fail('CN-site sort input and output must differ') end
+ local ok=command('LC_ALL=C sort '..quote(input)..' > '..quote(output))
  if not ok then fail('cannot sort CN-site for bounded-memory validation') end
+ local f=io.open(output,'rb')
+ if not f then fail('CN-site sorted output unavailable') end
+ f:close()
 end
 local function domains(path, sorted)
  sortfile(path, sorted)
