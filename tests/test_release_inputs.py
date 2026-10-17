@@ -105,7 +105,7 @@ class Evidence:
             "qemu-nft-cli": json.dumps(dict(ok=True, checks=len(cases), sanitized=False, device_or_kernel_evidence=False)) + "\n",
         })
         test_names = verify.re.findall(rb"(?m)^    def (test_[a-z0-9_]+)\(self\):", self.source["c/tests/fixed_integration.py"])
-        self.outputs["qemu-final-apk-integration"] = "".join(name.decode() + " (__main__.FixedIntegration." + name.decode() + ") ... ok\n" for name in test_names) + "\nRan 12 tests in 1.234s\n\nOK\n"
+        self.outputs["qemu-final-apk-integration"] = "".join(name.decode() + " (__main__.FixedIntegration." + name.decode() + ") ... ok\n" for name in test_names) + "\nRan 13 tests in 1.234s\n\nOK\n"
         app_record, list_record = record(), record(b"/usr/sbin/diversion-dns-c-lite\n")
         metadata = {"info": {"name": "diversion-dns-c-lite", "arch": arch, "version": version + "-r1", "license": "GPL-3.0-or-later",
                               "depends": ["libc", "libpthread"], "installed-size": app_record["bytes"] + list_record["bytes"]}, "paths": []}
@@ -360,7 +360,7 @@ class ReleaseInputs(unittest.TestCase):
         fixture = self.fixture()
         edits = [("apk-version", "0.1.0", "0.2.0"), ("qemu-cache_domain_test", "43200", "143200"),
                  ("qemu-nft_netlink_test", "170", "169"), ("qemu-domain-fixture", "70 assertions", "7 assertions"),
-                 ("qemu-final-apk-integration", "Ran 12", "Ran 11"), ("qemu-final-apk-integration", "... ok", "... skipped 'why'"),
+                 ("qemu-final-apk-integration", "Ran 13", "Ran 12"), ("qemu-final-apk-integration", "... ok", "... skipped 'why'"),
                  ("qemu-final-apk-integration", "\nOK\n", "\nFAILED (failures=1)\n"),
                  ("qemu-dns_test", "tests passed", "tests")]
         for name, before, after in edits:

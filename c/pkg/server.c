@@ -540,6 +540,7 @@ int md_server_run(md_engine *e, unsigned workers, char *err) {
         int rc = md_thread_create(&threads[started], work, &roles[started]);
         if (rc) { snprintf(err, MD_ERROR_SIZE, "worker: %s", strerror(rc)); goto cleanup; }
     }
+    if (md_engine_start(e, err)) goto cleanup;
     struct sigaction handler, old_int, old_term;
     memset(&handler, 0, sizeof(handler)); handler.sa_handler = stop_signal;
     sigemptyset(&handler.sa_mask); stop_requested = 0;

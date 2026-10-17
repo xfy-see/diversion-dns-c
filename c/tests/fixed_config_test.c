@@ -200,13 +200,43 @@ static void actual_rules_are_checked(void) {
     assert(strstr(err, rules_path)); assert(strstr(err, "3"));
     const char *good = "domain:cn\nfull:exact.test\n"; write_bytes(rules_path, good, strlen(good));
 }
+static void cache_policy_contract(void) {
+    char extra[2048];
+    accept_config("cache_stale_ttl=0\n"); accept_config("cache_stale_ttl=86400\ncache_stale_ttl_cn=30\ncache_stale_answer_ttl=300\n");
+    accept_config("cache_prefetch_percent=10\ncache_prefetch_max=64\ncache_max_bytes=4096\ncache_foreign_reserve_percent=90\n");
+    accept_config("cache_max_bytes=0\ncache_prefetch_percent=0\n");
+    snprintf(extra, sizeof(extra), "cache_stale_ttl=60\ncache_stale_override=0:%s\ncache_stale_override=10:%s\n", rules_path, rules_path); accept_config(extra);
+    snprintf(extra, sizeof(extra), "cache_warm_file=%s/warm.txt\ncache_warm_max=10000\ncache_warm_qps=100\ncache_warm_save_interval=30\n", test_dir); accept_config(extra);
+    const char *bad[] = {
+        "cache_stale_ttl=86401\n", "cache_stale_ttl=-1\n", "cache_stale_ttl_cn=86401\n", "cache_stale_answer_ttl=0\n", "cache_stale_answer_ttl=301\n",
+        "cache_prefetch_percent=51\n", "cache_prefetch_max=0\n", "cache_prefetch_max=65\ncache_prefetch_percent=10\n", "cache_prefetch_max=8\n",
+        "cache_max_bytes=4095\n", "cache_max_bytes=4294967296\n", "cache_foreign_reserve_percent=91\n",
+        "cache_lazy_ttl=30\ncache_stale_ttl=30\n", "cache_lazy_ttl=30\ncache_stale_ttl_cn=30\n",
+        "cache_size=0\ncache_stale_ttl=30\n", "cache_size=0\ncache_prefetch_percent=10\n",
+        "cache_warm_max=10\n", "cache_warm_qps=10\n", "cache_warm_save_interval=60\n",
+        "cache_warm_file=/tmp/x\ncache_warm_qps=0\n", "cache_warm_file=/tmp/x\ncache_warm_qps=101\n",
+        "cache_warm_file=/tmp/x\ncache_warm_save_interval=29\n", "cache_warm_file=/tmp/x\ncache_warm_max=0\n",
+        "cache_stale_override=60\n", "cache_stale_override=60:\n", "cache_stale_override=x:/tmp/r\n", "cache_stale_override=86401:/tmp/r\n",
+        "cache_stale_override=0:/definitely/missing/stale.txt\n"
+    };
+    for (size_t i = 0; i < sizeof(bad)/sizeof(bad[0]); ++i) reject(bad[i]);
+    snprintf(extra, sizeof(extra), "cache_lazy_ttl=30\ncache_stale_override=0:%s\n", rules_path); reject(extra);
+    size_t used = 0;
+    for (unsigned i = 0; i < 9; ++i) used += (size_t)snprintf(extra + used, sizeof(extra) - used, "cache_stale_override=1:%s\n", rules_path);
+    assert(used < sizeof(extra)); reject(extra);
+    const char *single[] = {"cache_stale_ttl=1", "cache_stale_ttl_cn=1", "cache_stale_answer_ttl=1", "cache_prefetch_percent=1",
+        "cache_max_bytes=0", "cache_foreign_reserve_percent=1", "cache_warm_file=/tmp/x"};
+    for (size_t i = 0; i < sizeof(single)/sizeof(single[0]); ++i) {
+        snprintf(extra, sizeof(extra), "%s\n%s\n", single[i], single[i]); reject(extra);
+    }
+}
 int main(void) {
     strcpy(test_dir, "/tmp/mosdns-fixed-config-XXXXXX"); assert(mkdtemp(test_dir));
     snprintf(config_path, sizeof(config_path), "%s/config.conf", test_dir);
     snprintf(rules_path, sizeof(rules_path), "%s/cn.txt", test_dir);
     const char *rules = "domain:cn\nfull:exact.test\n"; write_bytes(rules_path, rules, strlen(rules));
     snprintf(valid, sizeof(valid), "listen_udp=127.0.0.1:5300\ncn_domain_file=%s\ncn_upstream=127.0.0.1:5301\nforeign_upstream=127.0.0.1:5302\n", rules_path);
-    basic_contract(); malformed_contract(); repeat_limits(); byte_limits(); literal_value_characters(); actual_rules_are_checked();
+    basic_contract(); malformed_contract(); repeat_limits(); byte_limits(); literal_value_characters(); actual_rules_are_checked(); cache_policy_contract();
     assert(!unlink(config_path)); assert(!unlink(rules_path)); assert(!rmdir(test_dir));
     puts("fixed config: strict keys, bounds, lists, diagnostics and rules preflight passed"); return 0;
 }

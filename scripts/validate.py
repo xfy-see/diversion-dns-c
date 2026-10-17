@@ -37,7 +37,7 @@ def main():
     result=dict(completed=False,commit=m['commit'],run_id=m['run_id'],target=m['target'],profiles=list(m['profiles']),
                 suites=suites,regex_backends=backends,
                 started_utc=datetime.now(timezone.utc).isoformat(),compilers_invoked=False,commands=commands,
-                scope='Five C suites, shared domain fixture, service integration suite, 18 nft CLI grammar/failure checks and CLI smoke per current profile. Archived legacy bundles retain their 15 nft CLI checks and plan integrations. No real kernel NFT writes or performance/stability proof.')
+                scope='Five C suites, domain fixtures, service integration, cache refresh/warm-file safety when present, nft CLI contract and CLI smoke per profile. Archived bundles retain their original available suites. No real kernel NFT writes or performance/stability proof.')
 
     def run(label, argv, env, timeout=90):
         r=subprocess.run([str(v) for v in argv],cwd=source,env=env,capture_output=True,text=True,timeout=timeout)
@@ -64,6 +64,14 @@ def main():
             run(label+'-domain',domain_fixture_command(source,tests['domain_driver'],profile),env)
             integration='fixed_integration.py' if fixed else 'integration.py'
             run(label+'-integration',[sys.executable,source/'c/tests'/integration,app],env)
+            if fixed:
+                for suite in ('cache_refresh_safety', 'cache_warm_safety'):
+                    runner = source/'c/tests'/(suite+'_test.py')
+                    # Preserve validation of historical bundles whose source
+                    # predates these standalone regression suites.
+                    if runner.exists():
+                        run(label+'-'+suite,[sys.executable,runner,'--application',app,
+                                            '--output',out/(label+'-'+suite)],env,timeout=180)
             if not fixed:
                 run(label+'-plan-integration',[sys.executable,source/'c/tests/plan_integration.py',app],env)
             argv=[sys.executable,source/'c/tests/nft_cli_test.py','--driver',tests['nft_cli_driver'],'--output',out/(label+'-nft')]

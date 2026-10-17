@@ -48,7 +48,7 @@ def config_text(config, rules):
 
 
 @contextlib.contextmanager
-def running(config, *, nofile=None, process_info=None):
+def running(config, *, nofile=None, process_info=None, env=None, output=None):
     with tempfile.TemporaryDirectory(prefix="fixed-dns-integration-") as tmp:
         root = Path(tmp)
         rules = root / "cn.txt"
@@ -63,7 +63,8 @@ def running(config, *, nofile=None, process_info=None):
                     "import os,resource,sys; n=int(sys.argv[1]); "
                     "resource.setrlimit(resource.RLIMIT_NOFILE,(n,n)); "
                     "os.execv(sys.argv[2],sys.argv[2:])", str(nofile)] + argv
-        process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        child_env = None if env is None else {**os.environ, **env}
+        process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=child_env)
         if process_info is not None:
             process_info["pid"] = process.pid
         port = int(config["listen_tcp"].rsplit(":", 1)[1])
@@ -91,6 +92,8 @@ def running(config, *, nofile=None, process_info=None):
                 raise AssertionError(f"server failed to stop: {out!r} {err!r}")
             if process.returncode != 0:
                 raise AssertionError(f"server exit {process.returncode}: {err.decode()} {out.decode()}")
+            if output is not None:
+                output["stderr"] = err.decode()
 
 
 class MockDNS(support.MockDNS):
@@ -102,6 +105,8 @@ class MockDNS(support.MockDNS):
     def reply(self, packet, transport):
         response = super().reply(packet, transport)
         name, typ, cls, end = question(packet)
+        if self.mode == "servfail":
+            return response[:2] + struct.pack("!5H", 0x8182, 1, 0, 0, 0) + packet[12:end]
         if name.startswith("alias."):
             target = "target.foreign.test" if self.address.startswith("192.") else "target.cn"
             wire = b"".join(bytes([len(label)]) + label.encode() for label in target.split(".")) + b"\0"
@@ -332,6 +337,51 @@ class FixedIntegration(unittest.TestCase):
                     time.sleep(0.025)
                 time.sleep(0.2)
                 self.assertEqual(mock.count("lazy.fixed.test"), 2)
+        finally:
+            mock.close()
+
+    def test_stale_servfail_keeps_answer_stats_and_warm_file(self):
+        mock = MockDNS("203.0.113.77", ttl=2)
+        name = "keep.fixed.test"
+        try:
+            with tempfile.TemporaryDirectory(prefix="fixed-dns-warm-") as tmp:
+                warm = Path(tmp) / "warm.txt"
+                config = self.config(cache_stale_ttl=30, foreign_upstream=f"127.0.0.1:{mock.port}",
+                                     cache_warm_file=str(warm), cache_warm_qps=50)
+                output = {}
+                with running(config, env={"DIVERSION_CACHE_STATS": "1"}, output=output) as port:
+                    self.assertEqual(address(udp_exchange(port, query(name, 800))), "203.0.113.77")
+                    udp_exchange(port, query(name, 801))
+                    time.sleep(2.1)
+                    mock.mode = "servfail"
+                    for ident in (802, 803):
+                        response = udp_exchange(port, query(name, ident))
+                        self.assertEqual(struct.unpack_from("!H", response, 2)[0] & 15, 0)
+                        self.assertEqual(address(response), "203.0.113.77")
+                        self.assertEqual(struct.unpack_from("!I", response, question(response)[3] + 6)[0], 30)
+                        deadline = time.monotonic() + 3
+                        while mock.count(name) < 2 and time.monotonic() < deadline:
+                            time.sleep(0.02)
+                        time.sleep(0.1)
+                # Failed refreshes back off for 5 seconds; the second stale
+                # hit must preserve the answer without sending another query.
+                self.assertEqual(mock.count(name), 2)
+                stats = output["stderr"]
+                self.assertRegex(stats, r"cache stats foreign: .*fresh_hit=1 stale_hit=2 miss_cold=1")
+                self.assertRegex(stats, r"refresh_kept_old=1\b")
+                text = warm.read_text()
+                self.assertIn(f"0 1 {name}\n", text)
+                self.assertNotIn("203.0.113", text)
+                mock.mode = "normal"
+                before = mock.count(name)
+                with running(config) as port:
+                    deadline = time.monotonic() + 3
+                    while mock.count(name) == before and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    self.assertEqual(mock.count(name), before + 1)
+                    time.sleep(0.1)
+                    self.assertEqual(address(udp_exchange(port, query(name, 810))), "203.0.113.77")
+                    self.assertEqual(mock.count(name), before + 1)
         finally:
             mock.close()
 

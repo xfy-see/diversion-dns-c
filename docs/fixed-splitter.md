@@ -80,7 +80,19 @@ cache_size=1024 # explanation
 | `cn_upstream` | 必填列表，1–64 个数字 UDP/TCP 上游 | 报错 |
 | `foreign_upstream` | 必填列表，1–64 个数字 UDP/TCP 上游 | 报错 |
 | `cache_size` | 单值，0–10000000 条；0 禁用缓存 | 1024 |
-| `cache_lazy_ttl` | 单值，0–4294967295 秒；0 关闭 lazy | 0 |
+| `cache_lazy_ttl` | 单值，0–4294967295 秒；旧键：正向回答**自写入起**的总保留时间（不是 TTL 之后追加）；0 关闭。与 `cache_stale_ttl*`/`cache_stale_override` 互斥 | 0 |
+| `cache_stale_ttl` | 单值，0–86400 秒；国外组正向回答在 **TTL 到期之后**可额外 stale 服务的秒数（RFC 8767）；建议 30–120 | 0（关闭） |
+| `cache_stale_ttl_cn` | 单值，0–86400 秒；CN 组同上 | 0（关闭） |
+| `cache_stale_answer_ttl` | 单值，1–300 秒；stale 回答中写入的 TTL | `cache_stale_ttl*` 模式 30；旧 lazy 模式 5 |
+| `cache_stale_override` | 列表，最多 8 项，`<秒>:<域名规则文件>`（规则语法同 `cn_domain_file`）；首个匹配生效，覆盖该域名 stale 秒数，0 禁用（DDNS、快速切换） | 无 |
+| `cache_prefetch_percent` | 单值，0–50；被复用（≥2 次命中）的新鲜条目剩余 TTL ≤ 原 TTL×百分比（抖动 0.75–1.25×）时后台预取；建议 10 | 0（关闭） |
+| `cache_prefetch_max` | 单值，1–64；并发预取上限（同时受总刷新上限 64 约束）；需 `cache_prefetch_percent` | 8 |
+| `cache_max_bytes` | 单值，0 或 4096–4294967295；按字节限制缓存（每条按 96 字节固定开销 + key + 报文计） | 0（仅条目上限） |
+| `cache_foreign_reserve_percent` | 单值，0–90；国外条目占用不超过该比例（条目与字节）时，淘汰优先取 CN 条目，CN 冷门域名不能挤掉国外热点 | 0（全局 LRU） |
+| `cache_warm_file` | 单值；重启预热文件路径，只保存域名（不保存 IP），原子写入（同目录临时文件 + fsync + rename） | 不预热 |
+| `cache_warm_max` | 单值，1–10000；保存/预热的最多名称数；需 `cache_warm_file` | 512 |
+| `cache_warm_qps` | 单值，1–100；启动预热的速率（单线程顺序） | 10 |
+| `cache_warm_save_interval` | 单值，30–86400 秒；周期保存间隔（退出时也保存） | 600 |
 | `cn_mark` / `foreign_mark` | 各一个 uint32，十进制或 `0x` | 0，不设置 mark |
 | `cn_interface` / `foreign_interface` | 各一个，1–63 可打印 ASCII 字节，不含空白或斜杠 | 不绑定接口 |
 | `cn_concurrent` / `foreign_concurrent` | 各一个，1–3 | 1 |
@@ -100,7 +112,7 @@ cache_size=1024 # explanation
 | `udp_sport_reuse_pool` | 单值，1–4；每 worker 每上游可停放的空闲 UDP socket 数（仅启用时生效） | 2 |
 
 必须至少配置一个 listener。UDP 和 TCP listener **合计最多 64 个**，同一传输中的重复
-数字地址被拒绝。`cache_size=0` 时，非零 `cache_lazy_ttl` 会报错。
+数字地址被拒绝。`cache_size=0` 时，非零 `cache_lazy_ttl` 或任何 `cache_stale_*`/`cache_prefetch_*`/`cache_max_bytes`/`cache_foreign_reserve_percent`/`cache_warm_*` 键会报错。
 
 监听地址及上游的缺省端口为 53，显式端口为 1–65535。使用明确数字地址；不支持 hostname
 或 `:53` 的空主机缩写。监听所有 IPv4 地址可写 `0.0.0.0:53`。带端口的 IPv6 必须加方括号。
@@ -147,15 +159,41 @@ nft 执行模块保留原语义：只学习 Answer 中 IN A/AAAA，不读取 CNA
   等待 worker 的连接不淘汰，都不可淘汰时拒绝新连接。IPv6 按完整地址计数
 - 最坏情况报文对象内存约（3×64 + `tcp_max_connections`）× 128 KiB，按需分配
 
-## 缓存与 lazy 刷新
+## 缓存、stale 与预取
 
-- 容量有界，hash + LRU；TTL 随存储时长递减，容量单位是条目而非字节
-- NXDOMAIN 保留 30 秒，SERVFAIL 保留 5 秒；空 Answer 的 NOERROR 受记录最小 TTL 和 300 秒上限约束，没有可用 TTL 时不缓存
-- 正向回答的 `cache_lazy_ttl` 是从最初存储时刻开始计算的总保留时间，不是在 DNS TTL 之后再加一段 stale 时间
-- stale 命中将普通记录 TTL 设为 5 秒，并尝试异步刷新；同 key 刷新去重，总计最多 64 个刷新任务
-- 刷新使用首次分类的同一上游组及同一 CN 最终处理路径，绝不跨组；上游交换失败不会主动删除已有 stale 回答
+- 容量有界，hash + 每组（CN/国外）一条 LRU，跨组按全局使用序号比较，默认等价于一条全局 LRU；
+  容量单位是条目，可再加 `cache_max_bytes` 字节上限；`cache_foreign_reserve_percent` 为国外热点保留份额
+- NXDOMAIN 保留 30 秒，SERVFAIL 保留 5 秒；空 Answer 的 NOERROR 受记录最小 TTL 和 300 秒上限约束，没有可用 TTL 时不缓存；
+  这些负面/错误回答都不会 stale 服务
+- 旧键 `cache_lazy_ttl` 保持原语义：正向回答从最初存储时刻开始计算的**总**保留时间（TTL 大于它时会更早删除），
+  stale 记录 TTL 为 5 秒。新键 `cache_stale_ttl`（国外）/`cache_stale_ttl_cn`（CN）是 **TTL 到期之后**追加的秒数，
+  硬截止 = 写入时刻 + TTL + stale 秒数，stale 回答 TTL 默认 30 秒（RFC 8767 建议）。两套键互斥
+- stale 命中立即回答旧数据并尝试异步刷新；同 key 刷新去重（stale 刷新与预取共用占位），总计最多 64 个刷新任务。
+  后台刷新启动尝试另受每个引擎 64 次/秒、突发 8 次的令牌桶限制（分配/线程创建失败也消耗令牌）；前台首次查询不受此预算影响。
+  同 key 连续失败后按 5、10、20、30 秒退避（之后保持 30 秒），成功恢复重置；等待下一次命中触发，不延长旧答案硬截止
+- **后台刷新/预取/预热**得到 SERVFAIL（或超时、无响应）时，硬截止前**不替换**仍有效的正向旧回答
+  ；后台刷新任务失败计入 `refresh_fail`，确实保留同代旧正答案时计入 `refresh_kept_old`（包括传输超时）。
+  合法的 NXDOMAIN、NODATA 或地址变化正常替换；TTL=0、空 NODATA、超出字节预算或分配失败无法保存新回答时，也撤销旧项。
+  畸形、截断、不匹配、签名响应或暂时错误不会据此撤销旧项。前台未命中时的 SERVFAIL 照旧缓存 5 秒
+- 预取：被复用（≥2 次命中，固定）的正向新鲜条目在剩余 TTL ≤ TTL×`cache_prefetch_percent`%（每条随机抖动 0.75–1.25×，
+  至少 1 秒，TTL<2 秒不预取）时由 worker 启动一次后台刷新；每个已存回答最多认领一次，并发受 `cache_prefetch_max` 限制，
+  被刷新并发/速率限制拒绝后，下一次命中可重新认领；失败后须先经过同 key 退避。若任务在进入 worker 前被队列丢弃，认领仍可能保留至条目更新/过期。
+  需要预取的国外新鲜命中改走缓存 lane（事件循环不创建线程），其余国外新鲜命中仍在事件循环回答。
+  默认关闭：它增加上游查询数（每个热点每个 TTL 约多一次），建议从 10 开始
+- 刷新使用首次分类的同一上游组及同一 CN 最终处理路径，绝不跨组
+- **nft 决策**：CN 的 stale 命中照旧经 nft（与 fresh 命中相同，受热命中跳过窗口约束）；CN 的预取、stale 刷新与启动预热结果
+  也经 `finalize` 写 nft，使新地址在客户端使用前已在集合中；国外回答从不写 nft。CN 集合学习仍只来自 CN 组回答
 - 保留旧的错误边界：取得有效 DNS 回答后，即使 nft 最终处理失败，该回答仍可能入缓存；后续命中仍重新执行 nft，并继续报告学习失败
-- `cache_size=0` 完全跳过缓存及 lazy 刷新
+- 重启预热：`cache_warm_file` 周期（及退出时）保存最近被复用的 A/AAAA 名称，每行 `<key标志位> <qtype> <name>`，只含名称，
+  从不保存地址；全部监听器和工作线程启动成功后，由维护线程按 `cache_warm_qps` 顺序经正常解析路径预热（CN 经 nft），已缓存的名称跳过。配置或绑定失败不会读取、覆盖旧名单。
+  文件必须是普通文件，拒绝符号链接、FIFO 和设备；最多读取 4 MiB / 20000 行（含空行、坏行），过长或含 NUL 的行整行丢弃。保存使用同目录随机独占临时文件（0600），完成 fsync 后原子替换；既有符号链接或特殊文件不会被替换。
+- 统计：每个请求在每组只计一次：`fresh_hit`、`stale_hit`、`miss_cold`（近期未见）、`miss_evicted`（被容量淘汰）、
+  `miss_expired`（超过截止）、`bypass`（ECS/EDNS 选项等不可缓存），以及 `refresh_ok`/`refresh_fail`/`refresh_kept_old`/
+  `prefetch`/`evictions`/`warm`。淘汰原因由 4096 槽位的 ghost 表近似判定。设置环境变量 `DIVERSION_CACHE_STATS=1` 时退出前打印到
+  stderr；`DIVERSION_CACHE_STATS=<N>`（N≥5）另外每 N 秒打印一次。计数使用 relaxed 原子量，开销是每请求一次原子加
+- `refresh_ok` 表示后台任务取得并最终处理有效的 NOERROR/NXDOMAIN，包含有效但不可缓存而撤销旧项的情况；不是“成功插入缓存”的计数。
+  `refresh_fail` 也包括后台任务分配/线程创建失败；`prefetch` 只计实际启动的预取线程，CN 的调度探测与 worker 查找合计只增加一次命中/热度。预热查询仍单独计入 `warm`
+- `cache_size=0` 完全跳过缓存、刷新、预取与预热
 
 ## 域名规则
 
