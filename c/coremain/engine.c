@@ -423,7 +423,8 @@ static int resolve_ex(md_engine *e, bool cn, const md_packet *query, const md_dn
     md_dns_view *view = md_dns_view_scratch();
     if (!view) return fail(err, "out of memory for DNS view");
     md_trace_mark(MD_T_UP_SEND);
-    int rc = md_forward_policy_q(group->policy, group->items, group->count, group->concurrent, query, qv, response, view, err);
+    int rc = group->policy ? md_forward_policy_q(group->policy, group->items, group->count, group->concurrent, query, qv, response, view, err) :
+                            md_forward_q(group->items, group->count, group->concurrent, query, qv, response, view, err);
     md_trace_mark(MD_T_UP_RECV);
     /* md_forward_view 只交出已校验的响应；防御性地在 view 缺失时重新解析。 */
     if (response->len && (!view->valid || view->len != response->len) && md_dns_view_parse(response, view, err)) {
