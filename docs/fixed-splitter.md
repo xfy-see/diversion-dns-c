@@ -360,3 +360,7 @@ NOERROR 和 NXDOMAIN 是有效终态，不用竞争掩盖负答案。达到 hedg
 只对确定未提交的 generation 冲突最多尝试 8 次并退避，保持原 5 秒总截止；
 不确定的发送/ACK 失败仍然失败关闭。错误记录包含 numeric errno、ERESTART 标识、generation、
 序列号、目标集合及冲突耗尽次数，避免 musl 的 “No error information” 隐去关键诊断。
+
+TCP 上游复用连接在发出查询后、收到任何响应 framing 字节前遭遇 `ECONNRESET` 时，
+与已有 EOF 分支一样只重建一次新连接；部分响应或新建连接失败仍返回错误，不循环重试。
+该修复同时适用于默认路径和可选健康策略，覆盖服务端每回答一次即关闭连接的竞争窗口。

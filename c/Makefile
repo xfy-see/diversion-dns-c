@@ -80,6 +80,7 @@ integration: $(BUILD)/mosdns-c
 	python3 tests/cache_refresh_safety_test.py --application $(BUILD)/mosdns-c --output $(BUILD)/cache-refresh-$$(date +%s)-$$$$
 	python3 tests/cache_warm_safety_test.py --application $(BUILD)/mosdns-c --output $(BUILD)/cache-warm-$$(date +%s)-$$$$
 	python3 tests/upstream_resilience_test.py --application $(BUILD)/mosdns-c --output $(BUILD)/upstream-resilience-$$(date +%s)-$$$$
+	python3 tests/upstream_tcp_reset_test.py --application $(BUILD)/mosdns-c --output $(BUILD)/upstream-tcp-reset-$$(date +%s)-$$$$
 test: unit integration
 clean:
 	rm -f $(BUILD)/mosdns-c $(BUILD)/libmosdns-c.a $(LIBOBJ) $(APPOBJ) $(addprefix $(BUILD)/tests/,$(TESTS) $(DRIVERS))

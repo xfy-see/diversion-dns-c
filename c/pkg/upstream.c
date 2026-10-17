@@ -600,7 +600,15 @@ static int advance(exchange *x, short events, const md_packet *q, const md_quest
         uint8_t *data = prefix ? x->prefix : x->packet.data;
         size_t wanted = prefix ? 2 : x->packet.len;
         ssize_t n = recv(x->fd, data + x->done, wanted - x->done, 0);
-        if (n < 0) { if (again()) return 0; syserr(err, "receive upstream TCP"); stop(x); return -1; }
+        if (n < 0) {
+            if (again()) return 0;
+            /* A peer may reset instead of sending FIN after our pooled send.
+             * Match the EOF recovery only before any response framing byte;
+             * the fresh connection clears reused, so this cannot loop. */
+            if (errno == ECONNRESET && x->reused && prefix && !x->done)
+                return begin_connection(x, x->upstream, x->tcp, false, err);
+            syserr(err, "receive upstream TCP"); stop(x); return -1;
+        }
         /* A pooled connection the upstream closed while idle can still accept
          * our send; EOF before any response byte then gets one fresh connection.
          * Random upstream IDs (M4) make such reuse common, so this is required. */
