@@ -126,7 +126,7 @@ elif name == "mv":
         sys.exit(0)
     finish()
 elif name == "nft":
-    finish()
+    finish(1 if control.get("missing_policy") else 0)
 elif name == "flock":
     fd = int(args[-1])
     operation = fcntl.LOCK_UN if "-u" in args else fcntl.LOCK_EX
@@ -261,13 +261,13 @@ class RecoveryFixture(unittest.TestCase):
         self.assert_original_dns()
         self.assertTrue((self.base / "degraded").exists())
 
-    def test_success_checks_both_routes_and_families_before_switching(self):
+    def test_success_requires_cn_rounds_before_switching_and_checks_foreign_after(self):
         self.execute("recover.sh", "--automatic", expected=0)
         calls = self.calls()
         preflight = [item for item in calls if item[0] == "lua" and item[3] == "15363"
-                     and item[-1] == "health"]
-        self.assertEqual(len(preflight), 12)
-        for suffix in ("qq.com", "example.com"):
+                     and item[-1] == "health" and item[4].endswith("qq.com")]
+        self.assertEqual(len(preflight), 6)
+        for suffix in ("qq.com",):
             for qtype in ("A", "AAAA"):
                 matching = [item for item in preflight
                             if item[4].rstrip(".").endswith(suffix) and item[5] == qtype]
@@ -275,13 +275,18 @@ class RecoveryFixture(unittest.TestCase):
                 # A distinct, uncached name is needed in every round.
                 self.assertEqual(len({item[4] for item in matching}), 3)
         frontend = [item for item in calls if item[0] == "lua" and item[3] == "53"
-                    and item[-1] in ("health", "positive")]
-        self.assertEqual(len(frontend), 8)
+                    and item[-1] in ("health", "positive")
+                    and not item[4].endswith("example.com")]
+        self.assertEqual(len(frontend), 4)
         first_mutation = next(i for i, call in enumerate(calls)
                               if call[0] == "uci" and any(
                                   value in ("set", "delete", "add_list", "commit")
                                   for value in call[1:]))
         self.assertTrue(all(calls.index(item) < first_mutation for item in preflight))
+        foreign = [item for item in calls if item[0] == "lua"
+                   and item[4].endswith("example.com")]
+        self.assertEqual(len(foreign), 4)
+        self.assertTrue(all(calls.index(item) > first_mutation for item in foreign))
         state = self.state()
         self.assertTrue(state["c_running"])
         self.assertTrue(state["start_snapshot_complete"])
@@ -301,8 +306,8 @@ class RecoveryFixture(unittest.TestCase):
         self.assertTrue(self.state()["c_running"])
         self.assertFalse((self.base / "degraded").exists())
 
-    def test_each_preflight_route_and_family_failure_leaves_fallback_live(self):
-        for suffix in ("qq.com", "example.com"):
+    def test_each_cn_preflight_family_failure_leaves_fallback_live(self):
+        for suffix in ("qq.com",):
             for qtype in ("A", "AAAA"):
                 with self.subTest(suffix=suffix, qtype=qtype):
                     self.control(fail_probes=[{"port": "15363", "suffix": suffix,
@@ -315,6 +320,21 @@ class RecoveryFixture(unittest.TestCase):
                     self.assertTrue((self.base / "degraded").exists())
                     self.assertFalse((self.base / "recovering").exists())
 
+    def test_recovery_succeeds_with_cn_healthy_and_foreign_unavailable(self):
+        self.control(fail_probes=[{"suffix": "example.com"}])
+        self.execute("recover.sh", "--automatic", expected=0)
+        self.assertTrue(self.state()["c_running"])
+        self.assertEqual(self.state()["uci"]["dhcp.@dnsmasq[0].server"],
+                         ["127.0.0.1#15363"])
+        self.assertFalse((self.base / "degraded").exists())
+        self.assertFalse((self.base / "recovering").exists())
+        self.assertFalse((self.base / "recovery-auto").exists())
+        self.assertTrue((self.run / "foreign-degraded").exists())
+        self.assertEqual(len(self.calls("dnsmasq")), 1)
+        readiness = [item for item in self.calls("lua") if item[-1] == "allow-response"]
+        self.assertEqual(len(readiness), 1)
+        self.assertTrue(readiness[0][4].endswith("qq.com"))
+
     def test_c_start_failure_preserves_live_fallback(self):
         self.control(fail_c_start=True)
         result = self.execute("recover.sh", "--automatic")
@@ -324,7 +344,7 @@ class RecoveryFixture(unittest.TestCase):
         self.assertFalse(self.calls("lua"))
 
     def test_frontend_probe_failure_restores_saved_dns_before_stopping_c(self):
-        self.control(fail_probes=[{"port": "53", "suffix": "example.com", "qtype": "AAAA"}])
+        self.control(fail_probes=[{"port": "53", "suffix": "qq.com", "qtype": "AAAA"}])
         result = self.execute("recover.sh", "--automatic")
         self.assertNotEqual(result.returncode, 0)
         self.assert_original_dns()
@@ -572,6 +592,323 @@ class RecoveryFixture(unittest.TestCase):
         self.assertTrue((self.base / "degraded").exists())
         self.assertEqual((self.base / "recovery-auto").read_text(), "service-health\n")
         self.assertEqual(len((self.root / "fallback.log").read_text().splitlines()), 1)
+
+    def activate_normal_service(self):
+        for name in ("degraded", "recovery-auto"):
+            (self.base / name).unlink(missing_ok=True)
+        state = self.state()
+        state["c_running"] = True
+        state["uci"]["dhcp.@dnsmasq[0].server"] = ["127.0.0.1#15363"]
+        state["uci"]["dhcp.@dnsmasq[0].cachesize"] = "0"
+        self.statefile.write_text(json.dumps(state))
+        return state["uci"]
+
+    def test_foreign_failure_never_changes_dns_or_stops_cn_service(self):
+        original = self.activate_normal_service()
+        self.control(fail_probes=[{"suffix": "example.com"}],
+                     stop_after_intervals=5, advance_sleep=True)
+        self.execute("guard.sh", expected=0)
+        self.assertEqual(self.state()["uci"], original)
+        self.assertTrue(self.state()["c_running"])
+        self.assertFalse(self.calls("diversion-dns-c"))
+        self.assertFalse(self.calls("dnsmasq"))
+        self.assertFalse((self.root / "fallback.log").exists())
+        self.assertFalse((self.base / "degraded").exists())
+        self.assertFalse((self.base / "recovery-auto").exists())
+        self.assertTrue((self.run / "foreign-degraded").exists())
+        cn = [item for item in self.calls("lua") if item[4].endswith("qq.com")]
+        self.assertEqual(len(cn), 20)  # Both ports/families every round.
+        foreign = [item for item in self.calls("lua") if item[4].endswith("example.com")]
+        self.assertLess(len(foreign), 5)  # Independent outage backoff.
+
+    def test_each_foreign_route_and_family_failure_only_sets_foreign_status(self):
+        original = self.activate_normal_service()
+        for port in ("53", "15363"):
+            for qtype in ("A", "AAAA"):
+                with self.subTest(port=port, qtype=qtype):
+                    (self.run / "foreign-state").unlink(missing_ok=True)
+                    (self.run / "foreign-degraded").unlink(missing_ok=True)
+                    self.control(fail_probes=[{"port": port, "suffix": "example.com",
+                                               "qtype": qtype}])
+                    self.execute("guard.sh", "--once", expected=0)
+                    self.assertEqual(self.state()["uci"], original)
+                    self.assertTrue(self.state()["c_running"])
+                    self.assertTrue((self.run / "foreign-degraded").exists())
+                    self.assertFalse((self.base / "degraded").exists())
+        self.assertFalse(self.calls("dnsmasq"))
+        self.assertFalse(self.calls("diversion-dns-c"))
+
+    def test_foreign_recovery_clears_status_without_service_switch(self):
+        original = self.activate_normal_service()
+        self.control(fail_probes=[{"suffix": "example.com"}])
+        self.execute("guard.sh", "--once", expected=0)
+        self.assertTrue((self.run / "foreign-degraded").exists())
+        self.control()
+        (self.root / "time").write_text("120\n")
+        self.execute("guard.sh", "--once", expected=0)
+        self.assertFalse((self.run / "foreign-degraded").exists())
+        self.assertEqual((self.run / "foreign-state").read_text().split(),
+                         ["test-boot", "0", "140"])
+        self.assertEqual(self.state()["uci"], original)
+        self.assertFalse(self.calls("dnsmasq"))
+        self.assertFalse(self.calls("diversion-dns-c"))
+        self.assertTrue(any("foreign DNS recovered" in item[-1]
+                            for item in self.calls("logger")))
+
+    def test_local_dns_failure_still_triggers_whole_service_fallback(self):
+        self.activate_normal_service()
+        self.control(fail_probes=[{"port": "53", "suffix": "localhost"}],
+                     stop_after_intervals=3, advance_sleep=True)
+        self.execute("guard.sh", expected=0)
+        self.assertTrue((self.base / "degraded").exists())
+        self.assertEqual((self.base / "recovery-auto").read_text(), "service-health\n")
+        self.assertEqual(len((self.root / "fallback.log").read_text().splitlines()), 1)
+        self.assertFalse([item for item in self.calls("lua") if item[4].endswith("example.com")])
+
+    def test_cn_and_foreign_failure_still_triggers_whole_service_fallback(self):
+        self.activate_normal_service()
+        self.control(fail_probes=[{"suffix": "qq.com"}, {"suffix": "example.com"}],
+                     stop_after_intervals=3, advance_sleep=True)
+        self.execute("guard.sh", expected=0)
+        self.assertTrue((self.base / "degraded").exists())
+        self.assertEqual((self.base / "recovery-auto").read_text(), "service-health\n")
+        self.assertEqual(len((self.root / "fallback.log").read_text().splitlines()), 1)
+
+    def test_foreign_backoff_is_bounded_and_does_not_touch_cn_recovery_state(self):
+        self.control(fail_probes=[{"suffix": "example.com"}])
+        (self.run / "state").write_text("test-boot 4 800 0\n")
+        output = self.shell('''for i in 1 2 3 4 5 6; do
+ foreign_health_tick force
+ cat "$run/foreign-state"
+done''')
+        self.assertEqual(output.splitlines(), ["test-boot 1 120", "test-boot 2 140",
+                         "test-boot 3 180", "test-boot 4 260", "test-boot 5 400",
+                         "test-boot 5 400"])
+        self.assertEqual((self.run / "state").read_text(), "test-boot 4 800 0\n")
+        self.assertFalse(self.calls("uci"))
+        self.assertFalse(self.calls("dnsmasq"))
+
+    def install_cn_data_hook(self, result=0):
+        (self.base / "cn-data").mkdir()
+        (self.base / "cn-data/current").symlink_to("generations/fixture")
+        (self.base / "cn-data.sh").write_text(
+            '#!/bin/sh\n'
+            'printf "%s %s\\n" "$DIVERSION_CN_DEPLOY_LOCK_HELD" "$*" '
+            '>> "$RECOVERY_TEST_ROOT/cn-hook"\n'
+            'exit ' + str(result) + '\n')
+        (self.base / "cn-data.sh").chmod(0o755)
+
+    def test_cn_data_hook_receives_lock_handoff_and_failure_does_not_degrade_dns(self):
+        original = self.activate_normal_service()
+        self.install_cn_data_hook(result=1)
+        self.control(stop_after_intervals=3, advance_sleep=True)
+        self.execute("guard.sh", expected=0)
+        self.assertEqual((self.root / "cn-hook").read_text().splitlines(),
+                         ["1 audit-runtime"] * 3)
+        self.assertEqual(self.state()["uci"], original)
+        self.assertFalse((self.base / "degraded").exists())
+        self.assertFalse(self.calls("diversion-dns-c"))
+        self.assertFalse(self.calls("dnsmasq"))
+
+    def test_cn_data_enabled_marker_keeps_audit_active_after_current_pointer_loss(self):
+        self.activate_normal_service()
+        self.install_cn_data_hook()
+        (self.base / "cn-data/current").unlink()
+        (self.base / "cn-data/enabled").write_text("enabled\n")
+        self.execute("guard.sh", "--once", expected=0)
+        self.assertEqual((self.root / "cn-hook").read_text().splitlines(), ["1 audit-runtime"])
+
+    def test_cn_data_generation_without_markers_keeps_audit_active(self):
+        self.activate_normal_service()
+        self.install_cn_data_hook()
+        (self.base / "cn-data/current").unlink()
+        (self.base / "cn-data/generations").mkdir()
+        self.execute("guard.sh", "--once", expected=0)
+        self.assertEqual((self.root / "cn-hook").read_text().splitlines(), ["1 audit-runtime"])
+
+    def test_cn_data_hook_waits_for_interrupted_dns_transaction_reconciliation(self):
+        self.install_cn_data_hook()
+        self.make_transaction(switching=True)
+        self.execute("guard.sh", "--once", expected=0)
+        self.assertFalse((self.root / "cn-hook").exists())
+        self.assertFalse((self.base / "recovering").exists())
+        self.assert_original_dns()
+
+    def test_pending_cn_data_recovery_skips_guard_startup_delay(self):
+        self.activate_normal_service()
+        self.install_cn_data_hook()
+        (self.base / "cn-data/pending").write_text("pending\n")
+        self.control(stop_after_intervals=1)
+        self.execute("guard.sh", expected=0)
+        self.assertNotIn(["sleep", "120"], self.calls("sleep"))
+        self.assertTrue((self.root / "cn-hook").exists())
+
+    def install_policy_hook(self, result=0):
+        (self.base / "cn-policy").mkdir()
+        (self.base / "cn-policy/enabled").write_text("enabled\n")
+        (self.base / "cn-policy.sh").write_text(
+            '#!/bin/sh\n'
+            'printf "%s %s\\n" "$DIVERSION_CN_DEPLOY_LOCK_HELD" "$*" '
+            '>> "$RECOVERY_TEST_ROOT/policy-hook"\n'
+            'exit ' + str(result) + '\n')
+        (self.base / "cn-policy.sh").chmod(0o755)
+        for name in ("apply-policy", "enable-rescue"):
+            (self.base / (name + ".sh")).write_text(
+                '#!/bin/sh\nprintf "%s\\n" ' + name
+                + ' >> "$RECOVERY_TEST_ROOT/policy-actions"\n')
+            (self.base / (name + ".sh")).chmod(0o755)
+
+    def test_rejected_managed_policy_keeps_cn_alive_without_legacy_apply(self):
+        original = self.activate_normal_service()
+        self.install_policy_hook(result=1)
+        self.control(stop_after_intervals=3, advance_sleep=True)
+        self.execute("guard.sh", expected=0)
+        self.assertEqual((self.root / "policy-hook").read_text().splitlines(),
+                         ["1 audit-runtime"] * 3)
+        self.assertEqual((self.root / "policy-actions").read_text().splitlines(),
+                         ["enable-rescue"] * 3)
+        self.assertEqual(self.state()["uci"], original)
+        self.assertFalse((self.base / "degraded").exists())
+        self.assertFalse(self.calls("diversion-dns-c"))
+        self.assertFalse(self.calls("dnsmasq"))
+
+    def test_rejected_managed_policy_with_cn_failure_blocks_unsafe_fallback(self):
+        original = self.activate_normal_service()
+        self.install_policy_hook(result=1)
+        self.control(fail_probes=[{"suffix": "qq.com"}],
+                     stop_after_intervals=3, advance_sleep=True)
+        self.execute("guard.sh", expected=0)
+        self.assertEqual(self.state()["uci"], original)
+        self.assertFalse((self.root / "fallback.log").exists())
+        self.assertFalse((self.base / "degraded").exists())
+        self.assertFalse(self.calls("diversion-dns-c"))
+        self.assertEqual((self.root / "policy-actions").read_text().splitlines(),
+                         ["enable-rescue"] * 3)
+
+    def test_manual_fallback_rejects_bad_data_before_mode_markers_or_helper(self):
+        original = self.activate_normal_service()
+        self.install_cn_data_hook(result=1)
+        self.install_policy_hook()
+        (self.base / "recovery-auto").write_text("service-health\n")
+        self.execute("rollback.sh", "manual", expected=1)
+        self.assertEqual((self.root / "cn-hook").read_text().splitlines(), ["1 check-start"])
+        self.assertFalse((self.root / "policy-hook").exists())
+        self.assertEqual((self.root / "policy-actions").read_text().splitlines(), ["enable-rescue"])
+        self.assertEqual((self.base / "recovery-auto").read_text(), "service-health\n")
+        self.assertEqual(self.state()["uci"], original)
+        self.assertFalse((self.root / "fallback.log").exists())
+        self.assertFalse(self.calls("diversion-dns-c"))
+        self.assertFalse(self.calls("dnsmasq"))
+
+    def test_manual_fallback_rejects_bad_policy_after_readonly_data_check(self):
+        original = self.activate_normal_service()
+        self.install_cn_data_hook()
+        self.install_policy_hook(result=1)
+        self.execute("rollback.sh", "manual", expected=1)
+        self.assertEqual((self.root / "cn-hook").read_text().splitlines(), ["1 check-start"])
+        self.assertEqual((self.root / "policy-hook").read_text().splitlines(), ["1 audit-runtime"])
+        self.assertEqual((self.root / "policy-actions").read_text().splitlines(), ["enable-rescue"])
+        self.assertEqual(self.state()["uci"], original)
+        self.assertFalse((self.root / "fallback.log").exists())
+        self.assertFalse(self.calls("diversion-dns-c"))
+
+    def test_unmanaged_policy_rebuild_also_rejects_managed_bad_data(self):
+        original = self.activate_normal_service()
+        self.install_cn_data_hook(result=1)
+        self.install_policy_hook()
+        shutil.rmtree(self.base / "cn-policy")
+        self.control(missing_policy=True)
+        self.execute("guard.sh", "--once", expected=0)
+        self.assertEqual((self.root / "cn-hook").read_text().splitlines(),
+                         ["1 audit-runtime", "1 check-start"])
+        self.assertEqual((self.root / "policy-actions").read_text().splitlines(), ["enable-rescue"])
+        self.assertEqual(self.state()["uci"], original)
+        self.assertFalse((self.root / "fallback.log").exists())
+        self.assertFalse(self.calls("diversion-dns-c"))
+
+    def test_recovery_rejects_bad_data_before_dns_transaction_and_policy_check(self):
+        self.install_cn_data_hook(result=1)
+        self.install_policy_hook()
+        self.execute("recover.sh", "--automatic", expected=1)
+        self.assertEqual((self.root / "cn-hook").read_text().splitlines(), ["1 check-start"])
+        self.assertFalse((self.root / "policy-hook").exists())
+        self.assertEqual((self.root / "policy-actions").read_text().splitlines(), ["enable-rescue"])
+        self.assertFalse((self.base / "recovering").exists())
+        self.assertTrue((self.base / "degraded").exists())
+        self.assertFalse(self.calls("diversion-dns-c"))
+
+    def test_policy_generation_without_markers_cannot_bypass_guard_verification(self):
+        self.activate_normal_service()
+        self.install_policy_hook(result=1)
+        (self.base / "cn-policy/enabled").unlink()
+        (self.base / "cn-policy/generations").mkdir()
+        self.execute("guard.sh", "--once", expected=0)
+        self.assertEqual((self.root / "policy-hook").read_text().splitlines(), ["1 audit-runtime"])
+        self.assertEqual((self.root / "policy-actions").read_text().splitlines(), ["enable-rescue"])
+        self.assertFalse(self.calls("diversion-dns-c"))
+
+    def test_recovery_rejects_bad_managed_policy_before_transaction_or_c_start(self):
+        self.install_policy_hook(result=1)
+        self.execute("recover.sh", "--automatic", expected=1)
+        self.assertFalse((self.base / "recovering").exists())
+        self.assertFalse(self.calls("diversion-dns-c"))
+        self.assertFalse(self.calls("dnsmasq"))
+        self.assertEqual((self.root / "policy-hook").read_text().splitlines(), ["1 audit-runtime"])
+        self.assert_original_dns()
+
+    def test_recovery_missing_policy_verifier_keeps_fallback_unchanged(self):
+        self.install_policy_hook()
+        (self.base / "cn-policy.sh").unlink()
+        self.execute("recover.sh", "--automatic", expected=1)
+        self.assertFalse((self.base / "recovering").exists())
+        self.assertFalse(self.calls("diversion-dns-c"))
+        self.assert_original_dns()
+
+    def test_recovery_checks_managed_policy_before_creating_dns_transaction(self):
+        self.install_policy_hook()
+        script = self.base / "cn-policy.sh"
+        script.write_text(script.read_text().replace(
+            'exit 0', '[ ! -d "$DIVERSION_DNS_BASE/recovering" ] || exit 75\nexit 0'))
+        self.execute("recover.sh", "--automatic", expected=0)
+        self.assertTrue(self.state()["c_running"])
+        self.assertFalse((self.base / "recovering").exists())
+        self.assertEqual((self.root / "policy-hook").read_text().splitlines(), ["1 audit-runtime"])
+
+    def test_managed_policy_is_not_applied_during_dns_reconciliation(self):
+        self.install_policy_hook(result=1)
+        self.make_transaction(switching=True)
+        self.execute("guard.sh", "--once", expected=0)
+        self.assertFalse((self.root / "policy-hook").exists())
+        self.assertFalse((self.root / "policy-actions").exists())
+        self.assertFalse((self.base / "recovering").exists())
+        self.assert_original_dns()
+
+    def test_isolated_ports_are_used_by_guard_and_recovery(self):
+        self.env.update(DIVERSION_DNS_C_PORT="25363", DIVERSION_DNS_FRONTEND_PORT="2053")
+        self.execute("recover.sh", "--automatic", expected=0)
+        self.assertEqual(self.state()["uci"]["dhcp.@dnsmasq[0].server"],
+                         ["127.0.0.1#25363"])
+        self.assertEqual({item[3] for item in self.calls("lua")}, {"25363", "2053"})
+
+    def test_isolated_policy_table_is_used_without_production_table_access(self):
+        self.activate_normal_service()
+        self.env["DIVERSION_DNS_POLICY_TABLE"] = "ddns_p0_fixture"
+        self.execute("guard.sh", "--once", expected=0)
+        self.assertTrue(self.calls("nft"))
+        self.assertTrue(all(item[4] == "ddns_p0_fixture" for item in self.calls("nft")))
+
+    def test_invalid_isolated_port_or_interval_exits_before_actions(self):
+        for variable, value in (("DIVERSION_DNS_C_PORT", "0"),
+                                ("DIVERSION_DNS_FRONTEND_PORT", "65536"),
+                                ("DIVERSION_DNS_GUARD_INTERVAL", "0"),
+                                ("DIVERSION_DNS_GUARD_STARTUP", "-1"),
+                                ("DIVERSION_DNS_POLICY_TABLE", "bad;table")):
+            with self.subTest(variable=variable):
+                self.env[variable] = value
+                self.execute("guard.sh", "--once", expected=2)
+                self.env.pop(variable)
+        self.assertFalse(self.calls("lua"))
+        self.assertFalse(self.calls("uci"))
 
     def test_retry_delay_is_exponential_and_bounded(self):
         result = self.shell('for recovery_failures in 1 2 3 4 5 6 99; do recovery_delay; done')

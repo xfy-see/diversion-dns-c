@@ -34,9 +34,11 @@ case "$name" in
  lua)
   # script, host, port, question, qtype, mode
   port=$3; domain=$4; qtype=$5; mode=${6:-}
-  if [ "$port" = 15363 ] && [ "$mode" = health ]; then
-   [ "$(cat "$r/servers")" = '192.0.2.53 198.51.100.53' ] || exit 96
-   echo "$domain $qtype" >> "$r/preflight"
+  if [ "$port" = 15363 ] && [ "$mode" = health ] && [ -d "$r/base/recovering" ]; then
+   case "$domain" in *.qq.com)
+    [ "$(cat "$r/servers")" = '192.0.2.53 198.51.100.53' ] || exit 96
+    echo "$domain $qtype" >> "$r/preflight";;
+   esac
   fi
   if [ -f "$r/fail-probe" ]; then
    read -r fp suffix ft fm < "$r/fail-probe"
@@ -90,20 +92,26 @@ setup success
 recover_ok
 eq servers '127.0.0.1#15363'; eq cache 0; eq running 1; eq restarts 1
 absent base/degraded; absent base/recovering; absent base/recovery-auto; exists base/recovered
-[ "$(wc -l < "$r/preflight" | tr -d ' ')" = 12 ] || fail 'three complete preflight rounds required'
-for suffix in qq.com example.com; do
+[ "$(wc -l < "$r/preflight" | tr -d ' ')" = 6 ] || fail 'three complete preflight rounds required'
+for suffix in qq.com; do
  for kind in A AAAA; do
   [ "$(grep -c "$suffix $kind$" "$r/preflight")" = 3 ] || fail "missing rounds for $suffix $kind"
  done
 done
 pass
-for suffix in qq.com example.com; do
+for suffix in qq.com; do
  for kind in A AAAA; do
   setup "failed-$suffix-$kind"
   echo "15363 $suffix $kind health" > "$r/fail-probe"
   recover_fail; original_dns; eq running 0; eq restarts 0; eq commits 0
   exists base/degraded; absent base/recovering; pass
  done
+done
+for kind in A AAAA; do
+ setup "foreign-unavailable-$kind"
+ echo "15363 example.com $kind health" > "$r/fail-probe"
+ recover_ok; eq servers '127.0.0.1#15363'; eq cache 0; eq running 1; eq restarts 1
+ absent base/degraded; absent base/recovering; exists run/foreign-degraded; pass
 done
 setup manual-hold
 rm "$r/base/recovery-auto"
@@ -117,10 +125,10 @@ recover_fail; original_dns; eq running 0; eq restarts 0; absent base/recovering
 if grep -q '^diversion-dns-c ' "$r/calls"; then fail 'unknown hold started C'; fi
 pass
 setup final-probe-failed
-echo '53 example.com AAAA health' > "$r/fail-probe"
+echo '53 qq.com AAAA health' > "$r/fail-probe"
 recover_fail; original_dns; eq running 0; eq restarts 2; exists base/degraded; absent base/recovering; pass
 setup restoration-failed
-echo '53 example.com AAAA health' > "$r/fail-probe"; echo 2 > "$r/fail-commit"
+echo '53 qq.com AAAA health' > "$r/fail-probe"; echo 2 > "$r/fail-commit"
 recover_fail; eq running 1; exists base/recovering/switching; exists base/degraded
 rm "$r/fail-probe" "$r/fail-commit"
 recover_ok --reconcile; original_dns; eq running 0; absent base/recovering; pass
@@ -131,4 +139,18 @@ cp "$r/servers" "$r/base/recovering/servers"; cp "$r/cache" "$r/base/recovering/
 echo '127.0.0.1#15363' > "$r/servers"; echo 0 > "$r/cache"; echo 1 > "$r/running"
 /bin/sh "$r/base/guard.sh" --once > "$r/output" 2>&1 || fail 'guard reconciliation failed'
 original_dns; eq running 0; eq restarts 1; exists base/degraded; absent base/recovering; pass
-printf 'PASS all 10 isolated BusyBox shell scenarios; evidence: %s\n' "$root"
+setup foreign-guard-outage
+rm "$r/base/degraded" "$r/base/recovery-auto"
+echo '127.0.0.1#15363' > "$r/servers"; echo 0 > "$r/cache"; echo 1 > "$r/running"
+echo '15363 example.com A health' > "$r/fail-probe"
+/bin/sh "$r/base/guard.sh" --once > "$r/output" 2>&1 || fail 'guard failed'
+eq servers '127.0.0.1#15363'; eq running 1; eq restarts 0; eq commits 0
+exists run/foreign-degraded; absent base/degraded; absent base/recovery-auto
+if grep -q '^diversion-dns-c ' "$r/calls"; then fail 'foreign outage changed C service'; fi
+pass
+case_name=foreign-guard-recovery
+rm "$r/fail-probe" "$r/run/foreign-state"
+/bin/sh "$r/base/guard.sh" --once >> "$r/output" 2>&1 || fail 'guard recovery failed'
+eq servers '127.0.0.1#15363'; eq running 1; eq restarts 0; eq commits 0
+absent run/foreign-degraded; absent base/degraded; absent base/recovery-auto; pass
+printf 'PASS all 12 isolated BusyBox shell scenarios; evidence: %s\n' "$root"

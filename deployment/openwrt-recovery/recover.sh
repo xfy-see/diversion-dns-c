@@ -18,6 +18,15 @@ if [ "$mode" = --automatic ]; then
  [ "$(cat "$base/recovery-auto")" = service-health ] || exit 1
 fi
 
+# The legacy init applies policy before C starts. Verify while owning the
+# deployment lock and BEFORE creating recovering. Read-only data verification
+# can inherit this lock safely. Reconciliation above does not apply policy and
+# remains unblocked even if managed data or policy needs a separate repair.
+if ! verify_managed_data || ! verify_managed_policy; then
+ "$base/enable-rescue.sh" || log "CRITICAL: emergency protection failed"
+ exit 1
+fi
+
 # Snapshot before starting C; the switching marker precedes the first mutation.
 mkdir "$base/recovering" || exit 1
 committed=0
@@ -37,23 +46,23 @@ uci -q get 'dhcp.@dnsmasq[0].cachesize' > "$base/recovering/cachesize" || exit 1
 printf '%s\n' "$mode" > "$base/recovering/mode" || exit 1
 sync || exit 1
 # The durable transaction permits C after reboot too. Client DNS stays on ISP.
-"$initdir/diversion-dns-c" start || exit 1
+DIVERSION_CN_DEPLOY_LOCK_HELD=1 "$initdir/diversion-dns-c" start || exit 1
 ready=0
 for attempt in 1 2 3 4 5 6 7 8 9 10; do
- if probe 127.0.0.1 15363 health.diversion-dns-c.example.com A allow-response; then ready=1; break; fi
+ if probe 127.0.0.1 "$c_port" health.diversion-dns-c.qq.com A allow-response; then ready=1; break; fi
  sleep 1
 done
 [ "$ready" -eq 1 ] || exit 1
 for round in 1 2 3; do
- upstream_health 15363 nonce "$round" || exit 1
+ upstream_health "$c_port" nonce "$round" cn || exit 1
  [ "$round" -eq 3 ] || sleep 10
 done
 
 : > "$base/recovering/switching" || exit 1
 sync || exit 1
-set_dns '127.0.0.1#15363' 0 || exit 1
-upstream_health 53 nonce final || exit 1
-upstream_health 53 fixed final || exit 1
+set_dns "127.0.0.1#$c_port" 0 || exit 1
+upstream_health "$dns_port" nonce final cn || exit 1
+upstream_health "$dns_port" fixed final cn || exit 1
 rm -f "$base/degraded" || exit 1
 sync || exit 1
 retire_transaction || exit 1
@@ -61,4 +70,5 @@ rm -f "$base/recovery-auto"
 committed=1
 sync
 date > "$base/recovered"
-log "C DNS recovered after three healthy CN/foreign A/AAAA rounds; CN-site learning active"
+log "C DNS recovered after three healthy CN A/AAAA rounds; CN-site learning active"
+foreign_health_tick force
