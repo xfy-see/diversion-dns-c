@@ -396,7 +396,7 @@ static uint32_t nft_sequence_ticket(void) {
 /* 其他 nft 写者（dnsmasq、fw4、另一实例）提交会让 generation 检查失败；
  * 重试前短暂退避 1-4 ms 并加抖动，避免与对方同步碰撞，且不超过截止时间。 */
 #define NFT_RETRY 1
-#define NFT_PLAIN_ATTEMPTS 3u
+#define NFT_PLAIN_ATTEMPTS 8u
 static void nft_retry_backoff(unsigned attempt, uint64_t until) {
     static atomic_uint jitter = ATOMIC_VAR_INIT(0);
     struct timespec now;
@@ -429,7 +429,7 @@ static int nft_nl_metadata(int fd, uint32_t port, uint32_t seq, const nft_target
     return 0;
 }
 /* 使用独立 netlink socket 和序列号范围，避免混入其他事务的 ACK。
- * 先查询 generation，再读集合元数据并复查 generation；批次携带该值，
+ * 先查询 generation，再读集合元数据；批次携带原 generation，
  * 让内核拒绝元数据检查后发生的规则变更。发送后的失败不转用 CLI，
  * 因为写入结果可能已经生效，重放会掩盖不确定的状态。只有确定未提交的
  * 冲突（generation 变化、批次 ERESTART）返回 NFT_RETRY，由调用方新开 socket 重试。 */
@@ -442,15 +442,16 @@ static int add_plain_attempt(const nft_target *t, const nft_keys *values, uint8_
     if (bind(fd, (struct sockaddr *)&local, sizeof(local)) || getsockname(fd, (struct sockaddr *)&local, &size) || size != sizeof(local) || local.nl_family != AF_NETLINK || !local.nl_pid || local.nl_groups) {
         snprintf(err, MD_ERROR_SIZE, "bind private nft netlink port: %s", strerror(errno)); goto done;
     }
-    uint32_t before, after; bool interval = false;
+    uint32_t before; bool interval = false;
     if (nft_nl_generation(fd, local.nl_pid, ticket, receive, until, &before, err) ||
         nft_nl_metadata(fd, local.nl_pid, ticket + 1, t, receive, until, &interval, NULL, err)) goto done;
     /* interval set：前缀/区间语义交给 nft -f，不再额外 fork `nft list set`。 */
     if (interval) { snprintf(err, MD_ERROR_SIZE, "nftset %s/%s/%s is an interval set", t->family, t->table, t->set); rc = NFT_INTERVAL; goto done; }
-    if (nft_nl_generation(fd, local.nl_pid, ticket + 2, receive, until, &after, err)) goto done;
-    if (before != after) { snprintf(err, MD_ERROR_SIZE, "nft ruleset generation changed during metadata check"); rc = NFT_RETRY; goto done; }
+    /* The batch's GENID already rejects ANY commit since GETGEN, including
+     * changes during GETSET. A second GETGEN adds a round trip but cannot
+     * close the race after that read; retain the original generation instead. */
     md_nl_requests requests; uint8_t family = !strcmp(t->family, "inet") ? 1 : !strcmp(t->family, "ip") ? 2 : 10;
-    if (md_nft_nl_batch_encode(wire, MD_NL_BUFFER_SIZE, &requests, local.nl_pid, ticket + 3, family, t->table, t->set, (const uint8_t (*)[16])values->keys, values->count, t->bytes, after)) { snprintf(err, MD_ERROR_SIZE, "encode bounded nft add batch"); goto done; }
+    if (md_nft_nl_batch_encode(wire, MD_NL_BUFFER_SIZE, &requests, local.nl_pid, ticket + 3, family, t->table, t->set, (const uint8_t (*)[16])values->keys, values->count, t->bytes, before)) { snprintf(err, MD_ERROR_SIZE, "encode bounded nft add batch"); goto done; }
     if (nft_nl_send(fd, wire, requests.length, until, err)) goto done;
     atomic_fetch_add(&nft_stat_transactions, 1);
     /* 一个 recvmsg 可以包含多个 ACK；必须检查整包中的边界错误，
@@ -460,7 +461,9 @@ static int add_plain_attempt(const nft_target *t, const nft_keys *values, uint8_
         if (nft_nl_receive(fd, receive, MD_NL_BUFFER_SIZE, &length, until, err)) goto done;
         if (md_nft_nl_ack_consume(&requests, receive, length, &kernel_errno)) { snprintf(err, MD_ERROR_SIZE, "invalid nft add ACK cohort; mutation state unknown"); goto done; }
         if (kernel_errno) {
-            snprintf(err, MD_ERROR_SIZE, "nft add transaction: %s", strerror(kernel_errno));
+            snprintf(err, MD_ERROR_SIZE, "nft add transaction: errno=%d (%s%s) gen=%u seq=%u target=%s/%s/%s",
+                     kernel_errno, kernel_errno == ERESTART ? "ERESTART: " : "", strerror(kernel_errno),
+                     before, ticket + 3, t->family, t->table, t->set);
             /* GENID 拒绝不提交任何修改（MIPS 与 asm-generic 的 errno 值不同）。 */
             if (kernel_errno == ERESTART) rc = NFT_RETRY;
             goto done;
@@ -488,7 +491,11 @@ static int add_plain_target(const nft_target *t, const md_packet *r, const md_dn
     for (unsigned attempt = 0; ; attempt++) {
         rc = add_plain_attempt(t, &values, wire, receive, until, err);
         if (rc != NFT_RETRY) break;
-        if (attempt + 1 >= NFT_PLAIN_ATTEMPTS || milliseconds() >= until) { rc = -1; break; }
+        if (attempt + 1 >= NFT_PLAIN_ATTEMPTS || milliseconds() >= until) {
+            char cause[MD_ERROR_SIZE]; snprintf(cause, sizeof(cause), "%s", err);
+            snprintf(err, MD_ERROR_SIZE, "nft conflict retries exhausted attempts=%u: %.180s", attempt + 1, cause);
+            rc = -1; break;
+        }
         nft_retry_backoff(attempt, until);
     }
 done:

@@ -96,6 +96,8 @@ cache_size=1024 # explanation
 | `cn_mark` / `foreign_mark` | 各一个 uint32，十进制或 `0x` | 0，不设置 mark |
 | `cn_interface` / `foreign_interface` | 各一个，1–63 可打印 ASCII 字节，不含空白或斜杠 | 不绑定接口 |
 | `cn_concurrent` / `foreign_concurrent` | 各一个，1–3 | 1 |
+| `cn_upstream_hedge_ms` / `foreign_upstream_hedge_ms` | 各组延迟追加备用请求，0 关闭，1–2000 ms；必须小于该组 timeout | 0 |
+| `cn_upstream_timeout_ms` / `foreign_upstream_timeout_ms` | 各组一次上游查询的总截止，100–5000 ms；前台/后台一致 | 5000 |
 | `tcp_idle_timeout` | 单值，所有 TCP listener 共用，1–86400 秒 | 30 |
 | `tcp_read_timeout` | 单值，一个 TCP 帧从首字节到收完的期限，1–300 秒 | 5 |
 | `tcp_write_timeout` | 单值，一个 TCP 回复从开始写到写完的期限，1–300 秒 | 10 |
@@ -334,3 +336,26 @@ udp_sport_reuse_pool=2
 **.122 实测（2026-10-13，mipsel_24kc）：** 主要改善冷 **AAAA**——6 轮全部改善；冷 A 无稳定收益；TCP 受顺序效应影响大，无稳定结论。启用池后 500 QPS 累计 30 分钟：900,000/900,000 成功、零漏发、整体 P99 2.976 ms。协议、nft、队列/TCP 限制、池边界、interval 重叠、链路本地 IPv6 功能测试通过。默认保持 `udp_sport_reuse=0`（每查询新源端口）；启用会削弱源端口唯一性（上游随机 DNS ID 仍保留）。仅当慢速 MIPS 上冷 AAAA 延迟重要时建议启用。
 消融结论：恢复无上限 UDP 池（保留随机 ID）或整段回退 M4 可回到基线冷 P99；回退 N3 不能。
 
+
+## 单上游避让与有界备用请求
+
+未配置新键时保持旧行为。任一组启用 hedge 或改变 timeout 后，仅该组启用独立健康状态：
+每查询最多尝试 3 个不同上游，所有尝试共享总截止；连接/传输错误及 SERVFAIL 会立即尝试备用。
+NOERROR 和 NXDOMAIN 是有效终态，不用竞争掩盖负答案。达到 hedge 时间仍无回答时追加一个请求，
+不会预先把每次查询发给全部上游。源端口与随机 ID 策略不变。
+
+连续两次失败（包括超过 hedge 时间仍未响应而其他节点已成功）后暂避该节点 5 秒，
+重复失败退避至 10/20/40/60 秒。冷却期结束后由真实流量触发一个探测，其他并发请求继续选健康节点；
+探测成功清除失败状态。全部节点冷却时快速返回失败，已有缓存/旧答案仍按原缓存策略服务。
+这是请求触发恢复，没有额外后台定时探测线程；没有请求时不产生探测流量。
+短暂取消但未到 hedge 阈值的竞争者不计失败。每组状态约数 KiB，与另一组隔离。
+
+建议先隔离测量 `cn_upstream_hedge_ms=100`、`foreign_upstream_hedge_ms=250`，
+总截止分别 1000/1500 ms；这不是默认值。较短截止可能放弃原本会晚到的有效回答，
+备用请求增加上游流量，同一隧道全部失效时无法创造可用出口。冷却恢复需覆盖真实链路测试。
+
+普通 nft 路径保留 GETGEN → GETSET → 带原 GENID 的事务，去掉重复 GETGEN。
+元数据读取期间及之后的任意 ruleset 提交仍由内核 GENID 拒绝，不绕过并发安全检查。
+只对确定未提交的 generation 冲突最多尝试 8 次并退避，保持原 5 秒总截止；
+不确定的发送/ACK 失败仍然失败关闭。错误记录包含 numeric errno、ERESTART 标识、generation、
+序列号、目标集合及冲突耗尽次数，避免 musl 的 “No error information” 隐去关键诊断。

@@ -40,6 +40,7 @@ typedef enum {
     CACHE_STALE, CACHE_STALE_CN, CACHE_STALE_ANSWER, CACHE_STALE_OVERRIDE,
     CACHE_PREFETCH, CACHE_PREFETCH_MAX, CACHE_MAX_BYTES, CACHE_FOREIGN_RESERVE,
     CACHE_WARM_FILE, CACHE_WARM_MAX, CACHE_WARM_QPS, CACHE_WARM_SAVE,
+    CN_HEDGE_MS, FOREIGN_HEDGE_MS, CN_TIMEOUT_MS, FOREIGN_TIMEOUT_MS,
     KEY_COUNT
 } config_key;
 static const char *const key_names[KEY_COUNT] = {
@@ -51,7 +52,8 @@ static const char *const key_names[KEY_COUNT] = {
     "nftset_hit_window_ms",
     "cache_stale_ttl", "cache_stale_ttl_cn", "cache_stale_answer_ttl", "cache_stale_override",
     "cache_prefetch_percent", "cache_prefetch_max", "cache_max_bytes", "cache_foreign_reserve_percent",
-    "cache_warm_file", "cache_warm_max", "cache_warm_qps", "cache_warm_save_interval"
+    "cache_warm_file", "cache_warm_max", "cache_warm_qps", "cache_warm_save_interval",
+    "cn_upstream_hedge_ms", "foreign_upstream_hedge_ms", "cn_upstream_timeout_ms", "foreign_upstream_timeout_ms"
 };
 /* 可重复（列表）键；其余键只能出现一次。 */
 static bool list_key(size_t k) { return k <= FOREIGN_UPSTREAM || k == CACHE_STALE_OVERRIDE; }
@@ -60,7 +62,7 @@ typedef struct { char *text; size_t line; } config_value;
 typedef struct { config_value values[CONFIG_LIST_MAX]; size_t count; } config_values;
 typedef struct { config_values keys[KEY_COUNT]; size_t last_line; } config;
 typedef struct refresh_job refresh_job;
-typedef struct { md_upstream *items; size_t count; unsigned concurrent; } upstream_group;
+typedef struct { md_upstream *items; size_t count; unsigned concurrent; md_upstream_policy *policy; } upstream_group;
 typedef struct { uint32_t seconds; md_domain *domains; } stale_override;
 struct md_engine {
     md_domain *cn;
@@ -191,15 +193,24 @@ static int build_upstreams(md_engine *e, const config *c, bool foreign, const ch
     config_key mark_key = foreign ? FOREIGN_MARK : CN_MARK;
     config_key device_key = foreign ? FOREIGN_INTERFACE : CN_INTERFACE;
     config_key concurrent_key = foreign ? FOREIGN_CONCURRENT : CN_CONCURRENT;
-    const char *device = value(c, device_key); uint32_t mark, concurrent;
+    config_key hedge_key = foreign ? FOREIGN_HEDGE_MS : CN_HEDGE_MS;
+    config_key timeout_key = foreign ? FOREIGN_TIMEOUT_MS : CN_TIMEOUT_MS;
+    const char *device = value(c, device_key); uint32_t mark, concurrent, hedge, timeout;
     if (config_number(c, mark_key, 0, 0, UINT32_MAX, true, &mark, path, err) ||
-        config_number(c, concurrent_key, 1, 1, 3, false, &concurrent, path, err)) return -1;
+        config_number(c, concurrent_key, 1, 1, 3, false, &concurrent, path, err) ||
+        config_number(c, hedge_key, 0, 0, 2000, false, &hedge, path, err) ||
+        config_number(c, timeout_key, 5000, 100, 5000, false, &timeout, path, err)) return -1;
+    if (hedge && hedge >= timeout) return config_error(err, path, key_line(c, hedge_key), "hedge must be smaller than upstream timeout");
     if (strlen(device) >= 64 || strpbrk(device, " /\\\t\r\n\v\f"))
         return config_error(err, path, key_line(c, device_key), "invalid interface (1..63 bytes, no whitespace or slash)");
     for (const unsigned char *p = (const unsigned char *)device; *p; p++)
         if (*p < 33 || *p > 126) return config_error(err, path, key_line(c, device_key), "interface must use printable ASCII");
     upstream_group *group = &e->upstreams[foreign ? 1 : 0];
     group->count = c->keys[addresses].count; group->concurrent = concurrent;
+    if (hedge || timeout != 5000) {
+        group->policy = md_upstream_policy_new(group->count, hedge, timeout);
+        if (!group->policy) return config_error(err, path, key_line(c, hedge_key), "cannot allocate upstream policy");
+    }
     group->items = calloc(group->count, sizeof(*group->items));
     if (!group->items) return config_error(err, path, key_line(c, addresses), "out of memory");
     for (size_t i = 0; i < group->count; i++) {
@@ -412,7 +423,7 @@ static int resolve_ex(md_engine *e, bool cn, const md_packet *query, const md_dn
     md_dns_view *view = md_dns_view_scratch();
     if (!view) return fail(err, "out of memory for DNS view");
     md_trace_mark(MD_T_UP_SEND);
-    int rc = md_forward_q(group->items, group->count, group->concurrent, query, qv, response, view, err);
+    int rc = md_forward_policy_q(group->policy, group->items, group->count, group->concurrent, query, qv, response, view, err);
     md_trace_mark(MD_T_UP_RECV);
     /* md_forward_view 只交出已校验的响应；防御性地在 view 缺失时重新解析。 */
     if (response->len && (!view->valid || view->len != response->len) && md_dns_view_parse(response, view, err)) {
@@ -791,6 +802,7 @@ void md_engine_free(md_engine *e) {
     for (size_t i = 0; i < e->override_count; i++) md_domain_free(e->overrides[i].domains);
     free(e->warm_file); if (e->wake_ok) pthread_cond_destroy(&e->wake);
     md_domain_free(e->cn); md_cache_free(e->cache); md_nft_free(e->nft);
+    md_upstream_policy_free(e->upstreams[0].policy); md_upstream_policy_free(e->upstreams[1].policy);
     free(e->upstreams[0].items); free(e->upstreams[1].items); free(e->listeners);
     pthread_mutex_destroy(&e->lock); free(e);
 }

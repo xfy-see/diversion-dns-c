@@ -738,3 +738,162 @@ finished:
     else { free(xs); free(uq); free(view); }
     return result;
 }
+
+/* Bounded, per-engine/per-route-group health state. No query buffers or I/O
+ * under this lock, and no shared CN/foreign rotation/cooldown. */
+typedef struct { unsigned failures; uint64_t retry_at, probe; } upstream_health;
+struct md_upstream_policy {
+    pthread_mutex_t lock;
+    size_t count, rotation;
+    unsigned hedge_ms, timeout_ms;
+    uint64_t ticket;
+    upstream_health health[64];
+};
+md_upstream_policy *md_upstream_policy_new(size_t count, unsigned hedge_ms, unsigned timeout_ms) {
+    if (!count || count > 64 || hedge_ms > 2000 || timeout_ms < 100 || timeout_ms > 5000 ||
+        (hedge_ms && hedge_ms >= timeout_ms)) return NULL;
+    md_upstream_policy *p = calloc(1, sizeof(*p));
+    if (!p) return NULL;
+    if (pthread_mutex_init(&p->lock, NULL)) { free(p); return NULL; }
+    p->count = count; p->hedge_ms = hedge_ms; p->timeout_ms = timeout_ms;
+    return p;
+}
+void md_upstream_policy_free(md_upstream_policy *p) {
+    if (p) { pthread_mutex_destroy(&p->lock); free(p); }
+}
+/* Due quarantined nodes get one real-traffic probe; other callers use healthy
+ * nodes. If every node is cooling, fail promptly instead of filling a lane. */
+static int policy_pick(md_upstream_policy *p, uint64_t used, uint64_t *token) {
+    int selected = -1; uint64_t now = milliseconds(); *token = 0;
+    pthread_mutex_lock(&p->lock);
+    for (unsigned pass = 0; pass < 2 && selected < 0; ++pass) {
+        for (size_t n = 0; n < p->count; ++n) {
+            size_t i = (p->rotation + n) % p->count;
+            upstream_health *h = &p->health[i];
+            if ((used & (UINT64_C(1) << i)) || h->probe) continue;
+            bool want_probe = pass == (used ? 1u : 0u);
+            if (want_probe ? (h->failures < 2 || now < h->retry_at) : h->failures >= 2) continue;
+            selected = (int)i;
+            if (h->failures >= 2) {
+                if (!++p->ticket) ++p->ticket;
+                *token = h->probe = p->ticket;
+            }
+            p->rotation = (i + 1) % p->count; break;
+        }
+    }
+    pthread_mutex_unlock(&p->lock); return selected;
+}
+/* outcome: 1 valid answer, -1 failure/late loser, 0 cancelled before its hedge
+ * threshold. Never mark a promptly cancelled healthy competitor as failed. */
+static void policy_result(md_upstream_policy *p, unsigned i, uint64_t token, int outcome) {
+    pthread_mutex_lock(&p->lock);
+    upstream_health *h = &p->health[i];
+    if (token && h->probe == token) h->probe = 0;
+    if (outcome > 0) { h->failures = 0; h->retry_at = 0; }
+    else if (outcome < 0) {
+        if (h->failures < 6) h->failures++;
+        if (h->failures >= 2) {
+            unsigned delay = 5000u << (h->failures - 2);
+            h->retry_at = milliseconds() + (delay > 60000 ? 60000 : delay);
+        }
+    }
+    pthread_mutex_unlock(&p->lock);
+}
+int md_forward_policy_q(md_upstream_policy *p, const md_upstream *us, size_t count, unsigned concurrent,
+                        const md_packet *q, const md_dns_query *qv, md_packet *r, md_dns_view *rv, char *err) {
+    if (!p) return md_forward_q(us, count, concurrent, q, qv, r, rv, err);
+    md_dns_query local;
+    if (rv) rv->valid = false;
+    if (!md_dns_query_ok(q, qv)) qv = q && !md_dns_query_parse(q, &local, err) ? &local : NULL;
+    if (!us || !q || !r || !qv || count != p->count || (qv->q.flags & 0x8000u))
+        return fail(err, "invalid managed upstream query");
+    bool scoped = worker_tcp && !worker_tcp->exchanges_in_use;
+    unsigned slots = count < 3 ? (unsigned)count : 3;
+    exchange *xs = scoped ? worker_tcp->exchanges : malloc(slots * sizeof(*xs));
+    md_packet *uq = scoped ? &worker_tcp->query : malloc(sizeof(*uq));
+    md_dns_view *view = scoped ? &worker_tcp->view : malloc(sizeof(*view));
+    if (!xs || !uq || !view) {
+        if (!scoped) { free(xs); free(uq); free(view); }
+        return fail(err, "out of memory for managed upstream query");
+    }
+    if (scoped) worker_tcp->exchanges_in_use = true;
+    uint16_t client_id = md_read16(q->data), upstream_id = random_id();
+    memcpy(uq->data, q->data, q->len); uq->len = q->len; md_write16(uq->data, upstream_id);
+    prepare_worker(us, count);
+    unsigned launched = 0, initial = concurrent ? concurrent : 1;
+    if (initial > slots) initial = slots;
+    unsigned indices[3] = {0}; uint64_t tokens[3] = {0}, started[3] = {0}; bool recorded[3] = {false};
+    uint64_t used = 0, deadline = milliseconds() + p->timeout_ms, hedge_at = deadline;
+    bool error_response = false, immediate = true, exhausted = false;
+    int result = -1; char last[MD_ERROR_SIZE] = "all upstreams are unavailable or cooling";
+    while (milliseconds() < deadline) {
+        unsigned live = 0;
+        for (unsigned i = 0; i < launched; ++i) if (xs[i].state != DEAD) live++;
+        uint64_t now = milliseconds();
+        if (!exhausted && launched < slots && (launched < initial || immediate || !live || now >= hedge_at)) {
+            int index = policy_pick(p, used, &tokens[launched]);
+            if (index < 0) { exhausted = true; continue; }
+            unsigned i = launched++; indices[i] = (unsigned)index;
+            used |= UINT64_C(1) << index; started[i] = now;
+            memset(&xs[i], 0, offsetof(exchange, packet)); xs[i].packet.len = 0; xs[i].fd = -1; xs[i].state = DEAD;
+            xs[i].query_id = upstream_id;
+            begin(&xs[i], &us[index], us[index].tcp, last);
+            if (xs[i].state == SENDING) advance(&xs[i], POLLOUT, uq, &qv->q, view, last);
+            immediate = xs[i].state == DEAD;
+            if (immediate) { policy_result(p, indices[i], tokens[i], -1); recorded[i] = true; }
+            hedge_at = p->hedge_ms ? milliseconds() + p->hedge_ms : deadline;
+            continue;
+        }
+        if (!live) break;
+        immediate = false;
+        struct pollfd fds[3]; now = milliseconds(); uint64_t wake = deadline;
+        if (!exhausted && launched < slots && hedge_at < wake) wake = hedge_at;
+        for (unsigned i = 0; i < launched; ++i) {
+            fds[i].fd = xs[i].state == DEAD ? -1 : xs[i].fd;
+            fds[i].events = xs[i].state == CONNECTING || xs[i].state == SENDING ? POLLOUT : POLLIN;
+            fds[i].revents = 0;
+            if (xs[i].state == UDP_READING) {
+                if (xs[i].udp_retry <= now) fds[i].events |= POLLOUT;
+                else if (xs[i].udp_retry < wake) wake = xs[i].udp_retry;
+            }
+        }
+        int n = poll(fds, launched, wake > now ? (int)(wake - now) : 0);
+        if (n < 0) { if (errno == EINTR) continue; syserr(last, "poll managed upstreams"); break; }
+        for (unsigned i = 0; i < launched; ++i) {
+            if (!fds[i].revents || xs[i].state == DEAD) continue;
+            int status = advance(&xs[i], fds[i].revents, uq, &qv->q, view, last);
+            if (status == 1) {
+                unsigned rcode = md_dns_view_rcode(&xs[i].packet, view);
+                memcpy(r->data, xs[i].packet.data, xs[i].packet.len); r->len = xs[i].packet.len;
+                if (rv) md_dns_view_copy(rv, view);
+                md_write16(r->data, client_id);
+                if (rcode == 0 || rcode == 3) {
+                    policy_result(p, indices[i], tokens[i], 1); recorded[i] = true;
+                    keep_response(&xs[i], fds[i].revents); result = 0; goto managed_done;
+                }
+                error_response = true; stop(&xs[i]);
+            }
+            if (!status && xs[i].state == UDP_READING && (fds[i].revents & POLLOUT) &&
+                milliseconds() >= xs[i].udp_retry && milliseconds() < deadline)
+                resend_udp(&xs[i], uq, last);
+            if (xs[i].state == DEAD) {
+                if (!recorded[i]) { policy_result(p, indices[i], tokens[i], -1); recorded[i] = true; }
+                immediate = true;
+            }
+        }
+    }
+    if (error_response) result = 0;
+    else if (milliseconds() >= deadline) snprintf(last, sizeof(last), "upstream query timed out after %u ms", p->timeout_ms);
+managed_done:
+    for (unsigned i = 0; i < launched; ++i) {
+        if (!recorded[i]) {
+            int outcome = result < 0 || (p->hedge_ms && milliseconds() - started[i] >= p->hedge_ms) ? -1 : 0;
+            policy_result(p, indices[i], tokens[i], outcome);
+        }
+        stop(&xs[i]);
+    }
+    if (result && err) snprintf(err, MD_ERROR_SIZE, "%s", last);
+    if (scoped) worker_tcp->exchanges_in_use = false;
+    else { free(xs); free(uq); free(view); }
+    return result;
+}
