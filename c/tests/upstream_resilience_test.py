@@ -34,13 +34,13 @@ def main():
     ap=argparse.ArgumentParser();ap.add_argument('--application',required=True);ap.add_argument('--output',required=True);args=ap.parse_args()
     out=Path(args.output);out.mkdir(parents=True,exist_ok=False);app=Path(args.application).resolve()
     bad=Fixture('198.18.0.1');good=Fixture('198.18.0.2');cn=Fixture('198.18.0.3');rows=[];proc=None;log=None;port=0
-    def start(extra=''):
+    def start(extra='',workers=1):
         nonlocal proc,log,port
         with socket.socket() as s:s.bind(('127.0.0.1',0));port=s.getsockname()[1]
         (out/'cn.txt').write_text('cn.test\n')
         text=f'listen_udp=127.0.0.1:{port}\nlisten_tcp=127.0.0.1:{port}\ncn_domain_file={out.resolve()}/cn.txt\ncn_upstream=127.0.0.1:{cn.port}\nforeign_upstream=127.0.0.1:{bad.port}\nforeign_upstream=127.0.0.1:{good.port}\ncache_size=0\n'+extra
         (out/'config.conf').write_text(text);log=(out/f'app-{len(rows)}.log').open('w')
-        proc=subprocess.Popen([str(app),'start','-c',str(out/'config.conf'),'--cpu','1'],stdout=log,stderr=log)
+        proc=subprocess.Popen([str(app),'start','-c',str(out/'config.conf'),'--cpu',str(workers)],stdout=log,stderr=log)
         for _ in range(100):
             assert proc.poll() is None,'server exited'
             try:
@@ -90,6 +90,14 @@ def main():
         record('nxdomain-is-final',query=negative);stop()
         bad.mode='wrongid';start(settings);invalid=query('spoof.foreign.test');assert invalid['rcode']==0 and invalid['address']=='198.18.0.2',invalid
         record('invalid-id-cannot-win',query=invalid);stop()
+        bad.mode='drop';good.mode='good';before=bad.count;start(settings,workers=4)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+            burst=list(pool.map(lambda i:query(f'wave{i}.foreign.test'),range(12)))
+        attempts=bad.count-before
+        assert attempts>2 and all(x['rcode']==0 for x in burst),(attempts,burst)
+        bad.mode='good';time.sleep(5.1);wave_probe=query('wave-probe.foreign.test')
+        assert wave_probe['address']=='198.18.0.1',wave_probe
+        record('concurrent-failure-wave-first-cooldown',bad_attempts=attempts,queries=burst,probe=wave_probe);stop()
         bad.mode='servfail';good.mode='drop';start('foreign_upstream_timeout_ms=300\nforeign_concurrent=2\n')
         mixed=[query(f'mixed{i}.foreign.test') for i in range(2)]
         before=(bad.count,good.count);cooled=query('mixed-cooled.foreign.test')

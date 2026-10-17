@@ -788,9 +788,12 @@ static int policy_pick(md_upstream_policy *p, uint64_t used, uint64_t *token) {
 static void policy_result(md_upstream_policy *p, unsigned i, uint64_t token, int outcome) {
     pthread_mutex_lock(&p->lock);
     upstream_health *h = &p->health[i];
-    if (token && h->probe == token) h->probe = 0;
+    bool probe_outcome = token && h->probe == token;
+    if (probe_outcome) h->probe = 0;
     if (outcome > 0) { h->failures = 0; h->retry_at = 0; }
-    else if (outcome < 0) {
+    /* Late failures from one in-flight wave must not extend an open circuit.
+     * Only the single post-cooldown probe advances exponential backoff. */
+    else if (outcome < 0 && (h->failures < 2 || probe_outcome)) {
         if (h->failures < 6) h->failures++;
         if (h->failures >= 2) {
             unsigned delay = 5000u << (h->failures - 2);
