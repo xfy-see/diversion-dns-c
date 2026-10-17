@@ -90,7 +90,13 @@ def main():
         record('nxdomain-is-final',query=negative);stop()
         bad.mode='wrongid';start(settings);invalid=query('spoof.foreign.test');assert invalid['rcode']==0 and invalid['address']=='198.18.0.2',invalid
         record('invalid-id-cannot-win',query=invalid);stop()
-        bad.mode='drop';start();legacy=query('legacy.foreign.test');assert legacy['rcode']==2 and legacy['ms']>=4500,legacy
+        bad.mode='servfail';good.mode='drop';start('foreign_upstream_timeout_ms=300\nforeign_concurrent=2\n')
+        mixed=[query(f'mixed{i}.foreign.test') for i in range(2)]
+        before=(bad.count,good.count);cooled=query('mixed-cooled.foreign.test')
+        assert all(x['rcode']==2 and x['ms']>=250 for x in mixed),mixed
+        assert cooled['rcode']==2 and cooled['ms']<200 and (bad.count,good.count)==before,(cooled,before,bad.count,good.count)
+        record('timeout-only-policy-counts-all-failures',queries=mixed,cooled=cooled);stop()
+        bad.mode='drop';good.mode='good';start();legacy=query('legacy.foreign.test');assert legacy['rcode']==2 and legacy['ms']>=4500,legacy
         record('default-retains-legacy',query=legacy);stop()
         assert sum(i==1234 for i,_ in bad.ids+good.ids+cn.ids)<=2,'upstream ID randomization regressed'
         (out/'summary.json').write_text(json.dumps({'status':'pass','checks':len(rows)},indent=2))

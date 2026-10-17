@@ -824,7 +824,7 @@ int md_forward_policy_q(md_upstream_policy *p, const md_upstream *us, size_t cou
     if (initial > slots) initial = slots;
     unsigned indices[3] = {0}; uint64_t tokens[3] = {0}, started[3] = {0}; bool recorded[3] = {false};
     uint64_t used = 0, deadline = milliseconds() + p->timeout_ms, hedge_at = deadline;
-    bool error_response = false, immediate = true, exhausted = false;
+    bool error_response = false, valid_answer = false, immediate = true, exhausted = false;
     int result = -1; char last[MD_ERROR_SIZE] = "all upstreams are unavailable or cooling";
     while (milliseconds() < deadline) {
         unsigned live = 0;
@@ -869,7 +869,7 @@ int md_forward_policy_q(md_upstream_policy *p, const md_upstream *us, size_t cou
                 md_write16(r->data, client_id);
                 if (rcode == 0 || rcode == 3) {
                     policy_result(p, indices[i], tokens[i], 1); recorded[i] = true;
-                    keep_response(&xs[i], fds[i].revents); result = 0; goto managed_done;
+                    keep_response(&xs[i], fds[i].revents); valid_answer = true; result = 0; goto managed_done;
                 }
                 error_response = true; stop(&xs[i]);
             }
@@ -887,7 +887,7 @@ int md_forward_policy_q(md_upstream_policy *p, const md_upstream *us, size_t cou
 managed_done:
     for (unsigned i = 0; i < launched; ++i) {
         if (!recorded[i]) {
-            int outcome = result < 0 || (p->hedge_ms && milliseconds() - started[i] >= p->hedge_ms) ? -1 : 0;
+            int outcome = !valid_answer || (p->hedge_ms && milliseconds() - started[i] >= p->hedge_ms) ? -1 : 0;
             policy_result(p, indices[i], tokens[i], outcome);
         }
         stop(&xs[i]);
