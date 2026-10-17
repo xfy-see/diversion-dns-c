@@ -99,7 +99,7 @@ static ssize_t fake_send_one(int fd,const void *data,size_t n,int flags,const st
     }
     if(md_nl_u16(p+4)==0xA0A){
         ++metadata_reads;
-        /* External commit after GETGEN/GETSET: only the batch GENID can catch it. */
+        /* External commit during GETSET: the second GETGEN or batch GENID must catch it. */
         if(!fast_mode() && ((!strcmp(fake_mode(),"plain-race-retry") && metadata_reads==1) || !strcmp(fake_mode(),"plain-race-forever") || !strcmp(fake_mode(),"changed-gen")))++plain_gen;
         md_nl_requests q={0};q.port=41771;md_nl_writer w={fake_reply,sizeof(fake_reply),0};size_t at;
         assert(!md_nl_message_start(&w,&q,0xA09,0,md_nl_u32(p+8),p[16],0,&at));

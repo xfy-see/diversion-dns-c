@@ -355,8 +355,9 @@ NOERROR 和 NXDOMAIN 是有效终态，不用竞争掩盖负答案。达到 hedg
 总截止分别 1000/1500 ms；这不是默认值。较短截止可能放弃原本会晚到的有效回答，
 备用请求增加上游流量，同一隧道全部失效时无法创造可用出口。冷却恢复需覆盖真实链路测试。
 
-普通 nft 路径保留 GETGEN → GETSET → 带原 GENID 的事务，去掉重复 GETGEN。
-元数据读取期间及之后的任意 ruleset 提交仍由内核 GENID 拒绝，不绕过并发安全检查。
+普通 nft 路径保留 GETGEN → GETSET → GETGEN → 带 GENID 的事务。
+曾尝试省略第二次 GETGEN，但 MIPS 短测未证明尾延迟收益，因此恢复原检查流程。
+元数据读取期间的变更由第二次 GETGEN 检出，后续规则变更仍由内核 GENID 拒绝。
 只对确定未提交的 generation 冲突最多尝试 8 次并退避，保持原 5 秒总截止；
 不确定的发送/ACK 失败仍然失败关闭。错误记录包含 numeric errno、ERESTART 标识、generation、
 序列号、目标集合及冲突耗尽次数，避免 musl 的 “No error information” 隐去关键诊断。
