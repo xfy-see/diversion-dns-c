@@ -33,7 +33,7 @@ def exact(s,n):
 def main():
     ap=argparse.ArgumentParser();ap.add_argument('--application',required=True);ap.add_argument('--output',required=True);args=ap.parse_args()
     out=Path(args.output);out.mkdir(parents=True,exist_ok=False);app=Path(args.application).resolve()
-    bad=Fixture('198.18.0.1');good=Fixture('198.18.0.2');cn=Fixture('198.18.0.3');rows=[];proc=None;log=None
+    bad=Fixture('198.18.0.1');good=Fixture('198.18.0.2');cn=Fixture('198.18.0.3');rows=[];proc=None;log=None;port=0
     def start(extra=''):
         nonlocal proc,log,port
         with socket.socket() as s:s.bind(('127.0.0.1',0));port=s.getsockname()[1]
