@@ -2,7 +2,7 @@
 """Exercise actual add_target with a grammar child and test-only netlink transport.
 
 Set metadata (type and INTERVAL flag) always comes from fake netlink GETSET; no
-`nft list set` is spawned. Plain sets then use fake GETGEN/GETSET/GETGEN/batch ACK
+`nft list set` is spawned. Plain sets then use fake GETGEN/GETSET/batch ACK
 (0 CLI calls); interval sets stop after GETGEN/GETSET and use the exact real
 `nft -f -` subprocess argv/stdin path (1 CLI call, plus one per skipped overlap).
 
@@ -137,7 +137,7 @@ def main():
             assert calls[0]['stdin']==f'add element inet {table} {name} {{ {wanted} }}\n',calls
         if expected_rc==0 and mode!='nodata' and not interval:
             assert calls==[],calls
-            stats=json.loads(result.stdout.splitlines()[0]);assert stats=={'opens':1,'closes':1,'sends':4,'generations':2,'batches':1,'keys':1,'rc':0},stats
+            stats=json.loads(result.stdout.splitlines()[0]);assert stats=={'opens':1,'closes':1,'sends':3,'generations':1,'batches':1,'keys':1,'rc':0},stats
         if mode!='nodata' and interval and expected_rc in (0,4):
             stats=json.loads(result.stdout.splitlines()[0]);assert stats==interval_stats,stats
         if expected_rc==3 or mode=='nodata':assert calls==[],calls
@@ -195,10 +195,10 @@ def main():
             checks.append({'label':mode+'-'+kind,'exit':expected_rc,'calls':0,'passed':True,'device_or_kernel_evidence':False})
     # Compatible plain path driven directly over fake netlink: sequence wrap
     # (H4) and bounded generation/ERESTART retries (H3). No CLI child runs.
-    for mode, expected_rc, expected in [('plain-sequence-wrap', 0, {'opens':5,'generations':10,'batches':5}),
-                                        ('plain-race-retry', 0, {'opens':2,'generations':4,'batches':1}),
-                                        ('plain-race-forever', 4, {'opens':3,'generations':6,'batches':0}),
-                                        ('plain-restart', 0, {'opens':2,'generations':4,'batches':2}),
+    for mode, expected_rc, expected in [('plain-sequence-wrap', 0, {'opens':5,'generations':5,'batches':5}),
+                                        ('plain-race-retry', 0, {'opens':2,'generations':2,'batches':2}),
+                                        ('plain-race-forever', 4, {'opens':8,'generations':8,'batches':8}),
+                                        ('plain-restart', 0, {'opens':2,'generations':2,'batches':2}),
                                         ('plain-interval-metadata', 4, {'opens':1,'generations':1,'batches':0}),
                                         ('window-plain', 0, {'opens':2,'batches':2})]:
         for kind in ('ipv4','ipv6'):
@@ -209,6 +209,8 @@ def main():
             stats=json.loads(result.stdout.splitlines()[0])
             assert {k:stats[k] for k in expected}==expected and stats['opens']==stats['closes'],(mode,kind,stats)
             assert not Path(local_env['NFT_TEST_LOG']).exists(),'plain netlink path invoked CLI'
+            if mode=='plain-race-forever':
+                assert 'attempts=8' in result.stderr and 'errno=85' in result.stderr and 'ERESTART' in result.stderr,result.stderr
             checks.append({'label':mode+'-'+kind,'exit':expected_rc,'calls':0,'passed':True,'device_or_kernel_evidence':False})
     if args.old_source:
         old = out/'nft-cli-driver-before-fix';compile(old,args.old_source)
