@@ -204,6 +204,14 @@ int md_forward_view(const md_upstream *us, size_t count, unsigned concurrent,
 /* 同 md_forward_view，复用请求的一次解析 qv；qv 无效时退回自行解析。 */
 int md_forward_q(const md_upstream *us, size_t count, unsigned concurrent,
                  const md_packet *q, const md_dns_query *qv, md_packet *r, md_dns_view *rv, char *err);
+/* Optional per-group health/hedging state. Never shared between CN/foreign.
+ * NULL policy keeps legacy behavior; timeout_ms bounds the whole request.
+ * Call free only after foreground and background callers have stopped. */
+typedef struct md_upstream_policy md_upstream_policy;
+md_upstream_policy *md_upstream_policy_new(size_t count, unsigned hedge_ms, unsigned timeout_ms);
+void md_upstream_policy_free(md_upstream_policy *p);
+int md_forward_policy_q(md_upstream_policy *policy, const md_upstream *us, size_t count, unsigned concurrent,
+                        const md_packet *q, const md_dns_query *qv, md_packet *r, md_dns_view *rv, char *err);
 /* Server workers opt in once and clean up after their final synchronous query.
  * Unscoped/library calls keep fresh sockets. Allocation failure also stays fresh. */
 void md_forward_worker_enable(void);

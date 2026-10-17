@@ -396,7 +396,7 @@ static uint32_t nft_sequence_ticket(void) {
 /* 其他 nft 写者（dnsmasq、fw4、另一实例）提交会让 generation 检查失败；
  * 重试前短暂退避 1-4 ms 并加抖动，避免与对方同步碰撞，且不超过截止时间。 */
 #define NFT_RETRY 1
-#define NFT_PLAIN_ATTEMPTS 3u
+#define NFT_PLAIN_ATTEMPTS 8u
 static void nft_retry_backoff(unsigned attempt, uint64_t until) {
     static atomic_uint jitter = ATOMIC_VAR_INIT(0);
     struct timespec now;
@@ -447,6 +447,8 @@ static int add_plain_attempt(const nft_target *t, const nft_keys *values, uint8_
         nft_nl_metadata(fd, local.nl_pid, ticket + 1, t, receive, until, &interval, NULL, err)) goto done;
     /* interval set：前缀/区间语义交给 nft -f，不再额外 fork `nft list set`。 */
     if (interval) { snprintf(err, MD_ERROR_SIZE, "nftset %s/%s/%s is an interval set", t->family, t->table, t->set); rc = NFT_INTERVAL; goto done; }
+    /* Retain the established two-read path: the one-read optimization did
+     * not show a reliable tail-latency benefit on the MIPS device. */
     if (nft_nl_generation(fd, local.nl_pid, ticket + 2, receive, until, &after, err)) goto done;
     if (before != after) { snprintf(err, MD_ERROR_SIZE, "nft ruleset generation changed during metadata check"); rc = NFT_RETRY; goto done; }
     md_nl_requests requests; uint8_t family = !strcmp(t->family, "inet") ? 1 : !strcmp(t->family, "ip") ? 2 : 10;
@@ -460,7 +462,9 @@ static int add_plain_attempt(const nft_target *t, const nft_keys *values, uint8_
         if (nft_nl_receive(fd, receive, MD_NL_BUFFER_SIZE, &length, until, err)) goto done;
         if (md_nft_nl_ack_consume(&requests, receive, length, &kernel_errno)) { snprintf(err, MD_ERROR_SIZE, "invalid nft add ACK cohort; mutation state unknown"); goto done; }
         if (kernel_errno) {
-            snprintf(err, MD_ERROR_SIZE, "nft add transaction: %s", strerror(kernel_errno));
+            snprintf(err, MD_ERROR_SIZE, "nft add transaction: errno=%d (%s%s) gen=%u seq=%u target=%s/%s/%s",
+                     kernel_errno, kernel_errno == ERESTART ? "ERESTART: " : "", strerror(kernel_errno),
+                     after, ticket + 3, t->family, t->table, t->set);
             /* GENID 拒绝不提交任何修改（MIPS 与 asm-generic 的 errno 值不同）。 */
             if (kernel_errno == ERESTART) rc = NFT_RETRY;
             goto done;
@@ -488,7 +492,11 @@ static int add_plain_target(const nft_target *t, const md_packet *r, const md_dn
     for (unsigned attempt = 0; ; attempt++) {
         rc = add_plain_attempt(t, &values, wire, receive, until, err);
         if (rc != NFT_RETRY) break;
-        if (attempt + 1 >= NFT_PLAIN_ATTEMPTS || milliseconds() >= until) { rc = -1; break; }
+        if (attempt + 1 >= NFT_PLAIN_ATTEMPTS || milliseconds() >= until) {
+            char cause[MD_ERROR_SIZE]; snprintf(cause, sizeof(cause), "%s", err);
+            snprintf(err, MD_ERROR_SIZE, "nft conflict retries exhausted attempts=%u: %.180s", attempt + 1, cause);
+            rc = -1; break;
+        }
         nft_retry_backoff(attempt, until);
     }
 done:

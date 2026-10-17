@@ -75,6 +75,11 @@ static void basic_contract(void) {
     accept_config("udp_sport_reuse=1\nudp_sport_reuse_max_uses=1\nudp_sport_reuse_ttl_ms=100\nudp_sport_reuse_pool=1\n");
     accept_config("udp_sport_reuse=1\nudp_sport_reuse_max_uses=256\nudp_sport_reuse_ttl_ms=60000\nudp_sport_reuse_pool=4\n");
     accept_config("cn_upstream=tcp://[::1]:5353\nforeign_upstream=udp://127.0.0.1:5353\n");
+    accept_config("cn_upstream_hedge_ms=100\ncn_upstream_timeout_ms=1000\nforeign_upstream_hedge_ms=250\nforeign_upstream_timeout_ms=1500\n");
+    reject("cn_upstream_hedge_ms=2001\n");
+    reject("foreign_upstream_timeout_ms=99\n");
+    reject("cn_upstream_timeout_ms=5001\n");
+    reject("foreign_upstream_hedge_ms=500\nforeign_upstream_timeout_ms=500\n");
     /* Final newline is optional and CRLF is accepted. */
     accept_config("cache_size=1"); accept_config("cache_size=1\r\n");
     const char *missing[] = {"", "# comments only\n", "listen_udp=127.0.0.1:5300\n", "cn_domain_file=/missing\n"};
