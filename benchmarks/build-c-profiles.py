@@ -309,7 +309,7 @@ def main():
         # Zig's optimized C mode defines NDEBUG. Assertions in the harnesses
         # also perform required calls, so explicitly keep them enabled.
         cflags = flags + ["-UNDEBUG", "-std=c11", "-Wall", "-Wextra", "-Wpedantic", "-Werror", "-pthread"]
-        libsrc = ["coremain/engine.c", "pkg/dns.c", "pkg/upstream.c", "pkg/domain.c", "pkg/util.c", "plugin/cache.c", "plugin/nftset.c"]
+        libsrc = ["coremain/engine.c", "pkg/dns.c", "pkg/upstream.c", "pkg/domain.c", "pkg/util.c", "pkg/request_metrics.c", "plugin/cache.c", "plugin/nftset.c"]
         sources = libsrc + ["main.c", "pkg/server.c"]
         objects = {}
 

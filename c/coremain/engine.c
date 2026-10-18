@@ -794,3 +794,8 @@ void md_engine_free(md_engine *e) {
     free(e->upstreams[0].items); free(e->upstreams[1].items); free(e->listeners);
     pthread_mutex_destroy(&e->lock); free(e);
 }
+
+/* Read-only cache snapshot for the opt-in request metrics exporter. */
+void md_engine_cache_snapshot(md_engine *e, md_cache_stats *out) {
+    md_cache_get_stats(e ? e->cache : NULL, out);
+}
