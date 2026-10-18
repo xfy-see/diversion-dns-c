@@ -257,6 +257,7 @@ md_engine *md_engine_load(const char *path, bool check, char *err);
 /* Call after listeners/workers are ready; enables maintenance and shutdown save. */
 int md_engine_start(md_engine *e, char *err);
 size_t md_engine_listener_count(const md_engine *e);
+void md_engine_cache_snapshot(md_engine *e, md_cache_stats *out);
 const md_listener *md_engine_listener(const md_engine *e, size_t i);
 /* 服务端过载保护，配置加载时已校验范围。queue_timeout_ms=0 表示排队任务不过期；
  * TCP 读/写期限单位为秒，连接数上限对所有 TCP listener 合计。 */

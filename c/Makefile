@@ -33,7 +33,7 @@ ifeq ($(SANITIZE),1)
 CFLAGS += -O1 -fsanitize=address,undefined -fno-omit-frame-pointer
 LDFLAGS += -fsanitize=address,undefined
 endif
-LIBSRC = coremain/engine.c pkg/dns.c pkg/upstream.c pkg/domain.c pkg/util.c plugin/cache.c plugin/nftset.c
+LIBSRC = coremain/engine.c pkg/dns.c pkg/upstream.c pkg/domain.c pkg/util.c pkg/request_metrics.c plugin/cache.c plugin/nftset.c
 LIBOBJ = $(patsubst %.c,$(BUILD)/%.o,$(LIBSRC))
 APPOBJ = $(BUILD)/main.o $(BUILD)/pkg/server.o
 TESTS = dns_test cache_domain_test fixed_config_test fixed_engine_test nft_netlink_test
