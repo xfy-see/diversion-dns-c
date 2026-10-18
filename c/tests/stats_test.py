@@ -21,6 +21,7 @@ class StatsSuite(Suite):
         self.require(s['received_valid']==t['completed']+s['inflight'],'accounting mismatch')
         self.require(sum(x['metrics']['completed'] for x in s['breakdown'])==t['completed'],'split mismatch')
         self.require(sum(t['cache'].values())==t['completed'],'cache accounting')
+        self.require(sum(h['samples'] for h in t['rt_by_cache'].values())==t['completed'],'cache RT accounting')
         self.require(sum(x['metrics']['completed'] for x in s['recent_intervals'])==t['completed'],'interval accounting')
         for h in (t['rt'], t['queue'], t['service']):
             self.require(sum(h['histogram'])==h['samples']==t['completed'],'histogram sample accounting')

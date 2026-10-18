@@ -27,7 +27,7 @@ diversion-dns-c-lite stats --file /tmp/diversion-dns-stats.json
 - `cache_hit_rate = (fresh + stale) / completed`；缓存来源按最终执行路径统计，可能与dispatch时的cache_engine计数有细小差异（排队期间过期/另一个请求填充）。关闭缓存或未进入缓存路径归disabled_or_unchecked。后台刷新、固定预热不计入前台成功率/RT/Top。
 - `rt` 从完整请求解析完成到完整回复提交内核，失败则到放弃/结算；包括排队、执行及TCP写等待，不含客户端链路、TCP握手/读帧时间。`queue` 为收取完整请求到worker取出的时间（含dispatch），`service` 为worker处理/立即回复路径耗时；跟随查询统计等待共享响应的执行部分。RT样本包括失败，避免只展示成功请求。
 - 平均值和最大值直接累计；P50/P90/P95/P99是固定直方图的**桶上界估计**，不能按精确分位数解读。超过最大32秒桶的分位数为null，尾桶计数和实际max保留。histogram_upper_ms公开全部桶界，histogram为非累计桶。
-- breakdown 按CN/foreign × A/AAAA/other × UDP/TCP给出相同指标。recent_intervals是最近60段全局指标，累计分组值位于breakdown。qps_lifetime按收到的有效请求/运行秒数，区间completed_qps按完成数/真实段长。
+- rt_by_cache分别提供新鲜命中、过期命中、未命中及关闭缓存时的RT直方图。breakdown 按CN/foreign × A/AAAA/other × UDP/TCP给出相同指标。recent_intervals是最近60段全局指标，累计分组值位于breakdown。qps_lifetime按收到的有效请求/运行秒数，区间completed_qps按完成数/真实段长。
 - errors 为请求的主要终态原因：队列满/过期、上游失败/总超时、nft失败、执行期限、响应校验、内存、发送失败、客户端断开、停机。上游内部丢弃的坏包/单次竞争失败不逐包统计，总失败会计数；程序生成的SERVFAIL与上游RCODE可结合errors判断。多个错误同时发生时终端发送/断开原因优先。
 - events 为连接/无有效请求级事件，可能与请求错误重叠，不能与completed相加。正常空闲TCP关闭不是读超时；收到部分帧后触发期限才计读超时。
 - cache_engine包括CN/foreign缓存占用、miss原因、refresh/prefetch/重启warm/固定keep计数；这些子系统计数与前台快照不是同一锁下的事务快照。nft汇总写入/跳过/事务。process提供CPU累计时间和峰值RSS，不冒充当前RSS。
