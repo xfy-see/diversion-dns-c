@@ -51,7 +51,8 @@ struct md_cache {
 };
 const char *const md_cache_stat_names[MD_CS_COUNT] = {
     "fresh_hit", "stale_hit", "miss_cold", "miss_evicted", "miss_expired", "bypass",
-    "refresh_ok", "refresh_fail", "refresh_kept_old", "prefetch", "evictions", "warm"
+    "refresh_ok", "refresh_fail", "refresh_kept_old", "prefetch", "evictions", "warm",
+    "keep_query", "keep_ok", "keep_fail", "keep_deferred"
 };
 
 static uint64_t hash_key(const uint8_t *key, size_t len) {
@@ -106,6 +107,18 @@ static unsigned ghost_reason(const md_cache *c, uint64_t hash) {
     uint64_t g = c->ghost[(hash >> 1) & (GHOST_SLOTS - 1)];
     if (!g || ((g ^ (hash | UINT64_C(2))) & ~UINT64_C(1))) return MD_CS_COLD;
     return (g & 1) ? MD_CS_EVICTED : MD_CS_EXPIRED;
+}
+bool md_cache_peek(md_cache *c, const md_packet *q, const md_dns_query *qv, md_cache_lifetime *life) {
+    if (!c || !life) return false;
+    md_dns_query local; qv = query_view(q, qv, &local);
+    uint8_t key[KEY_SIZE]; size_t len = qv ? make_key_q(q, qv, key) : 0;
+    if (!len) return false;
+    pthread_mutex_lock(&c->lock);
+    cache_entry *e = find_entry(c, key, len, hash_key(key, len));
+    bool found = e != NULL;
+    if (e) *life = (md_cache_lifetime){e->stored, e->expires, e->positive};
+    pthread_mutex_unlock(&c->lock);
+    return found;
 }
 /* 以下哈希和 LRU 辅助函数由持锁的调用方执行；每个组一条 LRU 链，head 最近
  * 使用；tick 是全局使用序号，跨组比较 tail 即等价于一条全局 LRU。 */

@@ -93,6 +93,9 @@ cache_size=1024 # explanation
 | `cache_warm_max` | 单值，1–10000；保存/预热的最多名称数；需 `cache_warm_file` | 512 |
 | `cache_warm_qps` | 单值，1–100；启动预热的速率（单线程顺序） | 10 |
 | `cache_warm_save_interval` | 单值，30–86400 秒；周期保存间隔（退出时也保存） | 600 |
+| `cache_keep_file` | 固定境外域名定时维护名单，只读；详见 [定时预热](scheduled-cache-keep.md) | 关闭 |
+| `cache_keep_qps` | 1–2，单并发后台维护任务速率；需 `cache_keep_file` | 2 |
+| `cache_keep_percent` | 1–50，TTL 提前刷新百分比并错峰；需 `cache_keep_file` | 10 |
 | `cn_mark` / `foreign_mark` | 各一个 uint32，十进制或 `0x` | 0，不设置 mark |
 | `cn_interface` / `foreign_interface` | 各一个，1–63 可打印 ASCII 字节，不含空白或斜杠 | 不绑定接口 |
 | `cn_concurrent` / `foreign_concurrent` | 各一个，1–3 | 1 |
