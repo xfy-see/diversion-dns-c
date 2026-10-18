@@ -84,7 +84,7 @@ class Metrics(unittest.TestCase):
         self.assertEqual((t['requests'],t['completed'],t['success'],t['failed']),(6,6,5,1))
         self.assertEqual((t['udp'],t['tcp']),(5,1))
         self.assertEqual((t['noerror'],t['nxdomain'],t['servfail']),(4,1,1))
-        self.assertEqual(s['cache']['foreign']['fresh'],3)
+        self.assertEqual(s['cache']['foreign']['fresh_hit'],3)
         self.assertGreater(t['latency_sum_us'],0)
 
     def test_extended_rcode_is_not_counted_as_noerror(self):
