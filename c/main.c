@@ -9,7 +9,7 @@
 #include <unistd.h>
 
 static void usage(void) {
-    puts("mosdns-c fixed splitter: version | check [-c config] [-d directory] | start [-c config] [-d directory] [--cpu workers]");
+    puts("mosdns-c fixed splitter: stats [--file snapshot.json] | version | check [-c config] [-d directory] | start [-c config] [-d directory] [--cpu workers]");
 }
 int main(int argc, char **argv) {
     if (argc == 1 || !strcmp(argv[1], "help") || !strcmp(argv[1], "--help") || !strcmp(argv[1], "-h")) {
@@ -18,6 +18,11 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "version")) {
         if (argc != 2) { fputs("version takes no arguments\n", stderr); return 1; }
         puts("mosdns-c 0.1.3 fixed-splitter"); return 0;
+    }
+    if (!strcmp(argv[1], "stats")) {
+        if (argc == 2) return md_stats_show("/tmp/diversion-dns-stats.json");
+        if (argc == 4 && !strcmp(argv[2], "--file")) return md_stats_show(argv[3]);
+        fputs("usage: stats [--file /absolute/snapshot.json]\n", stderr); return 1;
     }
     bool check = !strcmp(argv[1], "check");
     if (!check && strcmp(argv[1], "start")) {

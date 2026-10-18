@@ -58,6 +58,8 @@ void md_dns_limit_udp(const md_packet *q, md_packet *r);
  * 1 已计数且已认领一次 prefetch），保证每个请求只计数一次。解析时置 -1。 */
 typedef struct {
     md_question q; size_t len; bool valid, cache_edns_ok; signed char route, cache_memo;
+    /* Foreground telemetry metadata, no clocks or atomics when disabled. */
+    unsigned stats_rcode, stats_error; unsigned char stats_cache; bool stats_coalesced;
 } md_dns_query;
 int md_dns_query_parse(const md_packet *p, md_dns_query *v, char *err);
 bool md_dns_query_ok(const md_packet *p, const md_dns_query *v);
@@ -338,4 +340,5 @@ int md_thread_create(pthread_t *thread, void *(*fn)(void *), void *arg);
 /* 阻塞运行监听器与 worker；SIGINT/SIGTERM 触发回收，返回后可释放 engine。
  * workers 是每条 lane（缓存/CN/国外）各自的线程数，各 lane 独立排队和限额。 */
 int md_server_run(md_engine *e, unsigned workers, char *err);
+#include "stats.h"
 #endif
