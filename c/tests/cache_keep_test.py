@@ -153,6 +153,16 @@ def main():
         result['error'] = traceback.format_exc()
         raise
     finally:
+        # Only remove the two special fixture nodes we created, retaining their
+        # identity as JSON. CI archives intentionally reject special files.
+        nodes = []
+        for name in ('link', 'fifo'):
+            path = a.output / 'rejected' / name
+            if path.is_symlink() or path.exists():
+                nodes.append(dict(name=name, symlink=path.is_symlink(),
+                                  target=os.readlink(path) if path.is_symlink() else None))
+                path.unlink()
+        (a.output / 'special-fixtures.json').write_text(json.dumps(nodes, indent=2))
         suite.upstream.close()
         (a.output / 'upstream.json').write_text(json.dumps(suite.upstream.snapshot(), indent=2))
         (a.output / 'clients.json').write_text(json.dumps(suite.clients, indent=2))
