@@ -72,7 +72,7 @@ class StatsSuite(Suite):
 
     def bounded_top(self):
         path=self.output/'top.json';counts=Counter()
-        with self.running('top',stats_file=path,stats_interval=5,cache_size=0,cache_stale_ttl=0):
+        with self.running('top',stats_file=path,stats_interval=5,cache_size=0,cache_stale_ttl=None):
             for i in range(1100):
                 name=f'cold{i}.foreign.test';self.ask(name);counts[name]+=1
             for _ in range(60):self.ask('popular.foreign.test');counts['popular.foreign.test']+=1

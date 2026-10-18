@@ -353,6 +353,8 @@ class Suite:
         if extra.pop("override", False):
             config["cache_stale_override"] = f"0:{root / 'override.txt'}"
         config.update(extra)
+        # Tests may explicitly omit a fixture default (e.g. cache policy when cache_size=0).
+        config = {key: value for key, value in config.items() if value is not None}
         path = root / "config.conf"
         path.write_text("".join(f"{key}={value}\n" for key, value in config.items()))
         with (root / "stdout.log").open("wb") as stdout, (root / "stderr.log").open("wb") as stderr:
