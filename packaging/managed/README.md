@@ -2,7 +2,7 @@
 
 本分支基于已验证 stats head a16eafe（PR #27，依赖 #25），未合并或正式发布。
 GitHub 在固定 SDK 中编译并验证原 POSIX-lite ELF，再用同一 SDK 的 apk mkpkg
-打成两个原生 APK。保留 `packaging/openwrt` 的裸程序包及原验证流程。
+打成两个原生 APK。只在 GitHub 临时 runner 上用 sudo 为暂存目录设 root 所有权，打包后恢复。保留 `packaging/openwrt` 的裸程序包及原验证流程。
 
 | 包 | 内容 | 默认行为 |
 |---|---|---|

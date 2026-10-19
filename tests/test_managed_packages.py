@@ -44,7 +44,7 @@ class ManagedPackage(unittest.TestCase):
     for path,row in expected.items():
      meta['paths'].append({'name':str(Path(path).parent),'acl':{'user':'root','group':'root'},'files':[{'name':Path(path).name,'size':row['bytes'],'hash':row['sha256'],'acl':{'mode':row['mode'],'user':'root','group':'root'}}]})
     files[name+'-metadata.json']=json.dumps(meta).encode();logs['managed-metadata-'+name]=json.dumps(meta)
-    commands['managed-pack-'+name]=['fakeroot','sh','-ec','chown -R 0:0 "$1"; shift; exec "$@"']
+    commands['managed-pack-'+name]=['sudo','sh','-ec',M.ROOT_OWNER_SCRIPT]
     for step in ('metadata','integrity','extract'):commands['managed-'+step+'-'+name]=['apk',step,filename]
    files['managed-packages.json']=json.dumps(managed).encode();state={'managed':managed,'source_commit':commit,'application_version':'0.1.3','architecture':'mipsel_24kc'}
    M.verify_evidence(files,state,source,commands,logs)

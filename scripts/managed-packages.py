@@ -6,10 +6,12 @@ compiler, device installation, key generation or repository changes here.
 """
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
 
+ROOT_OWNER_SCRIPT = 'root=$1; owner=$2; shift 2; trap \'chown -R "$owner" "$root"\' EXIT; chown -R 0:0 "$root"; "$@"'
 CORE='diversion-dns-c'
 UI='luci-app-diversion-dns'
 MODULES=('device/device.lua','device/window.lua','telemetry.lua','metrics.lua','public-status.lua','dns-status.lua','query.lua')
@@ -97,7 +99,7 @@ def build(source,binary,work,out,apktool,commit,arch,version,run):
         pkgarch=arch if name==CORE else 'noarch'
         deps=CORE_DEPS if name==CORE else [CORE+'='+package_version]+UI_DEPS
         path=out/(name+'-'+package_version+'_'+pkgarch+'.apk')
-        cmd=['fakeroot','sh','-ec','chown -R 0:0 "$1"; shift; exec "$@"','managed-root-owner',root,apktool,'mkpkg','--info','name:'+name,'--info','version:'+package_version,'--info','arch:'+pkgarch,'--info','license:GPL-3.0-or-later','--info','description:Managed DNS '+('core service' if name==CORE else 'statistics and diagnostics'),'--info','origin:diversion-dns-c','--info','url:https://github.com/xfy-see/diversion-dns-c','--info','repo-commit:'+commit,'--info','depends:'+' '.join(deps),'--files',root,'--output',path]
+        cmd=['sudo','sh','-ec',ROOT_OWNER_SCRIPT,'managed-root-owner',root,str(os.getuid())+':'+str(os.getgid()),apktool,'mkpkg','--info','name:'+name,'--info','version:'+package_version,'--info','arch:'+pkgarch,'--info','license:GPL-3.0-or-later','--info','description:Managed DNS '+('core service' if name==CORE else 'statistics and diagnostics'),'--info','origin:diversion-dns-c','--info','url:https://github.com/xfy-see/diversion-dns-c','--info','repo-commit:'+commit,'--info','depends:'+' '.join(deps),'--files',root,'--output',path]
         prefix='core' if name==CORE else 'ui'
         hooks={}
         for hook in sorted((source/'packaging/managed/hooks').glob(prefix+'.*')):
@@ -155,7 +157,7 @@ def verify_evidence(files,state,source,commands,logs):
             prefix='core' if name==CORE else 'ui'
             hooks={p.name.split('.',1)[1]:p.read_text() for p in (src/'packaging/managed/hooks').glob(prefix+'.*')}
             if meta.get('scripts',{})!=hooks:raise ValueError('managed hook source mismatch')
-            if commands['managed-pack-'+name][:4]!=['fakeroot','sh','-ec','chown -R 0:0 "$1"; shift; exec "$@"']:raise ValueError('managed ownership command mismatch')
+            if commands['managed-pack-'+name][:4]!=['sudo','sh','-ec',ROOT_OWNER_SCRIPT]:raise ValueError('managed ownership command mismatch')
             for step in ('metadata','integrity','extract'):
                 if Path(commands['managed-'+step+'-'+name][-1]).name!=filename:raise ValueError('managed verification APK target mismatch')
     return managed

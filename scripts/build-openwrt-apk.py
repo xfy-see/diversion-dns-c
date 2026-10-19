@@ -351,6 +351,9 @@ def main():
             "GCC runtime portions: GPLv3 with GCC Runtime Library Exception 3.1.\n"
             "https://www.gnu.org/licenses/gcc-exception-3.1.html\n"
             "GCC 14.3.0 source: https://gcc.gnu.org/git/?p=gcc.git;a=tree;hb=releases/gcc-14.3.0\n")
+        if args.managed:
+            readme = out / "README.txt"
+            readme.write_text("This artifact also includes two managed candidate APKs; see managed-packages.json and source packaging/managed/README.md for lifecycle and deployment boundaries. The following legacy notes apply only to diversion-dns-c-lite.\n\n" + readme.read_text())
         paths = sorted(path for path in out.rglob("*") if path.is_file())
         (out / "SHA256SUMS").write_text("".join(f"{digest(path)}  {path.relative_to(out)}\n" for path in paths))
         print(json.dumps({"status": "passed", "output": str(out), "apk": state["apk"], "elf": state["elf"]}), flush=True)
