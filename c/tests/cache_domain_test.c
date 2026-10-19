@@ -616,10 +616,46 @@ static void nft_tests(void) {
                         "inet,t,s,invalid,24", "inet,t,s,ipv4_addr", "inet,t,s,ipv4_addr,1,2"};
     for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); ++i) assert(!md_nft_new(bad[i], err));
 }
+/* Cross many arena blocks and hash resizes, then recheck early pointers.
+ * Both backends run this under native and ASan/UBSan CI builds. */
+static void domain_storage_tests(void) {
+    char err[MD_ERROR_SIZE], rule[128], name[128];
+    for (unsigned cycle = 0; cycle < 2; ++cycle) {
+        md_domain *d = md_domain_new(); assert(d);
+        for (unsigned i = 0; i < 112000; ++i) {
+            snprintf(rule, sizeof(rule), "%s:n%u.storage.test", i & 1 ? "full" : "domain", i);
+            assert(!md_domain_add(d, rule, err));
+            if (!(i % 997)) assert(!md_domain_add(d, rule, err));
+        }
+        for (unsigned i = 0; i < 112000; ++i) {
+            snprintf(name, sizeof(name), "N%u.STORAGE.TEST.", i);
+            assert(md_domain_match(d, name));
+            snprintf(name, sizeof(name), "sub.n%u.storage.test", i);
+            assert(md_domain_match(d, name) == !(i & 1));
+            snprintf(name, sizeof(name), "badn%u.storage.test", i);
+            assert(!md_domain_match(d, name));
+        }
+        /* One allocation larger than the usual block, then another small node. */
+        char *large = malloc(65536); assert(large);
+        memset(large, 'a', 65534); large[65534] = '\0';
+        assert(!md_domain_add(d, large, err));
+        assert(md_domain_match(d, large));
+        free(large);
+        assert(!md_domain_add(d, "domain:after-large.test", err));
+        assert(md_domain_match(d, "child.after-large.test"));
+        assert(md_domain_add(d, "unsupported:bad.test", err));
+        assert(md_domain_match(d, "n0.storage.test"));
+        assert(!md_domain_match(d, "n112000.storage.test"));
+        md_domain_free(d);
+    }
+}
+
+#include "domain_storage_fault.h"
+
 int main(void) {
 #ifndef MD_REGEX_POSIX
     regex_budget_tests();
 #endif
-    regex_profile_tests(); direct_list_regex_tests(); regex_concurrency_tests(); domain_tests(); cache_tests(); stale_and_refresh_tests(); replacement_revocation_tests(); refresh_backoff_tests(); logical_hit_tests(); counter_capacity_tests(); prefetch_and_warm_tests(); concurrency_tests(); nft_tests();
+    regex_profile_tests(); direct_list_regex_tests(); regex_concurrency_tests(); domain_tests(); domain_storage_tests(); domain_storage_fault_tests(); cache_tests(); stale_and_refresh_tests(); replacement_revocation_tests(); refresh_backoff_tests(); logical_hit_tests(); counter_capacity_tests(); prefetch_and_warm_tests(); concurrency_tests(); nft_tests();
     puts("domain/cache/nftset parser tests passed"); return 0;
 }

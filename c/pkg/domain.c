@@ -25,6 +25,14 @@ typedef struct domain_entry {
     char text[];
 } domain_entry;
 typedef struct { domain_entry **buckets; size_t count, size; } domain_table;
+/* Fixed blocks never move: bucket growth can keep using ordinary pointers.
+ * Only full/suffix nodes use this arena; regex and keyword ownership is unchanged.
+ * Small rule sets start at 4 KiB, large sets use 32 KiB blocks. */
+typedef struct domain_block {
+    struct domain_block *next;
+    size_t used, capacity;
+    _Alignas(domain_entry) unsigned char data[];
+} domain_block;
 typedef struct domain_regex {
     struct domain_regex *next;
 #ifdef MD_REGEX_POSIX
@@ -36,6 +44,7 @@ typedef struct domain_regex {
 } domain_regex;
 struct md_domain {
     domain_table full, suffix;
+    domain_block *blocks;
     domain_entry *keywords;
     domain_regex *regexes;
     bool root;
@@ -44,6 +53,25 @@ struct md_domain {
     size_t regex_count;
 #endif
 };
+
+static domain_entry *entry_alloc(md_domain *d, size_t len) {
+    const size_t alignment = _Alignof(domain_entry);
+    if (len > SIZE_MAX - sizeof(domain_entry) - alignment) return NULL;
+    size_t size = (sizeof(domain_entry) + len + 1 + alignment - 1) & ~(alignment - 1);
+    domain_block *b = d->blocks;
+    if (!b || size > b->capacity - b->used) {
+        size_t capacity = b ? 32768 : 4096;
+        if (capacity < size) capacity = size;
+        if (capacity > SIZE_MAX - sizeof(*b)) return NULL;
+        b = malloc(sizeof(*b) + capacity);
+        if (!b) return NULL;
+        b->next = d->blocks; b->used = 0; b->capacity = capacity;
+        d->blocks = b;
+    }
+    domain_entry *e = (domain_entry *)(void *)(b->data + b->used);
+    b->used += size;
+    return e;
+}
 
 static uint64_t hash_text(const char *s) {
     uint64_t h = UINT64_C(14695981039346656037);
@@ -76,10 +104,10 @@ static int table_grow(domain_table *t) {
     return 0;
 }
 /* 相同规则只保存一次；负载达到 3/4 时先扩容，避免长冲突链。 */
-static int table_add(domain_table *t, const char *s) {
+static int table_add(md_domain *d, domain_table *t, const char *s) {
     if (table_has(t, s)) return 0;
     if ((!t->size || t->count >= t->size * 3 / 4) && table_grow(t)) return -1;
-    domain_entry *e = malloc(sizeof(*e) + strlen(s) + 1);
+    domain_entry *e = entry_alloc(d, strlen(s));
     if (!e) return -1;
     e->hash = hash_text(s); strcpy(e->text, s);
     size_t i = e->hash & (t->size - 1);
@@ -87,10 +115,6 @@ static int table_add(domain_table *t, const char *s) {
     return 0;
 }
 static void table_free(domain_table *t) {
-    for (size_t i = 0; i < t->size; ++i) {
-        domain_entry *e = t->buckets[i];
-        while (e) { domain_entry *next = e->next; free(e); e = next; }
-    }
     free(t->buckets);
 }
 /* Go's full/keyword normalization removes one final dot. Its domain scanner
@@ -181,9 +205,9 @@ int md_domain_add(md_domain *d, const char *rule, char *err) {
         if (!s[0]) d->root = true;
         else {
             if (s[0] == '.') memmove(s, s + 1, strlen(s));
-            rc = table_add(&d->suffix, s);
+            rc = table_add(d, &d->suffix, s);
         }
-    } else if (type == FULL) rc = table_add(&d->full, s);
+    } else if (type == FULL) rc = table_add(d, &d->full, s);
     else {
         for (domain_entry *e = d->keywords; e; e = e->next)
             if (!strcmp(e->text, s)) { free(s); return 0; }
@@ -284,6 +308,8 @@ bool md_domain_match(const md_domain *d, const char *name) {
 void md_domain_free(md_domain *d) {
     if (!d) return;
     table_free(&d->full); table_free(&d->suffix);
+    domain_block *b = d->blocks;
+    while (b) { domain_block *next = b->next; free(b); b = next; }
     domain_entry *k = d->keywords;
     while (k) { domain_entry *next = k->next; free(k); k = next; }
     domain_regex *r = d->regexes;
