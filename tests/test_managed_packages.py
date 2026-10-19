@@ -10,6 +10,8 @@ class ManagedPackage(unittest.TestCase):
    roots=M.stage(ROOT,binary,base/'roots','a'*40)
    core=M.contents(roots[M.CORE]);ui=M.contents(roots[M.UI])
    self.assertEqual(core['usr/libexec/diversion-dns-c']['mode'],0o755)
+   self.assertEqual((roots[M.UI]/'usr/share/diversion-dns-ui/device.lua').stat().st_mtime,0)
+   self.assertIn('nftables',M.CORE_DEPS)
    self.assertEqual(core['etc/config/diversion-dns']['mode'],0o600)
    self.assertFalse(set(core)&set(ui))
    self.assertNotIn('usr/share/diversion-dns-ui/control.lua',ui)

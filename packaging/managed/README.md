@@ -9,6 +9,7 @@ GitHub 在固定 SDK 中编译并验证原 POSIX-lite ELF，再用同一 SDK 的
 | diversion-dns-c | 已核验程序 `/usr/libexec/diversion-dns-c`、procd 服务 `diversion-dns`、UCI 与示例配置 | enabled=0，不启动、不改 DNS/路由 |
 | luci-app-diversion-dns | 三分区 LuCI、stats 归集、查询、检测和诊断、固定 RPC ACL、monitor 服务 | 页面可见；monitor enabled=0，需显式启用 |
 
+核心包包含 nftables 运行依赖，单独安装时也支持需要 nft 命令的路径。
 管理包精确依赖同版本核心包；依赖 Lua/jsonc/nixio、LuCI、rpcd file、uclient-fetch、
 CA 与 mbedTLS ustream、ip-full、nftables、wireguard-tools。当前验证目标为 OpenWrt
 25.12.5 的 mipsel_24kc 与 aarch64_cortex-a53。不要为了安装替换系统 libc/TLS。

@@ -15,7 +15,7 @@ ROOT_OWNER_SCRIPT = 'root=$1; owner=$2; shift 2; trap \'chown -R "$owner" "$root
 CORE='diversion-dns-c'
 UI='luci-app-diversion-dns'
 MODULES=('device/device.lua','device/window.lua','telemetry.lua','metrics.lua','public-status.lua','dns-status.lua','query.lua')
-CORE_DEPS=['libc','libpthread','procd','uci']
+CORE_DEPS=['libc','libpthread','procd','uci','nftables']
 UI_DEPS=['luci-base','luci-lib-jsonc','luci-lib-nixio','rpcd-mod-file','uclient-fetch','ca-bundle','libustream-mbedtls20201210','procd','uci','ip-full','nftables','wireguard-tools']
 
 
@@ -67,6 +67,8 @@ def stage(source,binary,destination,commit):
         put(root,'lib/apk/packages/'+name+'.list','\n'.join(paths)+'\n')
         for p in root.rglob('*'):
             if p.is_dir():p.chmod(0o755)
+            os.utime(p,(0,0))
+        os.utime(root,(0,0))
     return roots
 
 def verify_metadata(meta,expected,name,arch,version,deps):
