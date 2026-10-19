@@ -114,3 +114,48 @@ def build(source,binary,work,out,apktool,commit,arch,version,run):
         result['packages'][name]={'filename':path.name,'sha256':sha(path.read_bytes()),'bytes':path.stat().st_size,'arch':pkgarch,'depends':deps,'files':expected}
     (out/'managed-packages.json').write_text(json.dumps(result,indent=2)+'\n')
     return result
+
+
+def command_names():
+    return ['managed-'+step+'-'+name for name in (CORE,UI)
+            for step in ('pack','metadata','integrity','extract')]
+
+def evidence_files(managed):
+    return {'managed-packages.json'} | {row['filename'] for row in managed['packages'].values()} | {name+'-metadata.json' for name in (CORE,UI)}
+
+def verify_evidence(files,state,source,commands,logs):
+    """Reconstruct all non-ELF payloads from frozen source without running code."""
+    import tempfile
+    managed=json.loads(files['managed-packages.json'])
+    if managed!=state['managed'] or set(managed['packages'])!={CORE,UI}:raise ValueError('managed manifest mismatch')
+    commit=state['source_commit'];version=state['application_version']+'_pre20261019~'+commit[:12]+'-r1'
+    if managed['source_commit']!=commit or managed['version']!=version:raise ValueError('managed provenance mismatch')
+    original=json.loads(files['apk-metadata.json'])
+    elf=next(item for directory in original['paths'] for item in directory.get('files',[]) if directory.get('name')=='usr/sbin' and item['name']=='diversion-dns-c-lite')
+    with tempfile.TemporaryDirectory() as td:
+        base=Path(td);src=base/'source';src.mkdir()
+        for path,raw in source.items():
+            if path.startswith('packaging/managed/'):
+                put(src,path,raw)
+        binary=base/'elf-placeholder';binary.write_bytes(b'placeholder')
+        roots=stage(src,binary,base/'roots',commit)
+        put(roots[CORE],'usr/share/'+CORE+'/source.json',json.dumps({'source_commit':commit,'package':CORE,'binary_sha256':elf['hash']},indent=2))
+        for name,root in roots.items():
+            row=managed['packages'][name];arch=state['architecture'] if name==CORE else 'noarch'
+            deps=CORE_DEPS if name==CORE else [CORE+'='+version]+UI_DEPS
+            filename=name+'-'+version+'_'+arch+'.apk'
+            if row['filename']!=filename or row['arch']!=arch or row['depends']!=deps:raise ValueError('managed package identity mismatch')
+            if row['sha256']!=sha(files[filename]) or row['bytes']!=len(files[filename]):raise ValueError('managed APK hash mismatch')
+            expected=contents(root)
+            if name==CORE:expected['usr/libexec/diversion-dns-c']={'sha256':elf['hash'],'bytes':elf['size'],'mode':0o755}
+            if row['files']!=expected:raise ValueError('managed source payload mismatch')
+            meta=json.loads(files[name+'-metadata.json'])
+            if meta!=json.loads(logs['managed-metadata-'+name]):raise ValueError('managed metadata log mismatch')
+            verify_metadata(meta,expected,name,arch,version,deps)
+            prefix='core' if name==CORE else 'ui'
+            hooks={p.name.split('.',1)[1]:p.read_text() for p in (src/'packaging/managed/hooks').glob(prefix+'.*')}
+            if meta.get('scripts',{})!=hooks:raise ValueError('managed hook source mismatch')
+            if commands['managed-pack-'+name][:4]!=['fakeroot','sh','-ec','chown -R 0:0 "$1"; shift; exec "$@"']:raise ValueError('managed ownership command mismatch')
+            for step in ('metadata','integrity','extract'):
+                if Path(commands['managed-'+step+'-'+name][-1]).name!=filename:raise ValueError('managed verification APK target mismatch')
+    return managed

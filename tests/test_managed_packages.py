@@ -28,6 +28,29 @@ class ManagedPackage(unittest.TestCase):
   with self.assertRaisesRegex(ValueError,'dependency'):M.verify_metadata(meta,expected,M.CORE,'mipsel_24kc','1-r1',['libc'])
   meta['info']['depends']=['libc'];meta['paths'][0]['files'][0]['name']='other'
   with self.assertRaisesRegex(ValueError,'whitelist'):M.verify_metadata(meta,expected,M.CORE,'mipsel_24kc','1-r1',['libc'])
+ def test_frozen_payload_evidence_and_tamper_rejection(self):
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td);binary=base/'elf';binary.write_bytes(b'ELF fixture');commit='a'*40
+   roots=M.stage(ROOT,binary,base/'roots',commit);version='0.1.3_pre20261019~'+commit[:12]+'-r1'
+   managed={'source_commit':commit,'version':version,'packages':{}}
+   files={'apk-metadata.json':json.dumps({'paths':[{'name':'usr/sbin','files':[{'name':'diversion-dns-c-lite','hash':M.sha(binary.read_bytes()),'size':binary.stat().st_size}]}]}).encode()};commands={};logs={}
+   source={str(p.relative_to(ROOT)):p.read_bytes() for p in (ROOT/'packaging/managed').rglob('*') if p.is_file()}
+   for name,root in roots.items():
+    arch='mipsel_24kc' if name==M.CORE else 'noarch';deps=M.CORE_DEPS if name==M.CORE else [M.CORE+'='+version]+M.UI_DEPS
+    expected=M.contents(root);filename=name+'-'+version+'_'+arch+'.apk';files[filename]=b'container fixture'
+    managed['packages'][name]={'filename':filename,'sha256':M.sha(files[filename]),'bytes':len(files[filename]),'arch':arch,'depends':deps,'files':expected}
+    prefix='core' if name==M.CORE else 'ui'
+    meta={'info':{'name':name,'arch':arch,'version':version,'depends':deps,'installed-size':sum(x['bytes'] for x in expected.values())},'paths':[],'scripts':{p.name.split('.',1)[1]:p.read_text() for p in (ROOT/'packaging/managed/hooks').glob(prefix+'.*')}}
+    for path,row in expected.items():
+     meta['paths'].append({'name':str(Path(path).parent),'acl':{'user':'root','group':'root'},'files':[{'name':Path(path).name,'size':row['bytes'],'hash':row['sha256'],'acl':{'mode':row['mode'],'user':'root','group':'root'}}]})
+    files[name+'-metadata.json']=json.dumps(meta).encode();logs['managed-metadata-'+name]=json.dumps(meta)
+    commands['managed-pack-'+name]=['fakeroot','sh','-ec','chown -R 0:0 "$1"; shift; exec "$@"']
+    for step in ('metadata','integrity','extract'):commands['managed-'+step+'-'+name]=['apk',step,filename]
+   files['managed-packages.json']=json.dumps(managed).encode();state={'managed':managed,'source_commit':commit,'application_version':'0.1.3','architecture':'mipsel_24kc'}
+   M.verify_evidence(files,state,source,commands,logs)
+   managed['packages'][M.UI]['files']['usr/share/diversion-dns-ui/device.lua']['sha256']='0'*64
+   files['managed-packages.json']=json.dumps(managed).encode()
+   with self.assertRaisesRegex(ValueError,'source payload'):M.verify_evidence(files,state,source,commands,logs)
  def test_upgrade_only_restarts_previously_running_service(self):
   for name in ['core','ui']:
    for running in [False,True]:
