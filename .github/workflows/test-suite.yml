@@ -51,6 +51,14 @@ jobs:
             GOARCH="$arch" go build -trimpath -ldflags='-s -w' -o "dist/$arch/fixture" benchmarks/suite/fixture.go
             GOARCH="$arch" go build -trimpath -ldflags='-s -w' -o "dist/$arch/diagload" benchmarks/suite/diagload.go
           done
+          # Keep the identical workload available on a stronger local client.
+          # Cross-compile on Actions; no compiler is needed on the test machine.
+          mkdir -p dist/darwin-arm64
+          # diagload uses Linux CLOCK_MONOTONIC syscalls and remains Linux-only.
+          for helper in load fixture; do
+            GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags='-s -w' \
+              -o "dist/darwin-arm64/$helper" "benchmarks/suite/$helper.go"
+          done
           cp benchmarks/suite/*.go dist/
           go version > dist/toolchain.txt
           python3 - <<'PYTHON'
