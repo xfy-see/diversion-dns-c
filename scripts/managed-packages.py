@@ -74,6 +74,8 @@ def verify_metadata(meta,expected,name,arch,version,deps):
     files={}
     for directory in meta['paths']:
         prefix=directory.get('name','')
+        acl=directory.get('acl',{})
+        if str(acl.get('user')) not in ('root','0') or str(acl.get('group')) not in ('root','0'):raise ValueError('non-root package directory owner')
         if prefix.startswith('/') or '..' in Path(prefix).parts:raise ValueError('unsafe directory')
         for item in directory.get('files',[]):
             leaf=item['name'];path=str(Path(prefix)/leaf)
@@ -95,7 +97,7 @@ def build(source,binary,work,out,apktool,commit,arch,version,run):
         pkgarch=arch if name==CORE else 'noarch'
         deps=CORE_DEPS if name==CORE else [CORE+'='+package_version]+UI_DEPS
         path=out/(name+'-'+package_version+'_'+pkgarch+'.apk')
-        cmd=['fakeroot',apktool,'mkpkg','--info','name:'+name,'--info','version:'+package_version,'--info','arch:'+pkgarch,'--info','license:GPL-3.0-or-later','--info','description:Managed DNS '+('core service' if name==CORE else 'statistics and diagnostics'),'--info','origin:diversion-dns-c','--info','url:https://github.com/xfy-see/diversion-dns-c','--info','repo-commit:'+commit,'--info','depends:'+' '.join(deps),'--files',root,'--output',path]
+        cmd=['fakeroot','sh','-ec','chown -R 0:0 "$1"; shift; exec "$@"','managed-root-owner',root,apktool,'mkpkg','--info','name:'+name,'--info','version:'+package_version,'--info','arch:'+pkgarch,'--info','license:GPL-3.0-or-later','--info','description:Managed DNS '+('core service' if name==CORE else 'statistics and diagnostics'),'--info','origin:diversion-dns-c','--info','url:https://github.com/xfy-see/diversion-dns-c','--info','repo-commit:'+commit,'--info','depends:'+' '.join(deps),'--files',root,'--output',path]
         prefix='core' if name==CORE else 'ui'
         hooks={}
         for hook in sorted((source/'packaging/managed/hooks').glob(prefix+'.*')):

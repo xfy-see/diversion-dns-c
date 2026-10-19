@@ -22,7 +22,7 @@ class ManagedPackage(unittest.TestCase):
    with self.assertRaises(ValueError):M.stage(ROOT,binary,base/'roots','a'*40)
  def test_metadata_rejects_added_file_or_wrong_dep(self):
   expected={'usr/a':{'bytes':1,'sha256':'a'*64,'mode':0o755}}
-  meta={'info':{'name':M.CORE,'arch':'mipsel_24kc','version':'1-r1','depends':['libc'],'installed-size':1},'paths':[{'name':'usr','files':[{'name':'a','size':1,'hash':'a'*64,'acl':{'mode':0o755,'user':'root','group':'root'}}]}]}
+  meta={'info':{'name':M.CORE,'arch':'mipsel_24kc','version':'1-r1','depends':['libc'],'installed-size':1},'paths':[{'name':'usr','acl':{'user':'root','group':'root'},'files':[{'name':'a','size':1,'hash':'a'*64,'acl':{'mode':0o755,'user':'root','group':'root'}}]}]}
   M.verify_metadata(meta,expected,M.CORE,'mipsel_24kc','1-r1',['libc'])
   meta['info']['depends'].append('unexpected')
   with self.assertRaisesRegex(ValueError,'dependency'):M.verify_metadata(meta,expected,M.CORE,'mipsel_24kc','1-r1',['libc'])
