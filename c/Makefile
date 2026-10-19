@@ -60,7 +60,7 @@ $(BUILD)/%.o: %.c include/mosdns.h | check-backend
 $(BUILD)/tests/%: tests/%.c $(BUILD)/libmosdns-c.a $(wildcard $(REGEX_LIB)) | check-backend
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) $< $(BUILD)/libmosdns-c.a $(LDLIBS) -o $@
-$(BUILD)/tests/cache_domain_test: tests/regex_posix_profile.h tests/regex_concurrency.h tests/regex_budget_profile.h
+$(BUILD)/tests/cache_domain_test: tests/regex_posix_profile.h tests/regex_concurrency.h tests/regex_budget_profile.h tests/domain_storage_fault.h pkg/domain.c
 ifeq ($(shell uname -s),Darwin)
 $(BUILD)/tests/nft_cli_driver: CPPFLAGS += -Itests/nft_uapi
 endif
