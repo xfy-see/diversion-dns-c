@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+if [ -f /var/run/diversion-dns-ui-package-upgrade ]; then
+ /etc/init.d/diversion-dns-ui start
+ rm -f /var/run/diversion-dns-ui-package-upgrade
+fi
+rm -f /tmp/luci-indexcache.*
+/etc/init.d/rpcd reload

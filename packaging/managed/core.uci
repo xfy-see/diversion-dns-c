@@ -1,0 +1,3 @@
+config service 'main'
+	option enabled '0'
+	option config_file '/etc/diversion-dns/config.conf'

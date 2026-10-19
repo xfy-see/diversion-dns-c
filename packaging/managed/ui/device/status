@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /usr/libexec/diversion-dns-ui-control status
