@@ -42,7 +42,7 @@ def stage(source,binary,destination,commit):
     roots={CORE:destination/CORE,UI:destination/UI}
     for root in roots.values():root.mkdir()
     put(roots[CORE],'usr/libexec/diversion-dns-c',binary.read_bytes(),0o755)
-    for local,remote,mode in [('core.init','etc/init.d/diversion-dns',0o755),('core.uci','etc/config/diversion-dns',0o600),('config.conf','etc/diversion-dns/config.conf',0o600),('cn-domains.txt','etc/diversion-dns/cn-domains.txt',0o600)]:put(roots[CORE],remote,(base/local).read_bytes(),mode)
+    for local,remote,mode in [('core.init','etc/init.d/diversion-dns',0o755),('core.uci','etc/config/diversion-dns',0o600),('config.conf','etc/diversion-dns/config.conf',0o600),('cn-domains.txt','etc/diversion-dns/cn-domains.txt',0o600),('nft-init.nft','etc/diversion-dns/nft-init.nft',0o600)]:put(roots[CORE],remote,(base/local).read_bytes(),mode)
     for name in MODULES:put(roots[UI],'usr/share/diversion-dns-ui/'+Path(name).name,(ui/name).read_bytes())
     for name in ['control','status']:put(roots[UI],'usr/libexec/diversion-dns-ui-'+name,(ui/'device'/name).read_bytes(),0o755)
     put(roots[UI],'usr/share/diversion-dns-ui/monitor',(ui/'device/monitor').read_bytes(),0o755)
@@ -58,7 +58,7 @@ def stage(source,binary,destination,commit):
     put(roots[UI],'usr/share/luci/menu.d/luci-app-diversion-dns.json',json.dumps(menu,ensure_ascii=False,indent=2))
     acl={UI:{'description':'DNS statistics and bounded device diagnostics','read':{'ubus':{'file':['exec']},'file':{'/usr/libexec/diversion-dns-ui-status':['exec']}},'write':{'ubus':{'file':['exec']},'file':{'/usr/libexec/diversion-dns-ui-control':['exec']}}}}
     put(roots[UI],'usr/share/rpcd/acl.d/luci-app-diversion-dns.json',json.dumps(acl,indent=2))
-    configs={CORE:['/etc/config/diversion-dns','/etc/diversion-dns/config.conf','/etc/diversion-dns/cn-domains.txt'],UI:['/etc/config/diversion-dns-ui','/etc/diversion-dns-ui/profile.json']}
+    configs={CORE:['/etc/config/diversion-dns','/etc/diversion-dns/config.conf','/etc/diversion-dns/cn-domains.txt','/etc/diversion-dns/nft-init.nft'],UI:['/etc/config/diversion-dns-ui','/etc/diversion-dns-ui/profile.json']}
     for name,root in roots.items():
         put(root,'usr/share/'+name+'/source.json',json.dumps({'source_commit':commit,'package':name,**({'binary_sha256':sha(binary.read_bytes())} if name==CORE else {})},indent=2))
         put(root,'lib/apk/packages/'+name+'.conffiles','\n'.join(configs[name])+'\n')

@@ -53,6 +53,25 @@ class ManagedPackage(unittest.TestCase):
    managed['packages'][M.UI]['files']['usr/share/diversion-dns-ui/device.lua']['sha256']='0'*64
    files['managed-packages.json']=json.dumps(managed).encode()
    with self.assertRaisesRegex(ValueError,'source payload'):M.verify_evidence(files,state,source,commands,logs)
+ def test_init_nft_is_opt_in_and_failure_prevents_listener(self):
+  for enabled,nft_ok in [(False,True),(True,True),(True,False)]:
+   with self.subTest(enabled=enabled,nft_ok=nft_ok),tempfile.TemporaryDirectory() as td:
+    root=Path(td);(root/'etc/diversion-dns').mkdir(parents=True);(root/'usr/libexec').mkdir(parents=True);(root/'bin').mkdir()
+    (root/'etc/diversion-dns/config.conf').write_text('fixture')
+    (root/'etc/diversion-dns/nft-init.nft').write_text('fixture')
+    fake=root/'usr/libexec/diversion-dns-c';fake.write_text('#!/bin/sh\nexit 0\n');fake.chmod(0o755)
+    nft=root/'bin/nft';nft.write_text('#!/bin/sh\necho nft >> "'+str(root/'calls')+'"\nexit '+('0' if nft_ok else '1')+'\n');nft.chmod(0o755)
+    source=(ROOT/'packaging/managed/core.init').read_text().replace('/usr/libexec/',str(root)+'/usr/libexec/').replace('/etc/diversion-dns/',str(root)+'/etc/diversion-dns/')
+    setup='config_load() { :; }\nconfig_get_bool() { if [ "$1" = enabled ]; then enabled=1; else nft_init=NSTEP; fi; }\nconfig_get() { case "$1" in config_file) config_file="$4";; cpu) cpu=4;; memory_limit) memory_limit=67108864;; cache_stats) cache_stats=60;; esac; }\nprocd_open_instance() { echo open >> "TRACE"; }\nprocd_close_instance() { echo close >> "TRACE"; }\nprocd_set_param() { echo "set $*" >> "TRACE"; }\nprocd_append_param() { echo "append $*" >> "TRACE"; }\n'.replace('NSTEP','1' if enabled else '0').replace('TRACE',str(root/'calls'))
+    import os
+    env=dict(os.environ,PATH=str(root/'bin')+':'+os.environ['PATH'])
+    proc=subprocess.run(['sh','-c',setup+source+'\nstart_service\n'],capture_output=True,text=True,env=env)
+    calls=(root/'calls').read_text()
+    if enabled and not nft_ok:self.assertNotEqual(proc.returncode,0);self.assertNotIn('open',calls)
+    else:
+     self.assertEqual(proc.returncode,0,proc.stderr);self.assertIn('append command --cpu 4',calls);self.assertIn('append limits as=67108864',calls)
+     if enabled:self.assertLess(calls.index('nft'),calls.index('open'))
+     else:self.assertNotIn('nft',calls)
  def test_upgrade_only_restarts_previously_running_service(self):
   for name in ['core','ui']:
    for running in [False,True]:

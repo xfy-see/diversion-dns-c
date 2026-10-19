@@ -1,3 +1,7 @@
 config service 'main'
 	option enabled '0'
 	option config_file '/etc/diversion-dns/config.conf'
+ option nft_init '0'
+ option cpu '0'
+ option memory_limit '0'
+ option cache_stats '0'
