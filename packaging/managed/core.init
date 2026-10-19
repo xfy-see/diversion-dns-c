@@ -21,7 +21,7 @@ start_service() {
  for value in "$cpu" "$memory_limit" "$cache_stats"; do
   case "$value" in ''|*[!0-9]*) return 1;; esac
  done
- [ "$cpu" -le 256 ] && [ "$memory_limit" -le 2147483647 ] && [ "$cache_stats" -le 86400 ] || return 1
+ [ "$cpu" -le 64 ] && [ "$memory_limit" -le 2147483647 ] && [ "$cache_stats" -le 86400 ] || return 1
  if [ "$nft_init" = 1 ]; then
   [ -f /etc/diversion-dns/nft-init.nft ] && [ ! -L /etc/diversion-dns/nft-init.nft ] || return 1
   nft -f /etc/diversion-dns/nft-init.nft || return 1
