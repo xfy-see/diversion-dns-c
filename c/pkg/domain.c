@@ -27,7 +27,7 @@ typedef struct domain_entry {
 typedef struct { domain_entry **buckets; size_t count, size; } domain_table;
 /* Fixed blocks never move: bucket growth can keep using ordinary pointers.
  * Only full/suffix nodes use this arena; regex and keyword ownership is unchanged.
- * Small rule sets start at 4 KiB, large sets use 32 KiB blocks. */
+ * Use 4 KiB blocks throughout; oversized nodes still receive a dedicated block. */
 typedef struct domain_block {
     struct domain_block *next;
     size_t used, capacity;
@@ -60,7 +60,7 @@ static domain_entry *entry_alloc(md_domain *d, size_t len) {
     size_t size = (sizeof(domain_entry) + len + 1 + alignment - 1) & ~(alignment - 1);
     domain_block *b = d->blocks;
     if (!b || size > b->capacity - b->used) {
-        size_t capacity = b ? 32768 : 4096;
+        size_t capacity = 4096;
         if (capacity < size) capacity = size;
         if (capacity > SIZE_MAX - sizeof(*b)) return NULL;
         b = malloc(sizeof(*b) + capacity);
