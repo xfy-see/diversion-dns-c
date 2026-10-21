@@ -28,6 +28,8 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+      - name: Scan published source for private data
+        run: python3 scripts/privacy_scan.py --ref HEAD
       - name: Pinned no-Unicode PCRE2 dependency
         run: |
           set -euo pipefail
@@ -157,6 +159,8 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           persist-credentials: false
+      - name: Scan published source for private data
+        run: python3 scripts/privacy_scan.py --ref HEAD
       - name: Pinned Zig and PCRE2 sources
         env:
           ZIG_ARCH: ${{ matrix.zig_arch }}
@@ -270,6 +274,8 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           persist-credentials: false
+      - name: Scan published source for private data
+        run: python3 scripts/privacy_scan.py --ref HEAD
       - name: Install kernel test and strict GCC build tools
         run: |
           sudo apt-get update
@@ -330,6 +336,8 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           persist-credentials: false
+      - name: Scan published source for private data
+        run: python3 scripts/privacy_scan.py --ref HEAD
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: diversion-*-${{ github.sha }}-attempt-${{ github.run_attempt }}
@@ -358,6 +366,8 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           persist-credentials: false
+      - name: Scan published source for private data
+        run: python3 scripts/privacy_scan.py --ref HEAD
       - name: Install official runtime verification tools only
         run: |
           sudo apt-get update
@@ -391,6 +401,8 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           persist-credentials: false
+      - name: Scan published source for private data
+        run: python3 scripts/privacy_scan.py --ref HEAD
       - name: Install official runtime verification tools only
         run: |
           sudo apt-get update
@@ -424,6 +436,8 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           persist-credentials: false
+      - name: Scan published source for private data
+        run: python3 scripts/privacy_scan.py --ref HEAD
       - name: Install official runtime verification tools only
         run: |
           sudo apt-get update
@@ -457,6 +471,8 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           persist-credentials: false
+      - name: Scan published source for private data
+        run: python3 scripts/privacy_scan.py --ref HEAD
       - name: Install official runtime verification tools only
         run: |
           sudo apt-get update

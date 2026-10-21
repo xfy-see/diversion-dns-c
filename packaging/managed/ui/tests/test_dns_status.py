@@ -15,7 +15,7 @@ class DNSStatusTests(unittest.TestCase):
         self.lua.globals().D = self.lua.execute((ROOT / "dns-status.lua").read_text())
         self.lua.execute(r"""
           config='listen_udp=127.0.0.1:15363\nlisten_tcp=127.0.0.1:15363\n'..
-            'cn_upstream=202.101.172.35:53\ncn_upstream=202.101.172.46:53\ncn_interface=pppoe-wan\ncn_mark=0\n'..
+            'cn_upstream=192.0.2.53:53\ncn_upstream=192.0.2.54:53\ncn_interface=pppoe-wan\ncn_mark=0\n'..
             'foreign_upstream=1.1.1.1:53\nforeign_upstream=8.8.8.8:53\nforeign_interface=wg_vpn\nforeign_mark=1\n'
           files={['/etc/diversion-dns-c/config.conf']=config}
           server='127.0.0.1#15363';noresolv='1';resolvfile='/tmp/resolv.conf.d/resolv.conf.auto'
@@ -48,7 +48,7 @@ class DNSStatusTests(unittest.TestCase):
     def test_live_topology_whitelisted_addresses(self):
         self.lua.execute(r"""
           local r=get();assert(r.cn.available and r.foreign.available)
-          assert(#r.cn.upstreams==2 and r.cn.upstreams[1]=='202.101.172.35:53')
+          assert(#r.cn.upstreams==2 and r.cn.upstreams[1]=='192.0.2.53:53')
           assert(r.foreign.upstreams[2]=='8.8.8.8:53' and r.foreign.interface=='wg_vpn' and r.foreign.mark==1)
           assert(r.cn.interface=='pppoe-wan' and r.cn.mark==0 and r.cn.mode=='diversion')
           assert(r.observed_at==1792320000 and r.source=='/etc/diversion-dns-c/config.conf')
@@ -78,9 +78,9 @@ class DNSStatusTests(unittest.TestCase):
 
     def test_degraded_mode_uses_actual_common_servers(self):
         self.lua.execute(r"""
-          files['/etc/diversion-dns-c/degraded']='';server='202.101.172.35 202.101.172.46'
+          files['/etc/diversion-dns-c/degraded']='';server='192.0.2.53 192.0.2.54'
           local r=get();assert(not r.cn.available and not r.foreign.available)
-          assert(r.cn.mode=='degraded-dnsmasq' and r.foreign.upstreams[1]=='202.101.172.35:53')
+          assert(r.cn.mode=='degraded-dnsmasq' and r.foreign.upstreams[1]=='192.0.2.53:53')
           assert(r.foreign.reason:find('split is inactive',1,true))
           for _,command in ipairs(commands) do assert(not command:find('route get',1,true)) end
         """)
@@ -88,8 +88,8 @@ class DNSStatusTests(unittest.TestCase):
     def test_resolv_fallback_and_noresolv_source_selection(self):
         self.lua.execute(r"""
           files['/etc/diversion-dns-c/degraded']='';server='';noresolv='0'
-          files[resolvfile]='# nameserver 9.9.9.9\nnameserver 202.101.172.35\nnameserver 240e:1::1\n'
-          local r=get();assert(#r.cn.upstreams==2 and r.cn.upstreams[2]=='[240e:1::1]:53')
+          files[resolvfile]='# nameserver 9.9.9.9\nnameserver 192.0.2.53\nnameserver 2001:db8:1::1\n'
+          local r=get();assert(#r.cn.upstreams==2 and r.cn.upstreams[2]=='[2001:db8:1::1]:53')
           assert(r.source:find(resolvfile,1,true))
           noresolv='1';reads={};r=get();assert(#r.cn.upstreams==0)
           for _,path in ipairs(reads) do assert(path~=resolvfile) end
@@ -97,9 +97,9 @@ class DNSStatusTests(unittest.TestCase):
 
     def test_ipv6_dnsmasq_server_port_is_preserved(self):
         self.lua.execute(r"""
-          files['/etc/diversion-dns-c/degraded']='';server='240e:1::1#5353 [240e:1::2]#5354'
+          files['/etc/diversion-dns-c/degraded']='';server='2001:db8:1::1#5353 [2001:db8:1::2]#5354'
           local r=get();assert(#r.cn.upstreams==2)
-          assert(r.cn.upstreams[1]=='[240e:1::1]:5353' and r.cn.upstreams[2]=='[240e:1::2]:5354')
+          assert(r.cn.upstreams[1]=='[2001:db8:1::1]:5353' and r.cn.upstreams[2]=='[2001:db8:1::2]:5354')
         """)
 
     def test_unknown_resolv_file_cannot_read_secrets(self):

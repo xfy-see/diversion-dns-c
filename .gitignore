@@ -4,3 +4,23 @@ validation/
 __pycache__/
 *.pyc
 .DS_Store
+
+# Private device configuration and evidence never belong in published source.
+.env
+.env.*
+!.env.example
+private/
+private-artifacts/
+*.local.json
+*.local.conf
+*.pcap
+*.pcapng
+*.key
+*.pem
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+known_hosts*
+expected-egress.json
+!expected-egress.example.json

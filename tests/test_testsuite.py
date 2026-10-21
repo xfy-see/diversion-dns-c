@@ -48,10 +48,10 @@ class SuiteTests(unittest.TestCase):
                 t.release_audit(dict(release=dict(expected_commit='a'*40,required=['kernel'],reports={'kernel':tmp})))
     def test_one_report_cannot_satisfy_two_devices(self):
         with tempfile.TemporaryDirectory() as tmp:
-            p=Path(tmp);t.dump(p/'result.json',dict(schema_version=1,status='pass',completed=True,profile='device-smoke',identity={'commit':'a'*40,'target_address':'192.168.100.122'}))
+            p=Path(tmp);t.dump(p/'result.json',dict(schema_version=1,status='pass',completed=True,profile='device-smoke',identity={'commit':'a'*40,'target_address':'192.168.50.122'}))
             t.dump(p/'evidence.json',t.inventory(p))
             with self.assertRaisesRegex(ValueError,'multiple release'):
-                t.release_audit(dict(release=dict(expected_commit='a'*40,required=['device-smoke-122','device-smoke-131'],reports={'device-smoke-122':tmp,'device-smoke-131':tmp},expected_devices={'device-smoke-122':'192.168.100.122','device-smoke-131':'192.168.100.131'})))
+                t.release_audit(dict(release=dict(expected_commit='a'*40,required=['device-smoke-122','device-smoke-131'],reports={'device-smoke-122':tmp,'device-smoke-131':tmp},expected_devices={'device-smoke-122':'192.168.50.122','device-smoke-131':'192.168.50.131'})))
     def test_invalid_config_retains_failure_record(self):
         import argparse
         with tempfile.TemporaryDirectory() as tmp:

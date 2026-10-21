@@ -1,16 +1,16 @@
 {
   "schema_version": 1,
   "target": {
-    "address": "192.168.100.122",
-    "ssh": ["ssh", "-T", "-F", "/dev/null", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=/path/to/known_hosts", "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2", "-o", "IdentitiesOnly=yes", "-i", "/path/to/id_key", "root@192.168.100.122"],
+    "address": "192.168.50.122",
+    "ssh": ["ssh", "-T", "-F", "/dev/null", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=/path/to/known_hosts", "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2", "-o", "IdentitiesOnly=yes", "-i", "/path/to/id_key", "root@192.168.50.122"],
     "production_files": ["/usr/sbin/diversion-dns-c-lite", "/etc/diversion-dns-c-lite/config.conf"],
     "memory_limit_mib": 24,
     "min_available_kib": 8000,
     "max_conntrack": 12000
   },
   "client": {
-    "address": "192.168.100.131",
-    "ssh": ["ssh", "-T", "-F", "/dev/null", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=/path/to/known_hosts", "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2", "-o", "IdentitiesOnly=yes", "-i", "/path/to/id_key", "root@192.168.100.131"],
+    "address": "192.168.50.131",
+    "ssh": ["ssh", "-T", "-F", "/dev/null", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=/path/to/known_hosts", "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2", "-o", "IdentitiesOnly=yes", "-i", "/path/to/id_key", "root@192.168.50.131"],
     "production_files": [],
     "memory_limit_mib": 48,
     "min_available_kib": 16000,
@@ -36,6 +36,6 @@
   ],
   "helpers": {
     "load": {"path": "/path/to/verified/load", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"},
-    "fixture": {"path": "/path/to/verified/fixture", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "listen_address": "192.168.100.131", "listen_port": 15531, "ttl": 30, "command_args": ["-addr", "192.168.100.131:15531"]}
+    "fixture": {"path": "/path/to/verified/fixture", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "listen_address": "192.168.50.131", "listen_port": 15531, "ttl": 30, "command_args": ["-addr", "192.168.50.131:15531"]}
   }
 }

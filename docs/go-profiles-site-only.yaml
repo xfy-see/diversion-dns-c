@@ -23,7 +23,7 @@ plugins:
       so_mark: 16777216 # 0x01000000
       bind_to_device: "br-lan"
       upstreams:
-        - addr: "192.168.100.1:53"
+        - addr: "192.168.50.1:53"
   - tag: foreign_forward
     type: forward
     args:

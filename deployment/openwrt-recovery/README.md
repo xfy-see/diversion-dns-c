@@ -1,6 +1,6 @@
 # OpenWrt DNS 降级后的自动恢复
 
-这是针对主路由 `192.168.100.1` 现有定制部署的脚本覆盖层，依赖 `/etc/diversion-dns-c/`、本机 C DNS 的 `15363` 端口，以及现有策略和守护服务。它不是通用 APK 安装器，不更新 C 可执行文件，也不适用于未经核对的其他安装布局。
+这是针对具有匹配布局的主路由 现有定制部署的脚本覆盖层，依赖 `/etc/diversion-dns-c/`、本机 C DNS 的 `15363` 端口，以及现有策略和守护服务。它不是通用 APK 安装器，不更新 C 可执行文件，也不适用于未经核对的其他安装布局。
 
 保留现有 `dns-mode.sh`、`apply-policy.sh`、`enable-rescue.sh`、`refresh-monitor.sh` 和 DDNS 配置。降级仍由已有 `fallback_dns` 切换到 ISP DNS；本改动补充探测、自动回切及中断恢复，不增加境外流量自动绕过隧道走 WAN 的规则。
 

@@ -28,16 +28,16 @@ CN 规则，执行 `... check -c /etc/diversion-dns/config.conf`。启用需设�
 用户需要自行按实际网络接入 DNS；这是配置边界，不是自动接管功能。
 
 管理 profile `/etc/diversion-dns-ui/profile.json` 默认 generic，不能推断直连/隧道。
-.122/.131 迁移保留已核验 profile/config/policy 指纹，但服务名改为 `diversion-dns`；
+测试机 A/测试机 B 迁移保留已核验 profile/config/policy 指纹，但服务名改为 `diversion-dns`；
 新 UCI 的 config_file 指向原配置路径，规则文件与 nft 对象继续使用原位置。
 如旧服务负责创建独立 nft 表，先把其幂等 add table/set 定义保存到
 `/etc/diversion-dns/nft-init.nft`，再显式设置 `nft_init=1`。首次默认关闭；
 服务停止/卸载不会删除 nft 表，也不会 flush 共享规则。失败时拒绝启动解析器。
-`.131` 的旧 stop 会删除测试表，迁移必须接续此初始化责任；`.122` 的表由原网络配置管理，保持 nft_init=0。
+`测试机 B` 的旧 stop 会删除测试表，迁移必须接续此初始化责任；`测试机 A` 的表由原网络配置管理，保持 nft_init=0。
 `cpu=0` 使用程序默认；可指定原 --cpu 值。`memory_limit=0` 不另限地址空间；
 可设原字节限制。nofile 固定 1024，`cache_stats` 可保留原 stderr 统计秒数。
 不能只复制 DNS 配置而遗漏旧 init 中的资源初始化与运行限制。
-.122/.131 的旧手工菜单要先备份并撤下，避免同一路由被多个菜单文件定义。
+测试机 A/测试机 B 的旧手工菜单要先备份并撤下，避免同一路由被多个菜单文件定义。
 不向 .1 安装或套用这两个设备的 profile。
 
 ## 升级、卸载与回退
@@ -49,7 +49,7 @@ CN 规则，执行 `... check -c /etc/diversion-dns/config.conf`。启用需设�
 **卸载正在承担 DNS 的核心前，必须先恢复原解析服务/转发目标**，否则客户端会失去 DNS。
 不使用强制覆盖或绕过依赖移除；先卸载管理包，再移除核心。
 
-.122/.131 先演练“未激活安装→卸载→重装”，确认旧 DNS 不受影响，再显式迁移服务。
+测试机 A/测试机 B 先演练“未激活安装→卸载→重装”，确认旧 DNS 不受影响，再显式迁移服务。
 保留旧二进制、旧 init、配置和完整包清单，准备定时回退后执行迁移。
 单独验证包拥有权、服务重启/升级配置保留、真实 DNS、页面和卸载流程。
 正式验收报告写入 validation；CI 只证明同 SDK/QEMU 与 mock 检查，不替代真机。

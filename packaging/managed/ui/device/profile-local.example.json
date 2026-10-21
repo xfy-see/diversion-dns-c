@@ -1,5 +1,5 @@
 {
-  "device": "122",
+  "device": "lab-local",
   "config": "/etc/diversion-dns-c-lite/config.conf",
   "service": "diversion-dns",
   "dns_host": "127.0.0.1",

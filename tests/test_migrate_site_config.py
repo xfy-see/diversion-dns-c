@@ -63,7 +63,7 @@ class SiteMigrationTests(unittest.TestCase):
         config = migration.yaml.safe_load(text)
         config["plugins"].reverse()
         output = self.convert(config)
-        self.assertIn("cn_upstream=192.168.100.1:53\n", output)
+        self.assertIn("cn_upstream=192.168.50.1:53\n", output)
         self.assertIn("foreign_upstream=1.1.1.1:53\n", output)
 
     def test_repeatable_files_listeners_upstreams_preserve_order(self):

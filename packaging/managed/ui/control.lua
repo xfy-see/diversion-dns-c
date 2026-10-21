@@ -132,11 +132,39 @@ local function with_isolated_probe(fn)
  if not ok then error(result) end
  return result
 end
+-- Device identities are local configuration, never source-code defaults. The
+-- expected public egress and the route endpoint are intentionally independent.
+local function identity(id)
+ local raw=read(B..'/expected-egress.json')
+ if not raw then return {} end
+ assert(#raw<=65536,'exit identity configuration is too large')
+ local ok,configured=pcall(json.parse,raw)
+ assert(ok and type(configured)=='table','invalid exit identity configuration')
+ local item=configured[id]
+ assert(item==nil or type(item)=='table','invalid exit identity entry')
+ return item or {}
+end
+local function ipv4_literal(value)
+ if type(value)~='string' or not value:match('^%d+%.%d+%.%d+%.%d+$') then return nil end
+ for part in value:gmatch('%d+') do
+  if #part>3 or (#part>1 and part:sub(1,1)=='0') or tonumber(part)>255 then return nil end
+ end
+ return value
+end
 local function expected_ip(id,af)
- local configured=load(B..'/expected-egress.json');local item=configured[id]
- if type(item)=='table' and type(item['ipv'..af])=='string' then return item['ipv'..af] end
- -- Existing reviewed US exit identity; WG endpoint addresses are not egress identities.
- if (id=='usss' or id=='usvless') and af=='4' then return '186.241.86.13' end
+ local value=identity(id)['ipv'..af]
+ if value~=nil then
+  assert(type(value)=='string' and (af=='4' and ipv4_literal(value) or af=='6' and value:find(':',1,true) and value:match('^[%x:]+$')),'invalid expected egress address')
+ end
+ -- These exits formerly had a fixed expected identity. Missing configuration
+ -- must not silently downgrade that check to reachability-only.
+ if (id=='usss' or id=='usvless') and af=='4' then assert(value,'proxy egress identity is not configured; migrate local configuration first') end
+ return value
+end
+local function proxy_endpoint(id)
+ local value=identity(id).endpoint_ipv4
+ assert(ipv4_literal(value),'proxy endpoint is not configured; migrate local configuration first')
+ return value
 end
 local function public_probe(af,isolated)
  local out,rc=run(isolated and (SELF..' probe-fetch '..af) or ('uclient-fetch -'..af..' --no-proxy -T 10 -q -O - https://www.cloudflare.com/cdn-cgi/trace'))
@@ -267,7 +295,8 @@ local function switch(to)
  else
   assert(fs.stat('/sys/class/net/'..exits[to].dev),'US proxy TUN is not running')
   must('/etc/init.d/pnw-foreign-v4-dns status','foreign-only IPv4 DNS filter is not running')
-  local route=must('ip -4 route get 186.241.86.13 mark 512','US endpoint has no route')
+  expected_ip(to,'4') -- Validate identity before any route changes.
+  local route=must('ip -4 route get '..q(proxy_endpoint(to))..' mark 512','proxy endpoint has no route')
   assert(route:find('dev pppoe-wan',1,true),'US endpoint is not WAN reachable')
  end
  cn_health();local protected=hashes(isolated)

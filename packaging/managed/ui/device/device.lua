@@ -16,13 +16,15 @@ local function trim(s)return (s or ''):match('^%s*(.-)%s*$')end
 local function hash(p)return (run('sha256sum '..quote(p))):match('^([%da-f]+)')end
 local function profile()
  local p=load('/etc/diversion-dns-ui/profile.json')
- assert(p.device=='122' or p.device=='131' or p.device=='generic','unrecognized device profile')
- local cfg=p.device=='122' and '/etc/diversion-dns-c-lite/config.conf' or p.device=='131' and '/etc/diversion-dns-c-test/config.conf' or '/etc/diversion-dns/config.conf'
+ local kinds={['122']='local',['131']='listener',['lab-local']='local',['lab-listener']='listener',generic='generic'}
+ p.kind=assert(kinds[p.device],'unrecognized device profile')
+ local cfg=p.kind=='local' and '/etc/diversion-dns-c-lite/config.conf' or p.kind=='listener' and '/etc/diversion-dns-c-test/config.conf' or '/etc/diversion-dns/config.conf'
  assert(p.config==cfg,'invalid config path')
  assert(p.service=='diversion-dns','invalid service')
- assert(p.dns_host==(p.device=='131' and '192.168.100.131' or '127.0.0.1'),'invalid DNS host')
- assert(p.dns_port==(p.device=='131' and 15453 or 15353),'invalid DNS port')
- assert(p.selected==(p.device=='122' and 'wg0' or p.device=='131' and 'upstream' or 'unmanaged'),'invalid selected mode')
+ local _,host_kind=Q.validate_input(p.dns_host)
+ assert((p.kind=='listener' and host_kind=='ipv4') or (p.kind~='listener' and p.dns_host=='127.0.0.1'),'invalid DNS host')
+ assert(p.dns_port==(p.kind=='listener' and 15453 or 15353),'invalid DNS port')
+ assert(p.selected==(p.kind=='local' and 'wg0' or p.kind=='listener' and 'upstream' or 'unmanaged'),'invalid selected mode')
  return p
 end
 local function action_map()
@@ -37,8 +39,8 @@ local function policy_fingerprint()
  return trim(run("(nft -s list chain inet mark_routing classify; nft -s list chain inet mark_routing output; nft -s list chain inet mark_routing prerouting; ip -4 rule show; ip -6 rule show) | sha256sum")):match('^([%da-f]+)')
 end
 function M.status()
- local p=profile();local current={version='2026.10.19-managed',server_time=os.time(),selected=p.selected,exit_names={wg0='现有 WireGuard wg0',upstream='上级网关 192.168.100.1',unmanaged='尚未验证设备出口'},running=busy(),pending=false,previous_exit=J.null,actions=action_map(),device_profile=p.device,
- mode_text=p.device=='122' and '现有 mark-routing：国内优先；普通未分类流量按 wg0 策略路由' or p.device=='131' and '独立 DNS 测试服务；本机未部署隧道分流' or '管理包已安装；DNS 服务和网络策略需按本机配置启用',
+ local p=profile();local current={version='2026.10.19-managed',server_time=os.time(),selected=p.selected,exit_names={wg0='现有 WireGuard wg0',upstream='本机配置的上级网关',unmanaged='尚未验证设备出口'},running=busy(),pending=false,previous_exit=J.null,actions=action_map(),device_profile=p.device,
+ mode_text=p.kind=='local' and '现有 mark-routing：国内优先；普通未分类流量按 wg0 策略路由' or p.kind=='listener' and '独立 DNS 测试服务；本机未部署隧道分流' or '管理包已安装；DNS 服务和网络策略需按本机配置启用',
  control_note='保留本设备现有网络。检测与诊断已启用；缺少配套出口或事务机制的操作禁用。检测失败不会修改路由或自动切换。',
  load=trim(read('/proc/loadavg')),memory=tonumber((read('/proc/meminfo') or ''):match('MemAvailable:%s*(%d+)')),
  last=load(R..'/last.json'),health=load(R..'/health.json'),diagnostic=load(R..'/diagnostic.json'),public_exit=load(R..'/public.json'),telemetry=dofile(B..'/window.lua').status(),peers={}}
@@ -47,7 +49,7 @@ function M.status()
   for _,v in pairs({current.dns_upstreams.cn,current.dns_upstreams.foreign})do v.available=false;v.reason='配置已变化，未确认与已验证运行版本一致'end
  end
  if p.direct_listener then for _,v in pairs({current.dns_upstreams.cn,current.dns_upstreams.foreign})do if v.available then v.reason='独立端口 '..p.dns_port..'；本组件不接管 LAN DNS'end end end
- if p.device=='122' then
+ if p.kind=='local' then
   local hand=run('wg show wg0 latest-handshakes');local latest=0
   for stamp in hand:gmatch('\t(%d+)')do latest=math.max(latest,tonumber(stamp))end
   current.peers={{id='wg0',handshake_age=latest>0 and os.time()-latest or nil,handshake=latest}}
@@ -89,12 +91,12 @@ function M.query(input,source)
    for _,a in ipairs(r.answers or {})do if #out.answers<16 then out.answers[#out.answers+1]={family=a.family,address=a.address} end end
   end
  else out.answers={{family=kind=='ipv4' and 4 or 6,address=name}}end
- local known=p.device=='122' and type(p.policy_fingerprint)=='string' and #p.policy_fingerprint==64 and policy_fingerprint()==p.policy_fingerprint
+ local known=p.kind=='local' and type(p.policy_fingerprint)=='string' and #p.policy_fingerprint==64 and policy_fingerprint()==p.policy_fingerprint
  for _,a in ipairs(out.answers)do
   local mark=0;a.sets={};a.expected_path='unknown'
-  if p.device=='generic' then
+  if p.kind=='generic' then
    a.reason='未验证本机策略，不能推断直连或隧道'
-  elseif p.device=='131' then
+  elseif p.kind=='listener' then
    a.reason='本机没有流量分流链；流量交给上级网关，上级策略未在此页推断'
   elseif not known then a.reason='策略与已验证快照不同，拒绝按旧顺序推断'
   else
@@ -133,7 +135,7 @@ function M.check()
   local r=foreign_probe(af);public['ipv'..af]=r;h.checks['https_ipv'..af]=r.reachability;h.details['https_ipv'..af]={ok=r.reachability,duration_ms=r.duration_ms,error=r.error};h.ok=h.ok and r.reachability
   local domestic=public.domestic['ipv'..af];h.checks['domestic_https_ipv'..af]=domestic.reachability;h.details['domestic_https_ipv'..af]={ok=domestic.reachability,error=domestic.error};h.ok=h.ok and domestic.reachability
  end
- if p.device=='122' then
+ if p.kind=='local' then
   local latest=0;for n in run('wg show wg0 latest-handshakes'):gmatch('\t(%d+)')do latest=math.max(latest,tonumber(n))end
   local ok=latest>0 and os.time()-latest<180;h.checks.wireguard_handshake=ok;h.details.wireguard_handshake={ok=ok,error=not ok and 'wg0 最近握手超过 180 秒；接口存在不代表隧道可用' or nil};h.ok=h.ok and ok
  end
