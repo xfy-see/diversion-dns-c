@@ -33,14 +33,14 @@ function fixture(extra = {}) {
    public_exit: { selected: 'aws', time: now, ipv4: { ip: '203.0.113.5', expected: '203.0.113.5', matches_expected: true, identity_status: 'verified', checked_at: now, probe_scope: 'router_https' } }
   }, diagnostic: { fixture: true } }, extra);
 }
-function create(data, handler, statsOnly = false, deviceMode = false) {
+function create(data, handler, statsOnly = false, deviceMode = false, timer = setTimeout) {
  let now = 1792300000000;
  const polls = [], calls = [], notifications = [];
  class TestDate extends Date { static now() { return now; } }
  const factory = new Function('view', 'fs', 'poll', 'ui', 'E', 'document', 'Date', 'URL', 'Blob', 'setTimeout', source);
  const instance = factory({ extend: x => x }, { exec: async () => ({ code: 0, stdout: '{}' }) }, { add: (fn, interval) => polls.push({ fn, interval }) },
   { addNotification: (a, b, c) => notifications.push([a, b, c]) }, (tag, attrs, children) => new Element(tag, attrs, children),
-  { createTextNode: s => new TextNode(s), createElement: tag => new Element(tag) }, TestDate, { createObjectURL: () => 'blob:fixture', revokeObjectURL() {} }, Blob, setTimeout);
+  { createTextNode: s => new TextNode(s), createElement: tag => new Element(tag) }, TestDate, { createObjectURL: () => 'blob:fixture', revokeObjectURL() {} }, Blob, timer);
  instance.call = args => { calls.push(args); return handler ? handler(args) : Promise.resolve(fixture()); };
  instance.statsOnly=statsOnly;instance.deviceMode=deviceMode;
  const root = instance.render(data);
@@ -389,6 +389,39 @@ test('query result remains explicitly a query-time snapshot after exit changes',
  assert.match(before, /查询时隧道/);
  assert.match(before, /出口或配置变化后，结果不会自动刷新，请重新查询/);
  assert.doesNotMatch(before, /当前隧道/);
+});
+
+test('device query polls one ticket and blocks duplicate submission while pending', async () => {
+ const timers = []; let count = 0;
+ const ui = create(fixture(), args => Promise.resolve(args[0] === 'query-start' ? { accepted: true, query_id: '123-456' } : ++count === 1 ? { id: '123-456', state: 'running' } : { id: '123-456', state: 'complete', result: { input: 'example.com', answers: [], classification: { group: 'foreign' } } }), false, true, fn => timers.push(fn));
+ all(ui.root, n => n.tag === 'input' && n.attrs['aria-label'] === '待查询的域名或 IP')[0].value = 'example.com';
+ const button = all(ui.root, n => n.tag === 'button' && n.textContent === '查询分流')[0];
+ button.click(); await flush(); button.click();
+ assert.match(ui.part('queryResult').textContent, /后台解析/); assert.equal(button.disabled, true);
+ assert.deepEqual(ui.calls, [['query-start', 'example.com', 'router'], ['query-status', '123-456']]);
+ timers.shift()(); await flush(); await flush();
+ assert.match(ui.part('queryResult').textContent, /example.com/); assert.equal(button.disabled, false);
+ assert.equal(ui.calls.filter(a => a[0] === 'query-start').length, 1);
+});
+
+test('device query rejects failed, mismatched and invalid tickets without resubmitting', async () => {
+ for (const response of [{id:'123-456',state:'failed',error:'fixture failure'}, {id:'999-999',state:'complete',result:{input:'wrong.example'}}, {id:'123-456',state:'unexpected'}]) {
+  const ui=create(fixture(),a=>Promise.resolve(a[0]==='query-start'?{accepted:true,query_id:'123-456'}:response),false,true);
+  all(ui.root,n=>n.tag==='input'&&n.attrs['aria-label']==='待查询的域名或 IP')[0].value='example.com';
+  const b=all(ui.root,n=>n.tag==='button'&&n.textContent==='查询分流')[0];b.click();await flush();await flush();
+  assert.match(ui.part('queryResult').textContent,/fixture failure|标识不一致|状态无效/);assert.doesNotMatch(ui.part('queryResult').textContent,/wrong.example/);assert.equal(b.disabled,false);
+  assert.equal(ui.calls.length,2);
+ }
+ const ui=create(fixture(),()=>Promise.resolve({accepted:true,query_id:'../bad'}),false,true);
+ all(ui.root,n=>n.tag==='input'&&n.attrs['aria-label']==='待查询的域名或 IP')[0].value='example.com';all(ui.root,n=>n.tag==='button'&&n.textContent==='查询分流')[0].click();await flush();await flush();
+ assert.match(ui.part('queryResult').textContent,/未被接受/);assert.equal(ui.calls.length,1);
+});
+
+test('device query wait deadline reports failure without restarting the worker', async () => {
+ const timers=[];const ui=create(fixture(),a=>Promise.resolve(a[0]==='query-start'?{accepted:true,query_id:'123-456'}:{id:'123-456',state:'running'}),false,true,fn=>timers.push(fn));
+ all(ui.root,n=>n.tag==='input'&&n.attrs['aria-label']==='待查询的域名或 IP')[0].value='example.com';all(ui.root,n=>n.tag==='button'&&n.textContent==='查询分流')[0].click();await flush();
+ ui.advance(126000);timers.shift()();await flush();await flush();
+ assert.match(ui.part('queryResult').textContent,/等待超时/);assert.equal(ui.calls.filter(a=>a[0]==='query-start').length,1);
 });
 
 test('overflow P95 reports a lower bound instead of an invented percentile', () => {

@@ -83,6 +83,12 @@ monitor 也会检查超期事务。其他未部署的代理/应急功能仍禁�
 
 ## 有旧包保障的升级
 
+设备页面的域名查询通过 `query-start` / `query-status` 执行后台任务。
+多地址回答在较慢的设备上可能需要约一分钟；页面按任务标识轮询完整结果，
+不重复提交，也不将其他查询的结果显示在当前输入下。查询和检测共用任务锁。
+等待超过 120 秒或工作进程退出时显示失败；仍存活的任务保留锁，避免叠加负载。
+同步 `query` 命令保留给本地诊断。查询只推断新连接的路径，不证明网站实际访问成功。
+
 root 工具 `/usr/libexec/diversion-dns-upgrade` 接收
 `/root/diversion-upgrade/<transaction-id>` 和 `start` / `status` / `rollback`。
 目录及 `old`、`new` 子目录必须属于 root、权限 0700；其中放置已按精确 CI

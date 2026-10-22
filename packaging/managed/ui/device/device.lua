@@ -167,25 +167,41 @@ function M.main(args)
  local mode=args[1];if mode=='status'then return M.status()end
  if mode=='collect'then local router=routing();if router then pcall(router.recover)end;return {ok=dofile(B..'/window.lua').collect()}end
  if mode=='query'then assert(not args[4],'unexpected arguments');return M.query(args[2],args[3] or 'router')end
- if mode=='start'then
-  local action=args[2];local router=routing()
+ if mode=='query-status'then
+  local id=args[2];assert(type(id)=='string' and #id<64 and id:match('^%d+%-%d+$') and not args[3],'invalid query id')
+  local task=load(R..'/query.json');assert(task.id==id,'查询结果已被替换或不存在，请重新查询')
+  if task.state=='running' and (not busy() or os.time()-(task.started or 0)>120)then
+   return {id=id,state='failed',error=busy() and '查询超过 120 秒；后台任务结束前不会启动重复查询' or '查询工作进程已退出，未产生结果'}
+  end
+  return task
+ end
+ if mode=='start' or mode=='query-start'then
+  local action=mode=='query-start' and 'query' or args[2];local router=routing();local input,source,id
+  if action=='query' then
+   assert(mode=='query-start' and not args[4],'unexpected query arguments')
+   local why;input,why=Q.validate_input(args[2]);assert(input,why);source=args[3] or 'router'
+   assert(source=='router' or source=='lan','本设备仅支持本机和普通 LAN 新连接推断')
+   profile();id=tostring(os.time())..'-'..tostring(N.getpid())
+  end
   if router and action and (action:match('^switch%-')or action=='rollback')then assert(not args[3],'unexpected arguments');return router.start(action)end
-  assert((action=='check' or action=='diagnose') and not args[3],'本设备未部署该控制能力，操作已拒绝')
+  assert(action=='query' or ((action=='check' or action=='diagnose') and not args[3]),'本设备未部署该控制能力，操作已拒绝')
   F.mkdir(R,'700');local lock=R..'/lock'
   if F.stat(lock) and not busy()then os.remove(lock..'/pid');F.rmdir(lock)end
   assert(F.mkdir(lock,'700'),'已有检测或诊断任务正在运行')
   -- Reserve the lock with the live parent PID before fork; never clear a live task.
   local f=assert(io.open(lock..'/pid','w'));f:write(N.getpid());f:close()
+  if id then save(R..'/query.json',{id=id,state='running',started=os.time()})end
   local pid=N.fork();if not pid then os.remove(lock..'/pid');F.rmdir(lock);error('cannot start worker')end
   if pid==0 then
    N.setsid();local null=N.open('/dev/null','r+');if null then N.dup(null,N.stdout);N.dup(null,N.stderr);N.dup(null,N.stdin);null:close()end
    local f=assert(io.open(lock..'/pid','w'));f:write(N.getpid());f:close();local started=ms()
    save(R..'/last.json',{action=action,state='running',time=os.time()})
-   local ok,result=pcall(action=='check' and M.check or M.diagnose)
-   save(R..'/last.json',{action=action,state=ok and 'success' or 'failed',time=os.time(),duration_ms=ms()-started,message=ok and (action=='check' and (result.ok and '检测完成，全部项目通过' or '检测完成，有失败项；未更改网络') or '诊断已保存') or tostring(result):sub(1,300)})
+   local ok,result=pcall(function()if action=='query'then return M.query(input,source)elseif action=='check'then return M.check()else return M.diagnose()end end)
+   if id then save(R..'/query.json',{id=id,state=ok and 'complete' or 'failed',result=ok and result or nil,error=not ok and tostring(result):sub(1,300) or nil,finished=os.time()})end
+   save(R..'/last.json',{action=action,state=ok and 'success' or 'failed',time=os.time(),duration_ms=ms()-started,message=ok and (action=='query' and '查询完成' or action=='check' and (result.ok and '检测完成，全部项目通过' or '检测完成，有失败项；未更改网络') or '诊断已保存') or tostring(result):sub(1,300)})
    os.remove(lock..'/pid');F.rmdir(lock);os.exit(ok and 0 or 1)
   end
-  return {accepted=true}
+  return {accepted=true,query_id=id}
  end
  error('unsupported operation')
 end

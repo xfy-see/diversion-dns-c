@@ -4,7 +4,7 @@
 'require poll';
 'require ui';
 
-var PNW_VIEW_VERSION = '2026.10.19.1-compact';
+var PNW_VIEW_VERSION = '2026.10.22.1-query';
 
 return view.extend({
  statsOnly: false,
@@ -285,7 +285,7 @@ return view.extend({
    exportStats.disabled=!ok;
   }
   function renderQuery() {
-   if (querying) { replace(parts.queryResult, [message('正在解析并检查当前规则…')]); return; }
+   if (querying) { replace(parts.queryResult, [message(self.deviceMode ? '正在后台解析并逐地址检查规则；多地址回答可能需要约一分钟。页面会自动取得结果，请勿重复提交。' : '正在解析并检查当前规则…')]); return; }
    if (queryError) { replace(parts.queryResult, [message(queryError, 'bad')]); return; }
    if (!queryResult) { replace(parts.queryResult, [E('p', { 'class': 'pnw-muted' }, '输入域名或 IP，查看当前规则推断。查询会产生 DNS 请求；不会主动连接目标网站。')]); return; }
    var r = queryResult, c = object(r.classification), result = [];
@@ -337,7 +337,22 @@ return view.extend({
    var input = queryInput.value.trim();
    if (!input) { queryError = '请输入域名或 IP。'; renderQuery(); return; }
    querying = true; queryError = ''; renderQuery(); renderActions();
-   self.call(['query', input, querySource.value || 'router']).then(function(r) { queryResult = r; }).catch(function(e) { queryError = e.message; }).then(function() { querying = false; renderQuery(); renderActions(); });
+   var started = Date.now();
+   function result(id) {
+    return self.call(['query-status', id]).then(function(r) {
+     if (r.id !== id) throw new Error('查询结果标识不一致，请重新查询');
+     if (r.state === 'complete' && r.result && typeof r.result === 'object') return r.result;
+     if (r.state === 'failed') throw new Error(r.error || '后台查询失败');
+     if (r.state !== 'running') throw new Error('后台查询状态无效');
+     if (Date.now() - started >= 125000) throw new Error('查询等待超时；请检查任务状态，勿重复提交');
+     return new Promise(function(resolve) { setTimeout(resolve, 2000); }).then(function() { return result(id); });
+    });
+   }
+   var request = self.deviceMode ? self.call(['query-start', input, querySource.value || 'router']).then(function(r) {
+    if (!r.accepted || typeof r.query_id !== 'string' || !/^\d+-\d+$/.test(r.query_id)) throw new Error('后台查询未被接受');
+    return result(r.query_id);
+   }) : self.call(['query', input, querySource.value || 'router']);
+   request.then(function(r) { queryResult = r; }).catch(function(e) { queryError = e.message; }).then(function() { querying = false; renderQuery(); renderActions(); });
   }
   var queryButton = E('button', { 'type': 'button', 'class': 'cbi-button cbi-button-action', 'click': query }, '查询分流');
   queryInput.addEventListener('keydown', function(e) { if (e.key === 'Enter') { e.preventDefault(); query(); } });
