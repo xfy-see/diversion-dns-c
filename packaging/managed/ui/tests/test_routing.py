@@ -36,6 +36,15 @@ class Routing(unittest.TestCase):
   self.h.files[D+'/routing.json']='{"enabled":false}'
   with self.assertRaises(Exception):self.api.start('switch-nobrand')
   self.assertFalse(self.calls)
+ def test_upgrade_lock_blocks_route_preparation_without_mutation(self):
+  self.h.lua.execute("require('nixio').open=function(p,m,perm)assert(p=='/var/lock/diversion-upgrade.lock');return {lock=function()return false end,close=function()end}end")
+  with self.assertRaisesRegex(Exception,'upgrade in progress'):self.api.start('switch-nobrand')
+  self.assertNotIn(D+'/transaction.json',self.h.files);self.assertFalse(self.calls)
+ def test_upgrade_marker_is_rechecked_after_lock_acquisition(self):
+  self.h.lua.globals().MARK=lambda:self.h.files.__setitem__('/root/diversion-upgrade/active.json','{}')
+  self.h.lua.execute("require('nixio').open=function()return {lock=function()MARK();return true end,close=function()end}end")
+  with self.assertRaisesRegex(Exception,'upgrade in progress'):self.api.start('switch-nobrand')
+  self.assertNotIn(D+'/transaction.json',self.h.files);self.assertFalse(self.calls)
  def test_private_config_requires_all_expected_addresses(self):
   del self.c['exits']['aws']['ipv6'];self.h.files[D+'/routing.json']=json.dumps(self.c)
   with self.assertRaises(Exception):self.t.config()

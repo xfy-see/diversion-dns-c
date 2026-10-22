@@ -15,6 +15,8 @@ class ManagedPackage(unittest.TestCase):
    self.assertEqual(core['etc/config/diversion-dns']['mode'],0o600)
    self.assertFalse(set(core)&set(ui))
    self.assertNotIn('usr/share/diversion-dns-ui/control.lua',ui)
+   for name in ['upgrade-arm','upgrade-recovery.init','upgrade-recovery.loop','upgrade-recovery.dispatch']:
+    self.assertEqual(ui['usr/libexec/diversion-dns-'+name]['mode'],0o755)
    self.assertNotIn('etc/config/network',core|ui);self.assertNotIn('etc/config/dhcp',core|ui)
    self.assertIn("option enabled '0'",(roots[M.CORE]/'etc/config/diversion-dns').read_text())
    self.assertIn("option enabled '0'",(roots[M.UI]/'etc/config/diversion-dns-ui').read_text())

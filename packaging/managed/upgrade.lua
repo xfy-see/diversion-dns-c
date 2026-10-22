@@ -3,8 +3,8 @@
 -- Invoke: diversion-dns-upgrade /root/diversion-upgrade/<id> start|status|rollback
 local J=require('luci.jsonc');local F=require('nixio.fs');local N=require('nixio')
 assert(N.getuid()==0,'root required')
-local root=assert(arg[1]);assert(root:match('^/root/diversion%-upgrade/[%w_%-]+$'),'invalid transaction directory')
-local mode=arg[2];assert(not arg[3]and(mode=='start'or mode=='status'or mode=='rollback'or mode=='recover'),'invalid operation')
+local root=assert(arg[1]);assert(root:match('^/root/diversion%-upgrade/[%w_%-]+$'),'invalid transaction directory');assert(root~='/root/diversion-upgrade/recovery','reserved transaction directory')
+local mode=arg[2];assert(not arg[3]and(mode=='start'or mode=='status'or mode=='rollback'or mode=='recover'or mode=='recover-worker'),'invalid operation')
 local function q(s)return "'"..tostring(s):gsub("'","'\\''").."'"end
 local function read(p)local f=io.open(p);if not f then return nil end;local s=f:read(2097153);f:close();assert(#s<=2097152,'file too large');return s end
 local function load(p)return J.parse(assert(read(p),'missing '..p))end
@@ -103,8 +103,8 @@ local function check_protected(s)for _,p in ipairs(protected)do assert(hash(p)==
 local function health(s)
  for _,name in ipairs(services)do local _,rc=run('/etc/init.d/'..name..' running');assert((rc==0)==s.running[name],'service running state mismatch')end
  if s.running['diversion-dns']then
-  local p=load('/etc/diversion-dns-ui/profile.json');local Q=dofile('/usr/share/diversion-dns-ui/query.lua')
-  for _,typ in ipairs({1,28})do local r=Q.dns_query('www.baidu.com',typ,p.dns_host,p.dns_port);assert(r.ok and #(r.answers or{})>0,'DNS health failed')end
+  local p=load('/etc/diversion-dns-ui/profile.json')
+  assert(dofile(root..'/upgrade-health.lua').check(p),'local DNS listener health failed')
  end
  local ui=J.parse(must('/usr/libexec/diversion-dns-ui-status'));assert(ui and ui.selected,'UI status failed');check_protected(s)
 end
@@ -117,6 +117,45 @@ local function worker_failed(s)
  if not text or starttime(s.pid)~=s.start then return true end
  local status=text:match('^%d+ %b() (%S+)')
  return status=='T'or status=='t'or status=='Z'or status=='X'
+end
+-- One kernel-owned lock covers preparation, state transitions, commit and
+-- the entire rollback. Never unlink it: unlinking permits two lock inodes.
+-- lockf locks are released by the kernel on process exit, including SIGKILL.
+local active='/root/diversion-upgrade/active.json'
+local function with_lock(fn)
+ local f=assert(N.open('/var/lock/diversion-upgrade.lock','w','600'),'cannot open upgrade lock')
+ if not f:lock('tlock')then f:close();return nil,'busy'end
+ local ok,a,b=pcall(fn);f:close();if not ok then error(a)end;return a,b
+end
+-- A healthy worker waits out a monitor's brief read/decision critical section.
+-- Recovery observers remain nonblocking; they must never kill a lock holder.
+local function with_worker_lock(fn)
+ for _=1,200 do
+  local value,why=with_lock(fn);if why~='busy'then return value,why end
+  N.nanosleep(0,50000000)
+ end
+ error('upgrade state lock remained busy')
+end
+local function terminal(s)return s.state=='committed'or s.state=='rolled_back'or s.state=='rollback_failed'end
+local function owns(s)return s.boot==boot()and s.pid==N.getpid()and s.start==starttime(N.getpid())end
+-- Call only while holding the global lock, so a later transaction cannot
+-- publish active.json between this read and remove.
+local function unlock(s)
+ local a=read(active)and load(active)
+ if a and a.root==root and(s.state=='committed'or s.state=='rolled_back')then os.remove(active)end
+end
+local function set_phase(phase)
+ return with_worker_lock(function()
+  local s=load(statefile);assert(s.state=='installing'and owns(s),'worker no longer owns upgrade')
+  s.phase=phase;save(statefile,s);return s
+ end)
+end
+local function commit()
+ return with_worker_lock(function()
+  local s=load(statefile);assert(s.state=='installing'and owns(s),'worker no longer owns upgrade')
+  assert(now()<s.deadline,'deadline expired')
+  s.state='committed';s.finished=os.time();save(statefile,s);unlock(s);return true
+ end)
 end
 local function check_configs(s)
  for p,digest in pairs(s.configs)do assert(hash(p)==digest,'configuration changed during upgrade')end
@@ -137,55 +176,61 @@ local function activate(s)
   assert(cfg:match('^/etc/[%w_%-]+/config%.conf$'),'unsupported live config path')
   must('/usr/libexec/diversion-dns-c check -c '..q(cfg))
  end
- s.phase='activating';save(statefile,s)
+ assert(set_phase('activating'),'recovery in progress')
  for _,name in ipairs(services)do must('/etc/init.d/'..name..(s.running[name]and' restart'or' stop'))end
  must('rm -f /tmp/luci-indexcache.*');must('/etc/init.d/rpcd reload')
 end
-local function recover(s)
- local lock=root..'/recovery-lock';local st=F.stat(lock)
- if st then
-  local owner=read(lock..'/owner.json')and load(lock..'/owner.json')
-  if owner then assert(owner.boot~=boot()or starttime(owner.pid)~=owner.start,'recovery already running')
-  else assert(st.mtime and os.time()-st.mtime>5,'recovery lock is being reserved')end
-  os.remove(lock..'/owner.json');assert(F.rmdir(lock),'cannot release stale recovery lock')
- end
- assert(F.mkdir(lock,'700'),'recovery already running')
- save(lock..'/owner.json',{pid=N.getpid(),start=starttime(N.getpid()),boot=boot()})
- s.state='rolling_back';save(statefile,s)
- local ok,err=pcall(function()
-  hook_locks_clear();local args=simulate('old',true)
-  -- Old post-upgrade hooks must see the saved valid configuration, not a
-  -- failed candidate's configuration that could make the repair hook fail too.
-  must('tar -xzpf '..q(root..'/configs.tar.gz')..' -C /')
-  must('apk add --force-reinstall --wait 10 --allow-untrusted --no-network '..args)
-  -- Only application configs are restored; network and DHCP are never overwritten.
-  must('tar -xzpf '..q(root..'/configs.tar.gz')..' -C /')
-  for _,name in ipairs(services)do must('/etc/init.d/'..name..(s.running[name]and' restart'or' stop'))end
-  installed('old');for p,digest in pairs(s.configs)do assert(hash(p)==digest,'restored config mismatch')end;health(s)
+local function recover(reason,failure)
+ local result,why=with_lock(function()
+  -- All callers, including the guardian, reread AFTER acquiring the lock.
+  -- No process may be signalled based on an earlier snapshot.
+  local s=load(statefile)
+  if reason~='manual'and terminal(s)then unlock(s);return true,'terminal'end
+  if reason=='manual'and s.state=='rolled_back'then unlock(s);return true,'terminal'end
+  local a=read(active)and load(active);assert(not a or a.root==root,'another upgrade/recovery is pending')
+  if reason=='manual'then assert(s.state=='committed'or s.state=='rollback_failed','active transaction')
+  elseif reason=='auto'then
+   if s.state~='rolling_back'and s.boot==boot()and now()<s.deadline and not worker_failed(s)then return true,'waiting'end
+  elseif reason=='failure'then assert(s.state=='installing'and owns(s),'failure from stale worker')
+  else error('invalid recovery reason')end
+  local previous=s.state
+  -- Publish recovery ownership before considering the previous installer.
+  -- Holding the lock through APK means other recovery requests only wait.
+  s.state='rolling_back';s.recovery={pid=N.getpid(),start=starttime(N.getpid()),boot=boot()}
+  s.failure=failure or s.failure;save(statefile,s);save(active,{root=root})
+  if previous~='rolling_back'and s.boot==boot()and s.pid and s.pid~=N.getpid()and s.start==starttime(s.pid)then N.kill(-s.pid,9);N.nanosleep(1)end
+  local ok,err=pcall(function()
+   hook_locks_clear();local args=simulate('old',true)
+   -- Restore valid application config before invoking old installation hooks.
+   must('tar -xzpf '..q(root..'/configs.tar.gz')..' -C /')
+   must('apk add --force-reinstall --wait 10 --allow-untrusted --no-network '..args)
+   must('tar -xzpf '..q(root..'/configs.tar.gz')..' -C /')
+   for _,name in ipairs(services)do must('/etc/init.d/'..name..(s.running[name]and' restart'or' stop'))end
+   installed('old');for p,digest in pairs(s.configs)do assert(hash(p)==digest,'restored config mismatch')end;health(s)
+  end)
+  s.state=ok and'rolled_back'or'rollback_failed';s.error=not ok and tostring(err)or nil;s.finished=os.time();save(statefile,s);unlock(s);return ok
  end)
- s.state=ok and'rolled_back'or'rollback_failed';s.error=not ok and tostring(err)or nil;s.finished=os.time();save(statefile,s);os.remove(lock..'/owner.json');F.rmdir(lock);return ok
+ if why=='busy'then return true,'busy'end
+ return result,why
 end
 local function detach(fn)local pid=assert(N.fork());if pid~=0 then return pid end;N.setsid();local f=assert(N.open('/dev/null','r+'));N.dup(f,N.stdin);N.dup(f,N.stdout);N.dup(f,N.stderr);f:close();local ok,err=pcall(fn);if not ok then save(root..'/worker-error.json',{error=tostring(err)})end;os.exit(ok and 0 or 1)end
 
 if mode=='status'then print(J.stringify(load(statefile)));os.exit(0)end
-local active='/root/diversion-upgrade/active.json'
-local function unlock()local a=read(active)and load(active);if a and a.root==root then local st=load(statefile);if st.state=='committed'or st.state=='rolled_back'then os.remove(active)end end end
 if mode=='recover'then
- local s=load(statefile);if s.state=='committed'or s.state=='rolled_back'or s.state=='rollback_failed'then unlock();os.exit(0)end
- if s.boot==boot()and now()<s.deadline and not worker_failed(s)then os.exit(0)end
- if s.boot==boot()and s.pid and s.start==starttime(s.pid)then N.kill(-s.pid,9);N.nanosleep(1)end
- assert(recover(s),'rollback failed');unlock();os.exit(0)
+ -- A UI monitor must not own a rollback which stops/restarts that UI service.
+ if read(active)then must('/root/diversion-upgrade/recovery/diversion-dns-upgrade-recovery start')end
+ os.exit(0)
 end
-if mode=='rollback'then local a=read(active)and load(active);assert(not a or a.root==root,'another upgrade/recovery is pending');local s=load(statefile);assert(s.state~='installing'and s.state~='prepared','active transaction');assert(recover(s),'rollback failed');unlock();print(J.stringify(load(statefile)));os.exit(0)end
+if mode=='recover-worker'then assert(recover('auto'),'rollback failed');os.exit(0)end
+if mode=='rollback'then assert(recover('manual'),'rollback failed');print(J.stringify(load(statefile)));os.exit(0)end
+-- Preparation must succeed in full before any package/service mutation.
+local s,args=with_lock(function()
 assert(not F.stat(statefile),'transaction already exists')
 assert(not F.stat(active),'another upgrade or recovery is pending')
 local route=read('/etc/diversion-dns-ui/transaction.json')and load('/etc/diversion-dns-ui/transaction.json')
 assert(not route or route.state=='committed'or route.state=='rolled_back','routing transaction pending')
--- Preparation must succeed in full before any package/service mutation.
-assert(F.mkdir('/var/lock/diversion-upgrade','700'),'another upgrade is preparing; inspect preparation lock before retry')
-local prepared,s,args=pcall(function()
 installed('old');local args=simulate('new');packages('old')
-local s={state='prepared',running={},protected={},configs={},boot=boot(),deadline=now()+120,started=os.time()}
+local s={state='prepared',running={},protected={},configs={},boot=boot(),deadline=now()+300,started=os.time()}
 for _,p in ipairs(protected)do s.protected[p]=hash(p)end
 for _,name in ipairs(services)do local _,rc=run('/etc/init.d/'..name..' running');s.running[name]=rc==0 end
 local paths={'etc/config/diversion-dns','etc/config/diversion-dns-ui','etc/diversion-dns','etc/diversion-dns-ui'}
@@ -196,29 +241,37 @@ must('tar -czpf '..q(root..'/configs.tar.gz')..' -C / '..table.concat(list,' '))
 local hashes=must('find '..table.concat(list,' '):gsub("'etc/","'/etc/")..' -type f -exec sha256sum {} \\;')
 s.runtime_files=runtime_files(cfg)
 for digest,path in hashes:gmatch('([a-f0-9]+)%s+([^\n]+)')do if not s.runtime_files[path]then s.configs[path]=digest end end
-assert(type(arg[0])=='string'and arg[0]:sub(1,1)=='/','invoke guard by absolute path');must('cp '..q(arg[0])..' '..q(root..'/guard.lua'));save(statefile,s);save(active,{root=root})
+assert(type(arg[0])=='string'and arg[0]:sub(1,1)=='/','invoke guard by absolute path')
+local siblings=assert(arg[0]:match('^(.+)/[^/]+$'))
+must('cp '..q(arg[0])..' '..q(root..'/guard.lua'))
+must('cp '..q(siblings..'/diversion-dns-upgrade-health.lua')..' '..q(root..'/upgrade-health.lua'))
+must(q(siblings..'/diversion-dns-upgrade-arm')..' prepare')
+s.deadline=now()+300;save(statefile,s);save(active,{root=root})
+must(q(siblings..'/diversion-dns-upgrade-arm')..' start')
 return s,args
 end)
-F.rmdir('/var/lock/diversion-upgrade');assert(prepared,s)
+assert(s,'another upgrade operation is running')
 local guardian=detach(function()
  local f=assert(io.open(root..'/ready','w'));f:write(N.getpid());f:close()
- while now()<s.deadline do
-  N.nanosleep(1);local t=load(statefile);if t.state=='committed'or t.state=='rolled_back'or t.state=='rollback_failed'then return end
-  if worker_failed(t)then break end
+ while true do
+  local t=load(statefile);if terminal(t)then return end
+  recover('auto') -- deadline and owner checks are inside the shared lock
+  N.nanosleep(1)
  end
- local t=load(statefile);if t.pid and t.start==starttime(t.pid)then N.kill(-t.pid,9);N.nanosleep(1)end
- recover(t);unlock()
 end)
 local ready=false;for _=1,50 do if tonumber(read(root..'/ready')or'')==guardian and F.stat('/proc/'..guardian)then ready=true;break end;N.nanosleep(0,20000000)end
 assert(ready,'guardian startup failed: no packages changed')
 local pid=detach(function()
- s.pid=N.getpid();s.start=starttime(s.pid);s.state='installing';save(statefile,s)
+ s=assert(with_worker_lock(function()
+  local t=load(statefile);assert(t.state=='prepared','transaction no longer prepared')
+  t.pid=N.getpid();t.start=starttime(t.pid);t.state='installing';save(statefile,t);return t
+ end),'recovery in progress')
  local ok,err=pcall(function()
   install_new(args)
   installed('new');activate(s)
-  for _=1,10 do local good=pcall(health,s);if good then assert(now()<s.deadline,'deadline expired');s.state='committed';s.finished=os.time();save(statefile,s);unlock();return end;N.nanosleep(1)end
+  for _=1,10 do local good=pcall(health,s);if good then assert(commit(),'recovery in progress');return end;N.nanosleep(1)end
   error('post-upgrade health failed')
  end)
- if not ok then s.failure=tostring(err);recover(s);unlock()end
+ if not ok then recover('failure',tostring(err))end
 end)
 print(J.stringify({accepted=true,pid=pid,guardian=guardian,transaction=root}))

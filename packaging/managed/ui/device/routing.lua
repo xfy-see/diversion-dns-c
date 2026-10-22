@@ -123,10 +123,14 @@ function M.status()
  local t=load(T);return {enabled=true,runtime=r,scope=c.namespace and'隔离测试命名空间；不代表 LAN 出口'or'本机已配置的策略路径',pending=pending(t)or false,transaction=t and{state=t.state,message=t.message,finished=t.finished,target=t.target}or nil,public_exit=t and t.public_exit,previous_exit=(load(S)or{}).previous}
 end
 function M.start(action)
- assert(not F.stat('/root/diversion-upgrade/active.json')and not F.stat('/var/lock/diversion-upgrade'),'upgrade in progress')
+ assert(not F.stat('/root/diversion-upgrade/active.json'),'upgrade in progress')
  local c=assert(config(),'routing control disabled');assert(not pending(load(T)),'pending transaction requires recovery')
  local id=action=='rollback'and(load(S)or{}).previous or action:match('^switch%-(%w+)$');assert(c.exits[id],'exit not deployed')
- mutex();local ok,t=pcall(function()
+ local gate=assert(N.open('/var/lock/diversion-upgrade.lock','w','600'),'cannot open upgrade lock')
+ if not gate:lock('tlock')then gate:close();error('upgrade in progress')end
+ local reserved,reserve_error=pcall(function()assert(not F.stat('/root/diversion-upgrade/active.json'),'upgrade in progress');mutex()end)
+ if not reserved then gate:close();error(reserve_error)end
+ local ok,t=pcall(function()
   assert(not pending(load(T)),'pending transaction requires recovery')
   local before=peers(c);local r=runtime(c);assert(r.selected~='unknown'and r.selected~='mixed','ambiguous runtime selection')
   local after=target(c,before,id)
@@ -134,7 +138,7 @@ function M.start(action)
   -- Reject any default owned by an unmanaged peer before changing anything.
   for k,a in pairs(before)do if k~=c.exits.aws.peer and k~=c.exits.nobrand.peer then for _,ip in ipairs(a)do assert(ip~='0.0.0.0/0'and ip~='::/0','unmanaged default peer')end end end
   save(T,t);return t
- end);release();if not ok then error(t)end
+ end);release();gate:close();if not ok then error(t)end
  local ready=R..'/guardian-ready';os.remove(ready)
  local guardian=detached(function()
   local f=assert(io.open(ready,'w'));f:write(N.getpid());f:close()

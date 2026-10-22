@@ -47,6 +47,9 @@ def stage(source,binary,destination,commit):
     for name in ['control','status']:put(roots[UI],'usr/libexec/diversion-dns-ui-'+name,(ui/'device'/name).read_bytes(),0o755)
     put(roots[UI],'usr/libexec/diversion-dns-upgrade-recover',(base/'upgrade-recover').read_bytes(),0o755)
     put(roots[UI],'usr/libexec/diversion-dns-upgrade',(base/'upgrade.lua').read_bytes(),0o755)
+    put(roots[UI],'usr/libexec/diversion-dns-upgrade-health.lua',(base/'upgrade-health.lua').read_bytes(),0o644)
+    for local in ['upgrade-arm','upgrade-recovery.init','upgrade-recovery.loop','upgrade-recovery.dispatch']:
+        put(roots[UI],'usr/libexec/diversion-dns-'+local,(base/local).read_bytes(),0o755)
     put(roots[UI],'usr/share/diversion-dns-ui/monitor',(ui/'device/monitor').read_bytes(),0o755)
     for local,remote,mode in [('ui.init','etc/init.d/diversion-dns-ui',0o755),('ui.uci','etc/config/diversion-dns-ui',0o600),('profile.json','etc/diversion-dns-ui/profile.json',0o600),('routing.json','etc/diversion-dns-ui/routing.json',0o600)]:put(roots[UI],remote,(base/local).read_bytes(),mode)
     view=(ui/'view.js').read_text();assert view.count(' deviceMode: false,')==1
