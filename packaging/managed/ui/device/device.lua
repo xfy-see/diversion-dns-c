@@ -68,7 +68,8 @@ function M.status()
  if rs and rs.enabled then
   current.routing=rs;current.configured_selected=rs.runtime.configured_selected;current.selected=rs.runtime.selected;current.exit_names.aws='AWS';current.exit_names.nobrand='NoBrand';current.topology_verified=rs.runtime.ok;current.pending=rs.pending;current.running=current.running or rs.pending;current.previous_exit=rs.previous_exit or J.null
   current.mode_text=rs.scope;current.control_note='仅操作显式配置的两个 WireGuard 默认 peer；验证失败自动回退。'
-  if rs.public_exit then current.public_exit=rs.public_exit end
+  -- luci.jsonc serializes repeated table references as null; own the probe once.
+  if rs.public_exit then current.public_exit=rs.public_exit;rs.public_exit=nil end
   if rs.transaction then current.last={action='switch-'..(rs.transaction.target or ''),state=rs.transaction.state,message=rs.transaction.message,time=rs.transaction.finished}end
   if not rs.runtime.ok then current.health={ok=false,selected=current.selected,finished=os.time(),checks={runtime_selection=false},details={runtime_selection={ok=false,error='配置选择与运行 peer / 路由不一致'}}}end
  elseif rs and rs.error then current.control_note='路由控制配置无效：'..rs.error end

@@ -34,6 +34,13 @@ class Device(unittest.TestCase):
  def test_status_has_real_mode_and_disabled_actions(self):
   r=self.h.to_py(self.api.status());self.assertIn('需要重新核对',r['mode_text']);self.assertFalse(r['actions']['recover']['allowed']);self.assertTrue(r['actions']['check']['allowed'])
   self.assertFalse(r['dns_upstreams']['cn']['available']);self.assertFalse(r['topology_verified']);self.assertNotIn('pnw_aws',str(self.calls))
+ def test_routing_public_probe_has_no_shared_json_table(self):
+  h=self.h;h.files['/etc/diversion-dns-ui/routing.json']='{"enabled":true}'
+  h.lua.execute("local previous=dofile;dofile=function(p)if p:match('routing.lua$')then return {status=function()return {enabled=true,runtime={ok=true,selected='aws',configured_selected='aws'},scope='isolated',pending=false,public_exit={ok=true,ipv4={identity_status='verified'},ipv6={identity_status='verified'}}}end}else return previous(p)end end")
+  result=self.api.status();r=h.to_py(result);self.assertTrue(r['public_exit']['ok']);self.assertNotIn('public_exit',r['routing'])
+  # lua-cjson/jsonc detects aliasing even when Python's serializer does not.
+  h.lua.globals().DEVICE_RESULT=result
+  h.lua.execute("local seen={};local function unique(t)if type(t)~='table'then return end;assert(not seen[t],'shared JSON table');seen[t]=true;for _,v in pairs(t)do unique(v)end end;unique(DEVICE_RESULT)")
  def test_131_does_not_claim_tunnel(self):
   self.h.files['/etc/diversion-dns-ui/profile.json']=(S/'profile-listener.example.json').read_text();r=self.h.to_py(self.api.status());self.assertIn('未部署隧道',r['mode_text']);self.assertEqual(r['selected'],'upstream')
  def test_input_injection_and_unknown_source(self):
