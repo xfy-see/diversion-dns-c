@@ -122,6 +122,12 @@ local function check_configs(s)
  for p,digest in pairs(s.configs)do assert(hash(p)==digest,'configuration changed during upgrade')end
  check_protected(s)
 end
+local function install_new(args)
+ -- APK sanitizes script environments unless explicitly requested. Pass only
+ -- PATH and our marker, never the caller's credentials or unrelated variables.
+ local path=os.getenv('PATH')or'/usr/sbin:/usr/bin:/sbin:/bin'
+ must('env -i PATH='..q(path)..' DIVERSION_DNS_GUARDED_UPGRADE=1 apk add --preserve-env --wait 10 --allow-untrusted --no-network '..args)
+end
 local function activate(s)
  check_configs(s)
  -- Hash equality protects the saved configuration; check it with the new
@@ -208,7 +214,7 @@ assert(ready,'guardian startup failed: no packages changed')
 local pid=detach(function()
  s.pid=N.getpid();s.start=starttime(s.pid);s.state='installing';save(statefile,s)
  local ok,err=pcall(function()
-  must('DIVERSION_DNS_GUARDED_UPGRADE=1 apk add --wait 10 --allow-untrusted --no-network '..args)
+  install_new(args)
   installed('new');activate(s)
   for _=1,10 do local good=pcall(health,s);if good then assert(now()<s.deadline,'deadline expired');s.state='committed';s.finished=os.time();save(statefile,s);unlock();return end;N.nanosleep(1)end
   error('post-upgrade health failed')

@@ -14,10 +14,13 @@ class Upgrade(unittest.TestCase):
   h.files['/etc/diversion-dns-ui/profile.json']=json.dumps({'dns_host':'127.0.0.1','dns_port':15353})
   h.lua.globals().UP_RUN=self.command;h.lua.globals().arg=h.to_lua({0:'/usr/libexec/diversion-dns-upgrade',1:ROOT,2:'start'})
   h.lua.execute("require('nixio').getuid=function()return 0 end;local f=require('nixio.fs');f.chmod=function(p,m)assert(m=='600');return true end;f.lstat=function(p)return {type=p:match('%.apk$') and 'reg' or 'dir',uid=0,modestr='rwx------'}end;dofile=function()return {dns_query=function()return {ok=true,answers={{address='192.0.2.1'}}}end}end")
-  s=SOURCE;start=s.index('local function run(cmd)');end=s.index('local function must(',start);s=s[:start]+'local function run(cmd)return UP_RUN(cmd)end\n'+s[end:];s=s[:s.index("if mode=='status'")]+"return {packages=packages,simulate=simulate,installed=installed,health=health,recover=recover,runtime_files=runtime_files,worker_failed=worker_failed,activate=activate}"
+  s=SOURCE;start=s.index('local function run(cmd)');end=s.index('local function must(',start);s=s[:start]+'local function run(cmd)return UP_RUN(cmd)end\n'+s[end:];s=s[:s.index("if mode=='status'")]+"return {packages=packages,simulate=simulate,installed=installed,health=health,recover=recover,runtime_files=runtime_files,worker_failed=worker_failed,activate=activate,install_new=install_new}"
   self.api=h.lua.execute(s)
  def command(self,cmd):
   self.calls.append(cmd);a=shlex.split(cmd)
+  if a[:2]==['env','-i']:
+   assert a[2].startswith('PATH=') and a[3]=='DIVERSION_DNS_GUARDED_UPGRADE=1'
+   a=a[4:];assert '--preserve-env'in a
   if a[0]=='sha256sum':return ('e'if self.bad_hash else'd')*64+'  '+a[1],0
   if a[:2]==['apk','adbdump']:
    side='old'if '/old/'in a[-1]else'new';name=Path(a[-1]).name[:-4];return json.dumps({'info':{'name':name,'version':self.plan[side]['version'],'repo-commit':self.plan[side]['source_commit']}}),0
@@ -35,6 +38,12 @@ class Upgrade(unittest.TestCase):
   if a[0]=='/usr/libexec/diversion-dns-c':return '',1 if self.bad_health else 0
   raise AssertionError(cmd)
  def state(self):return self.h.to_lua({'running':{'diversion-dns':True,'diversion-dns-ui':True},'protected':{p:'d'*64 for p in ['/etc/config/network','/etc/config/firewall','/etc/config/dhcp']},'configs':{'/etc/config/diversion-dns':'d'*64}})
+ def test_apk_hooks_get_only_explicitly_whitelisted_environment(self):
+  self.h.env['PATH']='/usr/sbin:/usr/bin:/sbin:/bin'
+  self.h.env['UNRELATED_SECRET']='never-forward'
+  self.api.install_new("'/tmp/old.apk' '/tmp/ui.apk'")
+  a=shlex.split(self.calls[-1]);self.assertEqual(a[:4],['env','-i','PATH=/usr/sbin:/usr/bin:/sbin:/bin','DIVERSION_DNS_GUARDED_UPGRADE=1'])
+  self.assertIn('--preserve-env',a);self.assertNotIn('never-forward',self.calls[-1])
  def test_dead_or_stopped_worker_detected_without_deadline_wait(self):
   s=self.h.to_lua({'pid':999,'start':'12345'})
   self.assertTrue(self.api.worker_failed(s))
