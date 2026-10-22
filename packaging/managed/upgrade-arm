@@ -8,20 +8,24 @@ saved=$base/recovery
 entry=/etc/rc.d/S93diversion-dns-upgrade-recovery
 init=$saved/diversion-dns-upgrade-recovery
 case "$1" in prepare|start) ;; *) exit 1;; esac
-secure_dir() {
- [ -d "$1" ] && [ ! -L "$1" ] && [ "$(stat -c '%u:%a' "$1")" = 0:700 ]
+path_metadata() {
+ # BusyBox stat is optional on OpenWrt; nixio is already required by the guard.
+ # lstat checks the path itself, so symbolic links never satisfy dir/reg.
+ /usr/bin/lua - "$1" <<'LUA'
+local s=require('nixio.fs').lstat(arg[1])
+if not s then os.exit(1) end
+io.write(string.format('%d:%s:%s',s.uid,s.type,s.modestr))
+LUA
 }
-regular_root() {
- [ -f "$1" ] && [ ! -L "$1" ] && [ "$(stat -c '%u' "$1")" = 0 ]
-}
+secure_dir() { [ "$(path_metadata "$1")" = 0:dir:rwx------ ]; }
+regular_root() { case "$(path_metadata "$1")" in 0:reg:*) return 0;; *) return 1;; esac; }
 secure_dir "$base" || { echo 'unsafe upgrade root' >&2; exit 1; }
 verify_saved() {
  secure_dir "$saved" && regular_root "$saved/SHA256SUMS" || return 1
  # Never feed an arbitrary manifest path to sha256sum; require exactly our files.
  [ "$(wc -l < "$saved/SHA256SUMS")" -eq 3 ] || return 1
  for name in diversion-dns-upgrade-recovery loop dispatch; do
-  regular_root "$saved/$name" || return 1
-  [ "$(stat -c '%a' "$saved/$name")" = 700 ] || return 1
+  [ "$(path_metadata "$saved/$name")" = 0:reg:rwx------ ] || return 1
   digest=$(sha256sum "$saved/$name"); digest=${digest%% *}
   [ "$(grep -Fxc "$digest  $name" "$saved/SHA256SUMS")" = 1 ] || return 1
  done
