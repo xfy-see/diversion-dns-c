@@ -7,7 +7,7 @@ SOURCE=(Path(__file__).parents[2]/'upgrade.lua').read_text().split('\n',1)[1]
 ROOT='/root/diversion-upgrade/unit'
 class Upgrade(unittest.TestCase):
  def setUp(self):
-  h=self.h=Harness();self.calls=[];self.bad_hash=False;self.bad_plan=False;self.bad_health=False
+  h=self.h=Harness();self.calls=[];self.bad_hash=False;self.bad_plan=False;self.bad_health=False;self.broken={};self.sim_rc=0;self.sim_text=None
   self.plan={side:{'version':side+'-r1','source_commit':ch*40,'packages':{name:{'filename':name+'.apk','sha256':'d'*64,'files':{'usr/libexec/diversion-dns-c':{'sha256':'d'*64}}}for name in ['diversion-dns-c','luci-app-diversion-dns']}}for side,ch in [('old','a'),('new','b')]}
   h.files[ROOT+'/plan.json']=json.dumps(self.plan)
   for name in ['diversion-dns-c','luci-app-diversion-dns']:h.files['/usr/share/'+name+'/source.json']=json.dumps({'source_commit':'a'*40})
@@ -21,9 +21,11 @@ class Upgrade(unittest.TestCase):
   if a[0]=='sha256sum':return ('e'if self.bad_hash else'd')*64+'  '+a[1],0
   if a[:2]==['apk','adbdump']:
    side='old'if '/old/'in a[-1]else'new';name=Path(a[-1]).name[:-4];return json.dumps({'info':{'name':name,'version':self.plan[side]['version'],'repo-commit':self.plan[side]['source_commit']}}),0
+  if a[:2]==['apk','query']:return json.dumps([{'name':name,'status':['installed',*flags]}for name,flags in self.broken.items()]),0
   if a[:2]==['apk','list']:return a[-1]+'-old-r1 arch [installed]',0
   if a[:2]==['apk','add']:
-   if '--simulate'in a:return ('(1/1) Upgrading libc (1 -> 2)'if self.bad_plan else'(1/2) Upgrading diversion-dns-c (old -> new)'),0
+   if '--simulate'in a:return (self.sim_text or ('(1/1) Upgrading libc (1 -> 2)'if self.bad_plan else'(1/2) Upgrading diversion-dns-c (old -> new)')),self.sim_rc
+   self.broken={}
    return 'OK',0
   if a[0].startswith('/etc/init.d/'):
    return '',1 if self.bad_health else 0
@@ -63,9 +65,26 @@ class Upgrade(unittest.TestCase):
   self.bad_hash=True
   with self.assertRaises(Exception):self.api.health(self.state())
  def test_rollback_reinstalls_old_pair_and_checks_config(self):
-  s=self.state();self.assertTrue(self.api.recover(s));self.assertEqual(s.state,'rolled_back');self.assertTrue(any('apk add --wait 10'in x and'/old/'in x for x in self.calls));self.assertFalse(any('/etc/config/network'in x and not x.startswith('sha256sum')for x in self.calls))
+  s=self.state();self.assertTrue(self.api.recover(s));self.assertEqual(s.state,'rolled_back');self.assertTrue(any('apk add --force-reinstall --wait 10'in x and'/old/'in x for x in self.calls));self.assertFalse(any('/etc/config/network'in x and not x.startswith('sha256sum')for x in self.calls))
  def test_failed_rollback_remains_visible(self):
   self.bad_health=True;s=self.state();self.assertFalse(self.api.recover(s));self.assertEqual(s.state,'rollback_failed')
+ def test_recovery_reinstalls_even_when_old_version_is_still_registered(self):
+  self.assertTrue(self.api.recover(self.state()));self.assertTrue(any('apk add --force-reinstall --wait 10'in x for x in self.calls))
+ def test_owned_broken_script_repair_plan_is_allowed(self):
+  self.broken={'diversion-dns-c':['broken-scripts']};self.sim_rc=1;self.sim_text='(1/2) Reinstalling diversion-dns-c (old)\n(2/2) Reinstalling luci-app-diversion-dns (old)\n1 error; 1 MiB in 2 packages'
+  self.assertTrue(self.api.recover(self.state()))
+ def test_unrelated_broken_package_is_never_bypassed(self):
+  self.broken={'libc':['broken-scripts']};self.sim_rc=1;self.sim_text='(1/1) Reinstalling diversion-dns-c (old)\n1 error; 1 MiB in 2 packages'
+  self.assertFalse(self.api.recover(self.state()));self.assertFalse(any('apk add --force-reinstall --wait'in x for x in self.calls))
+ def test_solver_error_is_not_treated_as_repairable_broken_flag(self):
+  self.broken={'diversion-dns-c':['broken-scripts']};self.sim_rc=1;self.sim_text='ERROR: unable to select packages\n1 error; 1 MiB in 2 packages'
+  self.assertFalse(self.api.recover(self.state()));self.assertFalse(any('apk add --force-reinstall --wait'in x for x in self.calls))
+ def test_broken_state_rejected_during_normal_preflight(self):
+  self.broken={'diversion-dns-c':['broken-scripts']}
+  with self.assertRaises(Exception):self.api.installed('old')
+ def test_legacy_stale_hook_lock_is_visible_not_false_success(self):
+  self.h.dirs.add('/var/run/diversion-dns-package-upgrade.lock')
+  self.assertFalse(self.api.recover(self.state()));self.assertFalse(any('apk add --force-reinstall --wait'in x for x in self.calls))
  def test_stale_recovery_owner_is_reclaimed(self):
   self.h.dirs.add(ROOT+'/recovery-lock');self.h.files[ROOT+'/recovery-lock/owner.json']=json.dumps({'pid':999,'start':'old','boot':'old-boot'})
   self.assertTrue(self.api.recover(self.state()))

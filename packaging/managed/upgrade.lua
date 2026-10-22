@@ -29,7 +29,24 @@ local function packages(side)
   files[#files+1]=q(file)
  end;return table.concat(files,' ')
 end
+local function hook_locks_clear()
+ for _,name in ipairs(services)do assert(not F.stat('/var/run/'..name..'-package-upgrade.lock'),'legacy package hook lock requires inspection')end
+end
+local function package_status(allow_owned_broken)
+ local rows=assert(J.parse(must("apk query --from installed --installed --format json --fields name,status '*'")))
+ local broken={};for _,row in ipairs(rows)do
+  assert(type(row.name)=='string'and type(row.status)=='table','invalid APK status')
+  for _,flag in ipairs(row.status)do
+   if flag~='installed'then
+    assert(flag=='broken-files'or flag=='broken-scripts'or flag=='broken-xattr','unknown APK status')
+    assert(allow_owned_broken and(row.name==names[1]or row.name==names[2]),'broken package requires inspection: '..row.name)
+    broken[row.name]=true
+   end
+  end
+ end;return broken
+end
 local function installed(side)
+ hook_locks_clear();package_status(false)
  local p=plan[side]
  for _,name in ipairs(names)do
   local s=load('/usr/share/'..name..'/source.json');assert(s.source_commit==p.source_commit,'installed source mismatch')
@@ -41,11 +58,22 @@ local function installed(side)
  end
  assert(hash('/usr/libexec/diversion-dns-c')==p.packages['diversion-dns-c'].files['usr/libexec/diversion-dns-c'].sha256,'installed ELF mismatch')
 end
-local function simulate(side)
- local args=packages(side);local text=must('apk add --simulate --allow-untrusted --no-network '..args)
- for line in text:gmatch('[^\n]+')do
-  local action,name=line:match('^%(%d+/%d+%) (%w+) ([%w._+%-]+)')
-  if action then assert((name=='diversion-dns-c'or name=='luci-app-diversion-dns')and(action=='Installing'or action=='Upgrading'or action=='Downgrading'or action=='Reinstalling'),'unexpected APK plan: '..line)end
+local function simulate(side,recovery)
+ local args=packages(side);local force=recovery and' --force-reinstall'or''
+ local text,rc=run('apk add --simulate'..force..' --allow-untrusted --no-network '..args)
+ local planned={};for line in text:gmatch('[^\n]+')do
+  if line:match('^%(%d+/%d+%)')then
+   local action,name=line:match('^%(%d+/%d+%) (%w+) ([%w._+%-]+)')
+   assert((name==names[1]or name==names[2])and(action=='Installing'or action=='Upgrading'or action=='Downgrading'or action=='Reinstalling'),'unexpected APK plan: '..line)
+   planned[name]=true
+  end
+ end
+ if rc~=0 then
+  -- APK reports existing broken-script flags even for a valid repair plan.
+  -- Accept only our two flagged packages, each explicitly scheduled for repair.
+  assert(recovery and rc==1 and not text:find('ERROR:',1,true)and text:match('%d+ errors?;'),'APK simulation failed: '..text:sub(-2000))
+  local broken=package_status(true);assert(next(broken),'APK simulation failed without owned broken state')
+  for name in pairs(broken)do assert(planned[name],'broken package is not scheduled for repair')end
  end;return args
 end
 -- Warm names are runtime output, not immutable configuration. Keep them in
@@ -93,7 +121,7 @@ local function recover(s)
  save(lock..'/owner.json',{pid=N.getpid(),start=starttime(N.getpid()),boot=boot()})
  s.state='rolling_back';save(statefile,s)
  local ok,err=pcall(function()
-  local args=simulate('old');must('apk add --wait 10 --allow-untrusted --no-network '..args)
+  hook_locks_clear();local args=simulate('old',true);must('apk add --force-reinstall --wait 10 --allow-untrusted --no-network '..args)
   -- Only application configs are restored; network and DHCP are never overwritten.
   must('tar -xzpf '..q(root..'/configs.tar.gz')..' -C /')
   for _,name in ipairs(services)do must('/etc/init.d/'..name..(s.running[name]and' restart'or' stop'))end
