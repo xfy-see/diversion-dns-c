@@ -58,8 +58,17 @@ local function health(s)
  end
  local ui=J.parse(must('/usr/libexec/diversion-dns-ui-status'));assert(ui and ui.selected,'UI status failed');check_protected(s)
 end
+local function starttime(pid)local text=read('/proc/'..pid..'/stat');if not text then return nil end;local i=0;for word in text:match('^%d+ %b() (.*)$'):gmatch('%S+')do i=i+1;if i==20 then return word end end end
 local function recover(s)
- assert(F.mkdir(root..'/recovery-lock','700'),'recovery already running')
+ local lock=root..'/recovery-lock';local st=F.stat(lock)
+ if st then
+  local owner=read(lock..'/owner.json')and load(lock..'/owner.json')
+  if owner then assert(owner.boot~=boot()or starttime(owner.pid)~=owner.start,'recovery already running')
+  else assert(st.mtime and os.time()-st.mtime>5,'recovery lock is being reserved')end
+  os.remove(lock..'/owner.json');assert(F.rmdir(lock),'cannot release stale recovery lock')
+ end
+ assert(F.mkdir(lock,'700'),'recovery already running')
+ save(lock..'/owner.json',{pid=N.getpid(),start=starttime(N.getpid()),boot=boot()})
  s.state='rolling_back';save(statefile,s)
  local ok,err=pcall(function()
   local args=simulate('old');must('apk add --wait 10 --allow-untrusted --no-network '..args)
@@ -68,20 +77,20 @@ local function recover(s)
   for _,name in ipairs(services)do must('/etc/init.d/'..name..(s.running[name]and' restart'or' stop'))end
   installed('old');for p,digest in pairs(s.configs)do assert(hash(p)==digest,'restored config mismatch')end;health(s)
  end)
- s.state=ok and'rolled_back'or'rollback_failed';s.error=not ok and tostring(err)or nil;s.finished=os.time();save(statefile,s);F.rmdir(root..'/recovery-lock');return ok
+ s.state=ok and'rolled_back'or'rollback_failed';s.error=not ok and tostring(err)or nil;s.finished=os.time();save(statefile,s);os.remove(lock..'/owner.json');F.rmdir(lock);return ok
 end
 local function detach(fn)local pid=assert(N.fork());if pid~=0 then return pid end;N.setsid();local f=assert(N.open('/dev/null','r+'));N.dup(f,N.stdin);N.dup(f,N.stdout);N.dup(f,N.stderr);f:close();local ok,err=pcall(fn);if not ok then save(root..'/worker-error.json',{error=tostring(err)})end;os.exit(ok and 0 or 1)end
-local function starttime(pid)local text=read('/proc/'..pid..'/stat');if not text then return nil end;local i=0;for word in text:match('^%d+ %b() (.*)$'):gmatch('%S+')do i=i+1;if i==20 then return word end end end
+
 if mode=='status'then print(J.stringify(load(statefile)));os.exit(0)end
 local active='/root/diversion-upgrade/active.json'
-local function unlock()local a=read(active)and load(active);if a and a.root==root then os.remove(active)end end
+local function unlock()local a=read(active)and load(active);if a and a.root==root then local st=load(statefile);if st.state=='committed'or st.state=='rolled_back'then os.remove(active)end end end
 if mode=='recover'then
  local s=load(statefile);if s.state=='committed'or s.state=='rolled_back'or s.state=='rollback_failed'then unlock();os.exit(0)end
  if s.boot==boot()and now()<s.deadline then os.exit(0)end
  if s.boot==boot()and s.pid and s.start==starttime(s.pid)then N.kill(-s.pid,9);N.nanosleep(1)end
  assert(recover(s),'rollback failed');unlock();os.exit(0)
 end
-if mode=='rollback'then assert(not F.stat(active),'another upgrade/recovery is pending');local s=load(statefile);assert(s.state~='installing'and s.state~='prepared','active transaction');assert(recover(s),'rollback failed');print(J.stringify(load(statefile)));os.exit(0)end
+if mode=='rollback'then local a=read(active)and load(active);assert(not a or a.root==root,'another upgrade/recovery is pending');local s=load(statefile);assert(s.state~='installing'and s.state~='prepared','active transaction');assert(recover(s),'rollback failed');unlock();print(J.stringify(load(statefile)));os.exit(0)end
 assert(not F.stat(statefile),'transaction already exists')
 assert(not F.stat(active),'another upgrade or recovery is pending')
 local route=read('/etc/diversion-dns-ui/transaction.json')and load('/etc/diversion-dns-ui/transaction.json')

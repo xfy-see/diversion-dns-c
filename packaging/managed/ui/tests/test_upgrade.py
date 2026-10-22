@@ -52,4 +52,12 @@ class Upgrade(unittest.TestCase):
   s=self.state();self.assertTrue(self.api.recover(s));self.assertEqual(s.state,'rolled_back');self.assertTrue(any('apk add --wait 10'in x and'/old/'in x for x in self.calls));self.assertFalse(any('/etc/config/network'in x and not x.startswith('sha256sum')for x in self.calls))
  def test_failed_rollback_remains_visible(self):
   self.bad_health=True;s=self.state();self.assertFalse(self.api.recover(s));self.assertEqual(s.state,'rollback_failed')
+ def test_stale_recovery_owner_is_reclaimed(self):
+  self.h.dirs.add(ROOT+'/recovery-lock');self.h.files[ROOT+'/recovery-lock/owner.json']=json.dumps({'pid':999,'start':'old','boot':'old-boot'})
+  self.assertTrue(self.api.recover(self.state()))
+ def test_active_recovery_owner_is_preserved(self):
+  self.h.dirs.add(ROOT+'/recovery-lock');self.h.files['/proc/sys/kernel/random/boot_id']='boot-a';self.h.files['/proc/999/stat']='999 (lua) S '+'0 '*18+'12345 0'
+  self.h.files[ROOT+'/recovery-lock/owner.json']=json.dumps({'pid':999,'start':'12345','boot':'boot-a'})
+  with self.assertRaises(Exception):self.api.recover(self.state())
+  self.assertFalse(any(x.startswith('apk add')for x in self.calls))
 if __name__=='__main__':unittest.main()
