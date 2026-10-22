@@ -87,6 +87,18 @@ class ManagedPackage(unittest.TestCase):
       subprocess.run(['sh','-c',script],check=True,capture_output=True)
      calls=(root/'calls').read_text().splitlines();self.assertEqual(calls,['running','stop','start'] if running else ['running'])
      self.assertFalse((root/f'var/run/{service}-package-upgrade').exists())
+ def test_guarded_package_hooks_leave_live_service_untouched(self):
+  for name in ['core','ui']:
+   with self.subTest(name=name),tempfile.TemporaryDirectory()as td:
+    root=Path(td);(root/'etc/init.d').mkdir(parents=True)
+    service='diversion-dns'if name=='core'else'diversion-dns-ui'
+    for daemon in [service,'rpcd']:
+     p=root/'etc/init.d'/daemon;p.write_text('#!/bin/sh\necho called >> "'+str(root/'calls')+'"\nexit 1\n');p.chmod(0o755)
+    for phase in ['pre-upgrade','post-upgrade']:
+     script=(ROOT/f'packaging/managed/hooks/{name}.{phase}').read_text()
+     script=re.sub(r'/(?:etc|var|tmp)/',lambda m:str(root)+m.group(),script)
+     subprocess.run(['sh','-c',script],check=True,capture_output=True,env=dict(os.environ,DIVERSION_DNS_GUARDED_UPGRADE='1'))
+    self.assertFalse((root/'calls').exists())
  def test_killed_preupgrade_does_not_leave_a_lock_blocking_the_next_upgrade(self):
   for name in ['core','ui']:
    with self.subTest(name=name),tempfile.TemporaryDirectory() as td:

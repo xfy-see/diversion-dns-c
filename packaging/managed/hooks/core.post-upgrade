@@ -1,5 +1,8 @@
 #!/bin/sh
 set -eu
+# The root-only guard validates the new payload and saved configuration before
+# restarting services. Keep the current process alive while APK replaces files.
+[ "${DIVERSION_DNS_GUARDED_UPGRADE:-0}" != 1 ] || exit 0
 if [ -f /var/run/diversion-dns-package-upgrade ]; then
  /etc/init.d/diversion-dns start
  rm -f /var/run/diversion-dns-package-upgrade

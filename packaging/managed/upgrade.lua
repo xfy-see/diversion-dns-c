@@ -109,6 +109,32 @@ local function health(s)
  local ui=J.parse(must('/usr/libexec/diversion-dns-ui-status'));assert(ui and ui.selected,'UI status failed');check_protected(s)
 end
 local function starttime(pid)local text=read('/proc/'..pid..'/stat');if not text then return nil end;local i=0;for word in text:match('^%d+ %b() (.*)$'):gmatch('%S+')do i=i+1;if i==20 then return word end end end
+-- A dead or job-control-stopped worker cannot make progress. Do not leave
+-- service recovery waiting for the overall installation deadline in that case.
+local function worker_failed(s)
+ if not s.pid or not s.start then return false end
+ local text=read('/proc/'..s.pid..'/stat')
+ if not text or starttime(s.pid)~=s.start then return true end
+ local status=text:match('^%d+ %b() (%S+)')
+ return status=='T'or status=='t'or status=='Z'or status=='X'
+end
+local function check_configs(s)
+ for p,digest in pairs(s.configs)do assert(hash(p)==digest,'configuration changed during upgrade')end
+ check_protected(s)
+end
+local function activate(s)
+ check_configs(s)
+ -- Hash equality protects the saved configuration; check it with the new
+ -- executable as well, before any running service is stopped.
+ if s.running['diversion-dns']then
+  local cfg=must('uci -q get diversion-dns.main.config_file'):match('^%s*(.-)%s*$')
+  assert(cfg:match('^/etc/[%w_%-]+/config%.conf$'),'unsupported live config path')
+  must('/usr/libexec/diversion-dns-c check -c '..q(cfg))
+ end
+ s.phase='activating';save(statefile,s)
+ for _,name in ipairs(services)do must('/etc/init.d/'..name..(s.running[name]and' restart'or' stop'))end
+ must('rm -f /tmp/luci-indexcache.*');must('/etc/init.d/rpcd reload')
+end
 local function recover(s)
  local lock=root..'/recovery-lock';local st=F.stat(lock)
  if st then
@@ -140,7 +166,7 @@ local active='/root/diversion-upgrade/active.json'
 local function unlock()local a=read(active)and load(active);if a and a.root==root then local st=load(statefile);if st.state=='committed'or st.state=='rolled_back'then os.remove(active)end end end
 if mode=='recover'then
  local s=load(statefile);if s.state=='committed'or s.state=='rolled_back'or s.state=='rollback_failed'then unlock();os.exit(0)end
- if s.boot==boot()and now()<s.deadline then os.exit(0)end
+ if s.boot==boot()and now()<s.deadline and not worker_failed(s)then os.exit(0)end
  if s.boot==boot()and s.pid and s.start==starttime(s.pid)then N.kill(-s.pid,9);N.nanosleep(1)end
  assert(recover(s),'rollback failed');unlock();os.exit(0)
 end
@@ -170,7 +196,10 @@ end)
 F.rmdir('/var/lock/diversion-upgrade');assert(prepared,s)
 local guardian=detach(function()
  local f=assert(io.open(root..'/ready','w'));f:write(N.getpid());f:close()
- while now()<s.deadline do N.nanosleep(1);local t=load(statefile);if t.state=='committed'or t.state=='rolled_back'or t.state=='rollback_failed'then return end end
+ while now()<s.deadline do
+  N.nanosleep(1);local t=load(statefile);if t.state=='committed'or t.state=='rolled_back'or t.state=='rollback_failed'then return end
+  if worker_failed(t)then break end
+ end
  local t=load(statefile);if t.pid and t.start==starttime(t.pid)then N.kill(-t.pid,9);N.nanosleep(1)end
  recover(t);unlock()
 end)
@@ -179,8 +208,8 @@ assert(ready,'guardian startup failed: no packages changed')
 local pid=detach(function()
  s.pid=N.getpid();s.start=starttime(s.pid);s.state='installing';save(statefile,s)
  local ok,err=pcall(function()
-  must('apk add --wait 10 --allow-untrusted --no-network '..args)
-  installed('new');for p,digest in pairs(s.configs)do assert(hash(p)==digest,'configuration changed during upgrade')end
+  must('DIVERSION_DNS_GUARDED_UPGRADE=1 apk add --wait 10 --allow-untrusted --no-network '..args)
+  installed('new');activate(s)
   for _=1,10 do local good=pcall(health,s);if good then assert(now()<s.deadline,'deadline expired');s.state='committed';s.finished=os.time();save(statefile,s);unlock();return end;N.nanosleep(1)end
   error('post-upgrade health failed')
  end)

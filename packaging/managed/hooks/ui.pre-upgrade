@@ -1,5 +1,8 @@
 #!/bin/sh
 set -eu
+# The root-only guard validates the new payload and saved configuration before
+# restarting services. Keep the current process alive while APK replaces files.
+[ "${DIVERSION_DNS_GUARDED_UPGRADE:-0}" != 1 ] || exit 0
 # APK holds its database lock while running hooks. An extra mkdir lock can
 # survive SIGKILL and incorrectly block the next upgrade.
 rm -f /var/run/diversion-dns-ui-package-upgrade
