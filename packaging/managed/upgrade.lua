@@ -78,7 +78,7 @@ local function unlock()local a=read(active)and load(active);if a and a.root==roo
 if mode=='recover'then
  local s=load(statefile);if s.state=='committed'or s.state=='rolled_back'or s.state=='rollback_failed'then unlock();os.exit(0)end
  if s.boot==boot()and now()<s.deadline then os.exit(0)end
- if s.pid and s.start==starttime(s.pid)then N.kill(-s.pid,9);N.nanosleep(1)end
+ if s.boot==boot()and s.pid and s.start==starttime(s.pid)then N.kill(-s.pid,9);N.nanosleep(1)end
  assert(recover(s),'rollback failed');unlock();os.exit(0)
 end
 if mode=='rollback'then assert(not F.stat(active),'another upgrade/recovery is pending');local s=load(statefile);assert(s.state~='installing'and s.state~='prepared','active transaction');assert(recover(s),'rollback failed');print(J.stringify(load(statefile)));os.exit(0)end

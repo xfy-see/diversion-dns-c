@@ -100,21 +100,22 @@ end
 local function identity(pid)local s=read('/proc/'..pid..'/stat');return s and s:match('^%d+ %b() (.+)$'):match('^(.*)$') end
 local function process_start(pid)local s=identity(pid);if not s then return nil end;local i=0;for value in s:gmatch('%S+')do i=i+1;if i==20 then return value end end end
 local function release()os.remove(R..'/route-lock/identity');os.remove(R..'/route-lock/pid');F.rmdir(R..'/route-lock')end
-local function mutex()
+local function mutex(role)
  F.mkdir(R,448);if not F.mkdir(R..'/route-lock',448)then error('routing operation already running')end
- local f=assert(io.open(R..'/route-lock/pid','w'));f:write(N.getpid());f:close();save(R..'/route-lock/identity',{pid=N.getpid(),start=process_start(N.getpid())})
+ local f=assert(io.open(R..'/route-lock/pid','w'));f:write(N.getpid());f:close();save(R..'/route-lock/identity',{pid=N.getpid(),start=process_start(N.getpid()),role=role or 'preparing'})
 end
 function M.recover()
  local t=load(T);if not pending(t)then return false end
  if t.boot==boot()and uptime()<t.deadline then return false end
  if F.stat(R..'/route-lock')then
   local owner=load(R..'/route-lock/identity');if owner and owner.start and process_start(owner.pid)==owner.start then
-   -- The worker has its own session; stop its descendants as well before undo.
+   if owner.role~='worker'then return false end
+   -- Only the expired switch worker may be killed, never another recovery.
    assert(N.kill(-owner.pid,9),'cannot stop expired worker');N.nanosleep(0,100000000)
    assert(process_start(owner.pid)~=owner.start or (identity(owner.pid)or''):match('^Z '),'worker still active')
   end;release()
  end
- mutex();local ok,result=pcall(rollback,t);release();if not ok then error(result)end;return result
+ mutex('recovery');local ok,result=pcall(rollback,t);release();if not ok then error(result)end;return result
 end
 function M.status()
  local ok,c=pcall(config);if not ok then return {enabled=false,error=tostring(c)}end;if not c then return {enabled=false}end
@@ -126,6 +127,7 @@ function M.start(action)
  local c=assert(config(),'routing control disabled');assert(not pending(load(T)),'pending transaction requires recovery')
  local id=action=='rollback'and(load(S)or{}).previous or action:match('^switch%-(%w+)$');assert(c.exits[id],'exit not deployed')
  mutex();local ok,t=pcall(function()
+  assert(not pending(load(T)),'pending transaction requires recovery')
   local before=peers(c);local r=runtime(c);assert(r.selected~='unknown'and r.selected~='mixed','ambiguous runtime selection')
   local after=target(c,before,id)
   local t={id=read('/proc/sys/kernel/random/uuid'),config=copy(c),before=copy(before),after=copy(after),selection_before=load(S)or{selected=c.initial},target=id,state='prepared',boot=boot(),deadline=uptime()+35,started=os.time()}
@@ -143,7 +145,7 @@ function M.start(action)
  local available=false;for _=1,50 do if tonumber(read(ready)or'')==guardian and F.stat('/proc/'..guardian)then available=true;break end;N.nanosleep(0,20000000)end
  if not available then mutex();rollback(t);release();error('guardian did not start; switch refused')end
  detached(function()
-  mutex();local f=assert(io.open(R..'/route-lock/pid','w'));f:write(N.getpid());f:close()
+  mutex('worker');local f=assert(io.open(R..'/route-lock/pid','w'));f:write(N.getpid());f:close()
   local worked,err=pcall(function()
    t.state='applying';save(T,t);assert(same(config(),c)and same(peers(c),t.before),'state changed before switch');apply(c,t.after)
    t.state='verifying';save(T,t);t.public_exit=probe(c,id);assert(t.public_exit.ok,'public egress identity or route mismatch')

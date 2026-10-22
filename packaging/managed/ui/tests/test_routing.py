@@ -62,4 +62,17 @@ class Routing(unittest.TestCase):
   t=self.state();self.peers[U].append('10.0.0.4/32');self.assertFalse(self.t.rollback(t));self.assertIn('10.0.0.4/32',self.peers[U]);self.assertEqual(t.state,'rollback_failed')
  def test_changed_config_stops_rollback(self):
   t=self.state();self.h.files[D+'/routing.json']='{"enabled":false}';self.assertFalse(self.t.rollback(t));self.assertFalse(any('wg set'in x for x in self.calls))
+ def recovery_state(self,role):
+  t=self.h.to_py(self.state());t.update(boot='boot-a',deadline=900)
+  self.h.files[D+'/transaction.json']=json.dumps(t)
+  self.h.dirs.add(R+'/route-lock')
+  self.h.files[R+'/route-lock/identity']=json.dumps({'pid':123,'start':'999','role':role})
+  self.h.files['/proc/123/stat']='123 (lua) S '+'0 '*18+'999 0'
+  self.killed=[]
+  self.h.lua.globals().KILL=lambda pid,sig:self.killed.append((pid,sig))or self.h.files.pop('/proc/123/stat',None)or True
+  self.h.lua.execute("require('nixio').kill=function(pid,sig) KILL(pid,sig);return true end")
+ def test_recovery_does_not_kill_another_recovery(self):
+  self.recovery_state('recovery');self.assertFalse(self.api.recover());self.assertEqual(self.killed,[])
+ def test_expired_worker_is_killed_before_rollback(self):
+  self.recovery_state('worker');self.assertTrue(self.api.recover());self.assertEqual(self.killed,[(-123,9)])
 if __name__=='__main__':unittest.main()
