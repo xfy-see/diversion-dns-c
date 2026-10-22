@@ -121,7 +121,11 @@ local function recover(s)
  save(lock..'/owner.json',{pid=N.getpid(),start=starttime(N.getpid()),boot=boot()})
  s.state='rolling_back';save(statefile,s)
  local ok,err=pcall(function()
-  hook_locks_clear();local args=simulate('old',true);must('apk add --force-reinstall --wait 10 --allow-untrusted --no-network '..args)
+  hook_locks_clear();local args=simulate('old',true)
+  -- Old post-upgrade hooks must see the saved valid configuration, not a
+  -- failed candidate's configuration that could make the repair hook fail too.
+  must('tar -xzpf '..q(root..'/configs.tar.gz')..' -C /')
+  must('apk add --force-reinstall --wait 10 --allow-untrusted --no-network '..args)
   -- Only application configs are restored; network and DHCP are never overwritten.
   must('tar -xzpf '..q(root..'/configs.tar.gz')..' -C /')
   for _,name in ipairs(services)do must('/etc/init.d/'..name..(s.running[name]and' restart'or' stop'))end

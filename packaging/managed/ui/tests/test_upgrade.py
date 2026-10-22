@@ -70,6 +70,11 @@ class Upgrade(unittest.TestCase):
   self.bad_health=True;s=self.state();self.assertFalse(self.api.recover(s));self.assertEqual(s.state,'rollback_failed')
  def test_recovery_reinstalls_even_when_old_version_is_still_registered(self):
   self.assertTrue(self.api.recover(self.state()));self.assertTrue(any('apk add --force-reinstall --wait 10'in x for x in self.calls))
+ def test_old_config_is_restored_before_reinstall_hooks_execute(self):
+  self.assertTrue(self.api.recover(self.state()))
+  restore=next(i for i,x in enumerate(self.calls)if x.startswith('tar -xzpf'))
+  install=next(i for i,x in enumerate(self.calls)if x.startswith('apk add --force-reinstall --wait'))
+  self.assertLess(restore,install)
  def test_owned_broken_script_repair_plan_is_allowed(self):
   self.broken={'diversion-dns-c':['broken-scripts']};self.sim_rc=1;self.sim_text='(1/2) Reinstalling diversion-dns-c (old)\n(2/2) Reinstalling luci-app-diversion-dns (old)\n1 error; 1 MiB in 2 packages'
   self.assertTrue(self.api.recover(self.state()))
