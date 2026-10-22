@@ -95,7 +95,7 @@ return view.extend({
   function renderOverview() {
    var h = object(current.health), last = object(current.last), failures = object(current.endpoint_health).dns_failures, containment = object(current.containment);
    var known = connected ? '' : '上次记录：';
-   parts.exit.textContent = known + name(current.selected);
+   parts.exit.textContent = known + name(current.selected) + (current.configured_selected && current.configured_selected !== current.selected ? '（配置：' + name(current.configured_selected) + '）' : '');
    var mode = current.emergency ? containment.known && containment.active ? '国内应急；海外标记流量已阻断' : '国内应急；海外阻断规则未确认生效' : current.dns_degraded ? 'DNS 已降级' : '分流已启用（不代表出口可用）';
    if (self.deviceMode) mode = current.mode_text || '设备策略状态未知';
    parts.mode.textContent = connected ? mode : current.selected ? '当前模式未知；上次记录：' + mode : '当前模式未知，尚未取得配置状态';
@@ -196,7 +196,7 @@ return view.extend({
     if (p.error) identity += '；' + p.error;
     if (p.expected) identity = '预期 ' + (Array.isArray(p.expected) ? p.expected.join(' / ') : p.expected) + '；' + identity;
     if (!probeFresh) identity = '历史记录或信息不完整（当前未知）：' + identity;
-    var scope = { router_https: '路由器 HTTPS 探测', isolated_candidate: '隔离候选出口探测（仅探测流量）' }[p.probe_scope] || (p.probe_scope ? '其他探测范围：' + p.probe_scope : '未标明探测范围');
+    var scope = { router_https: '路由器 HTTPS 探测', isolated_candidate: '隔离候选出口探测（仅探测流量）', isolated_namespace: '独立命名空间测试流量', router_policy: '本机策略路由探测' }[p.probe_scope] || (p.probe_scope ? '其他探测范围：' + p.probe_scope : '未标明探测范围');
     return row([af.toUpperCase(), p.ip || '暂无数据', E('span', { 'class': probeFresh && p.identity_status === 'mismatch' ? 'pnw-text-bad' : probeFresh && p.identity_status === 'verified' ? 'pnw-text-ok' : 'pnw-muted' }, identity), scope, time(p.checked_at)]);
    }))]);
    var peers = object(h.peers);

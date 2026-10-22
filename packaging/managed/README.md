@@ -63,3 +63,41 @@ CN 规则，执行 `... check -c /etc/diversion-dns/config.conf`。启用需设�
 
 原生打包格式依据：[apk mkpkg](https://github.com/alpinelinux/apk-tools/blob/master/doc/apk-mkpkg.8.scd)
 与 [OpenWrt 包生成逻辑](https://github.com/openwrt/openwrt/blob/main/include/package-pack.mk)。
+
+## 可选的受管双 WireGuard 出口
+
+`/etc/diversion-dns-ui/routing.json` 默认 `enabled=false`。显式启用后才开放
+AWS、NoBrand 和上次出口回滚。该适配器只移动既有接口两个 peer 的默认前缀，
+不创建隧道、不接管 LAN、不修改 DNS、防火墙、主路由或其他 peer。
+本地配置需要 `interface`、`table`、`families`（4/6）、`initial` 和
+`exits.aws` / `exits.nobrand`，每个出口包含 `peer` 公钥及对应 `ipv4` / `ipv6`
+预期公网地址。地址和公钥不得提交到仓库。测试可配置 `namespace`，页面会明确
+标注隔离范围；这样的结果不代表 LAN 已切换。无 namespace 时，探测目标的实际
+策略路由必须走受管接口，否则拒绝成功。
+
+运行状态分别读取配置选择、每个地址族默认 peer 和目标表默认路由。切换前保存
+独立副本，确认独立 guardian 已启动后才修改；新 HTTPS 请求还必须返回预期地址。
+失败或 worker 超时会恢复旧 peer/选择。遇到第三方改动时保留 `rollback_failed`
+证据，拒绝覆盖未知状态。此时应先处理冲突，再恢复；不能把它视为已经恢复。
+monitor 也会检查超期事务。其他未部署的代理/应急功能仍禁用。
+
+## 有旧包保障的升级
+
+root 工具 `/usr/libexec/diversion-dns-upgrade` 接收
+`/root/diversion-upgrade/<transaction-id>` 和 `start` / `status` / `rollback`。
+目录及 `old`、`new` 子目录必须属于 root、权限 0700；其中放置已按精确 CI
+提交/run/attempt 验证的两套 APK。`plan.json` 的 `old` 和 `new` 分别使用对应
+`managed-packages.json` 的完整对象。首次部署可从已核验的新包载荷取得该脚本，
+用绝对路径运行；不会在准备完成前改服务。
+
+准备阶段核对旧版本、ELF 摘要、两套 APK 摘要/元数据、仅涉及本项目两包的安装计划，
+压缩备份应用配置，并记录 network/firewall/dhcp 的摘要及服务运行状态。
+准备成功并确认 guardian 已运行后才安装。健康失败会安装旧 APK、恢复应用配置和
+原服务运行状态；network/firewall/dhcp 只检查，绝不覆盖管理员的并发修改。
+验收需要核对实际包版本、二进制、配置与 DNS 请求，不能只看 APK 命令退出码。
+备份含本地配置，必须保持私有。
+
+切换和升级应串行进行。保留手动回退目录，不要在事务进行时卸载管理组件。
+突然断电、文件系统损坏或系统级 OOM 同时杀死所有守护进程不属于已验证保证；
+重启后 monitor 可检查遗留升级事务，但原版本未带恢复工具时仍需用目录中的
+`guard.lua` 手动恢复。真实设备、故障注入及浏览器验收结果另见私有 validation 报告。

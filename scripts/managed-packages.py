@@ -14,7 +14,7 @@ import shutil
 ROOT_OWNER_SCRIPT = 'root=$1; owner=$2; shift 2; trap \'chown -R "$owner" "$root"\' EXIT; chown -R 0:0 "$root"; "$@"'
 CORE='diversion-dns-c'
 UI='luci-app-diversion-dns'
-MODULES=('device/device.lua','device/window.lua','telemetry.lua','metrics.lua','public-status.lua','dns-status.lua','query.lua')
+MODULES=('device/device.lua','device/routing.lua','device/window.lua','telemetry.lua','metrics.lua','public-status.lua','dns-status.lua','query.lua')
 CORE_DEPS=['libc','libpthread','procd','uci','nftables']
 UI_DEPS=['luci-base','luci-lib-jsonc','luci-lib-nixio','rpcd-mod-file','uclient-fetch','ca-bundle','libustream-mbedtls20201210','procd','uci','ip-full','nftables','wireguard-tools']
 
@@ -45,8 +45,10 @@ def stage(source,binary,destination,commit):
     for local,remote,mode in [('core.init','etc/init.d/diversion-dns',0o755),('core.uci','etc/config/diversion-dns',0o600),('config.conf','etc/diversion-dns/config.conf',0o600),('cn-domains.txt','etc/diversion-dns/cn-domains.txt',0o600),('nft-init.nft','etc/diversion-dns/nft-init.nft',0o600)]:put(roots[CORE],remote,(base/local).read_bytes(),mode)
     for name in MODULES:put(roots[UI],'usr/share/diversion-dns-ui/'+Path(name).name,(ui/name).read_bytes())
     for name in ['control','status']:put(roots[UI],'usr/libexec/diversion-dns-ui-'+name,(ui/'device'/name).read_bytes(),0o755)
+    put(roots[UI],'usr/libexec/diversion-dns-upgrade-recover',(base/'upgrade-recover').read_bytes(),0o755)
+    put(roots[UI],'usr/libexec/diversion-dns-upgrade',(base/'upgrade.lua').read_bytes(),0o755)
     put(roots[UI],'usr/share/diversion-dns-ui/monitor',(ui/'device/monitor').read_bytes(),0o755)
-    for local,remote,mode in [('ui.init','etc/init.d/diversion-dns-ui',0o755),('ui.uci','etc/config/diversion-dns-ui',0o600),('profile.json','etc/diversion-dns-ui/profile.json',0o600)]:put(roots[UI],remote,(base/local).read_bytes(),mode)
+    for local,remote,mode in [('ui.init','etc/init.d/diversion-dns-ui',0o755),('ui.uci','etc/config/diversion-dns-ui',0o600),('profile.json','etc/diversion-dns-ui/profile.json',0o600),('routing.json','etc/diversion-dns-ui/routing.json',0o600)]:put(roots[UI],remote,(base/local).read_bytes(),mode)
     view=(ui/'view.js').read_text();assert view.count(' deviceMode: false,')==1
     view=view.replace(' deviceMode: false,',' deviceMode: true,',1)
     asset='diversion-dns/device-'+sha(view.encode())[:12]
@@ -58,7 +60,7 @@ def stage(source,binary,destination,commit):
     put(roots[UI],'usr/share/luci/menu.d/luci-app-diversion-dns.json',json.dumps(menu,ensure_ascii=False,indent=2))
     acl={UI:{'description':'DNS statistics and bounded device diagnostics','read':{'ubus':{'file':['exec']},'file':{'/usr/libexec/diversion-dns-ui-status':['exec']}},'write':{'ubus':{'file':['exec']},'file':{'/usr/libexec/diversion-dns-ui-control':['exec']}}}}
     put(roots[UI],'usr/share/rpcd/acl.d/luci-app-diversion-dns.json',json.dumps(acl,indent=2))
-    configs={CORE:['/etc/config/diversion-dns','/etc/diversion-dns/config.conf','/etc/diversion-dns/cn-domains.txt','/etc/diversion-dns/nft-init.nft'],UI:['/etc/config/diversion-dns-ui','/etc/diversion-dns-ui/profile.json']}
+    configs={CORE:['/etc/config/diversion-dns','/etc/diversion-dns/config.conf','/etc/diversion-dns/cn-domains.txt','/etc/diversion-dns/nft-init.nft'],UI:['/etc/config/diversion-dns-ui','/etc/diversion-dns-ui/profile.json','/etc/diversion-dns-ui/routing.json']}
     for name,root in roots.items():
         put(root,'usr/share/'+name+'/source.json',json.dumps({'source_commit':commit,'package':name,**({'binary_sha256':sha(binary.read_bytes())} if name==CORE else {})},indent=2))
         put(root,'lib/apk/packages/'+name+'.conffiles','\n'.join(configs[name])+'\n')
