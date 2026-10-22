@@ -1,5 +1,5 @@
 """Guarded APK preparation/rollback contracts using the real Lua implementation."""
-import json,sys,shlex,unittest
+import json,re,sys,shlex,unittest
 from contextlib import contextmanager
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).parent))
@@ -8,21 +8,36 @@ SOURCE=(Path(__file__).parents[2]/'upgrade.lua').read_text().split('\n',1)[1]
 ROOT='/root/diversion-upgrade/unit'
 class Upgrade(unittest.TestCase):
  def setUp(self):
-  h=self.h=Harness();self.calls=[];self.killed=[];self.lock_hook=None;self.apk_hook=None;self.sleep_hook=None;self.sleep_count=0;self.locked=False;self.pid=123;self.lock_owner=None;self.lock_held_at_state_save=[];self.local_health_calls=[];self.local_health_error=None;self.forbid_external_dns=False;self.service_running={};self.bad_hash=False;self.bad_plan=False;self.bad_health=False;self.broken={};self.sim_rc=0;self.sim_text=None
+  h=self.h=Harness();self.calls=[];self.killed=[];self.kill_success=True;self.kill_exits=True;self.stubborn_pids=set();self.setsid_calls=[];self.setsid_success=True;self.setsid_changes_group=True;self.sleep_advances=False;self.lock_hook=None;self.apk_hook=None;self.state_saved_hook=None;self.sleep_hook=None;self.sleep_count=0;self.locked=False;self.pid=123;self.lock_owner=None;self.lock_held_at_state_save=[];self.local_health_calls=[];self.local_health_error=None;self.forbid_external_dns=False;self.service_running={};self.bad_hash=False;self.bad_plan=False;self.bad_health=False;self.broken={};self.sim_rc=0;self.sim_text=None
   self.plan={side:{'version':side+'-r1','source_commit':ch*40,'packages':{name:{'filename':name+'.apk','sha256':'d'*64,'files':{'usr/libexec/diversion-dns-c':{'sha256':'d'*64}}}for name in ['diversion-dns-c','luci-app-diversion-dns']}}for side,ch in [('old','a'),('new','b')]}
   h.files[ROOT+'/plan.json']=json.dumps(self.plan)
   h.files['/proc/sys/kernel/random/boot_id']='boot-a';h.files['/proc/uptime']='1000.0 0.0'
-  h.files['/proc/123/stat']='123 (lua) S '+'0 '*18+'12345 0'
-  h.lua.globals().UP_SLEEP=self.sleep;h.lua.globals().UP_PID=lambda:self.pid;h.lua.globals().PY_RENAME=self.rename;h.lua.globals().UP_KILL=self.kill;h.lua.globals().UP_MKDIR=self.mkdir;h.lua.globals().UP_OPEN=self.lock_open
-  h.lua.execute("require('nixio').nanosleep=function(...)return UP_SLEEP(...)end;require('nixio').getpid=function()return UP_PID()end;require('nixio').kill=function(pid,sig)return UP_KILL(pid,sig)end;require('nixio').open=function(...)return UP_OPEN(...)end;require('nixio.fs').mkdir=function(p,m)return UP_MKDIR(p,m)end")
+  h.files['/proc/123/stat']=self.proc_stat(123,'12345')
+  h.lua.globals().UP_SETSID=self.setsid;h.lua.globals().PY_DIR=self.listdir;h.lua.globals().UP_SLEEP=self.sleep;h.lua.globals().UP_PID=lambda:self.pid;h.lua.globals().PY_RENAME=self.rename;h.lua.globals().UP_KILL=self.kill;h.lua.globals().UP_MKDIR=self.mkdir;h.lua.globals().UP_OPEN=self.lock_open
+  h.lua.execute("require('nixio').setsid=function()return UP_SETSID()end;require('nixio').nanosleep=function(...)return UP_SLEEP(...)end;require('nixio').getpid=function()return UP_PID()end;require('nixio').kill=function(pid,sig)return UP_KILL(pid,sig)end;require('nixio').open=function(...)return UP_OPEN(...)end;require('nixio.fs').mkdir=function(p,m)return UP_MKDIR(p,m)end")
   for name in ['diversion-dns-c','luci-app-diversion-dns']:h.files['/usr/share/'+name+'/source.json']=json.dumps({'source_commit':'a'*40})
   h.files['/etc/diversion-dns-ui/profile.json']=json.dumps({'dns_host':'127.0.0.1','dns_port':15353})
   h.lua.globals().UP_LOCAL_HEALTH=self.local_health;h.lua.globals().UP_DNS=self.dns;h.lua.globals().UP_RUN=self.command;h.lua.globals().arg=h.to_lua({0:'/usr/libexec/diversion-dns-upgrade',1:ROOT,2:'start'})
   h.lua.execute("require('nixio').getuid=function()return 0 end;local f=require('nixio.fs');f.chmod=function(p,m)assert(m=='600');return true end;f.lstat=function(p)return {type=p:match('%.apk$') and 'reg' or 'dir',uid=0,modestr='rwx------'}end;dofile=function(p)if p:match('/upgrade%-health.lua$')then return {check=function(profile)return UP_LOCAL_HEALTH(profile)end}end;return {dns_query=function(...)return UP_DNS(...)end}end")
   s=SOURCE;start=s.index('local function run(cmd)');end=s.index('local function must(',start);s=s[:start]+'local function run(cmd)return UP_RUN(cmd)end\n'+s[end:];self.full_source=s;s=s[:s.index("if mode=='status'")]+"return {packages=packages,simulate=simulate,installed=installed,health=health,recover=recover,runtime_files=runtime_files,worker_failed=worker_failed,activate=activate,install_new=install_new,commit=commit,with_lock=with_lock,capture_health=capture_health}"
   self.api=h.lua.execute(s)
+ @staticmethod
+ def proc_stat(pid,start,group=None,state='S'):
+  return str(pid)+' (lua) '+state+' 0 '+str(group if group is not None else pid)+' '+'0 '*16+str(start)+' 0'
+ def listdir(self,path):
+  if path=='/proc':return self.h.to_lua(sorted({m.group(1)for p in self.h.files if (m:=re.fullmatch(r'/proc/(\d+)/stat',p))}))
+  return self.h.to_lua([])
+ def setsid(self):
+  self.setsid_calls.append(self.pid)
+  if not self.setsid_success:return False
+  if self.setsid_changes_group:
+   path='/proc/'+str(self.pid)+'/stat';prefix,rest=self.h.files[path].split(') ',1);fields=rest.split()
+   fields[2]=str(self.pid);fields[3]=str(self.pid);self.h.files[path]=prefix+') '+' '.join(fields)
+  return self.pid
  def sleep(self,*args):
   self.sleep_count+=1
+  if self.sleep_advances:
+   uptime=float(self.h.files['/proc/uptime'].split()[0]);self.h.files['/proc/uptime']=str(uptime+0.1)+' 0.0'
   if self.sleep_hook:
    hook=self.sleep_hook;self.sleep_hook=None;hook()
  def local_health(self,profile):
@@ -34,9 +49,12 @@ class Upgrade(unittest.TestCase):
   return self.h.to_lua({'ok':True,'answers':[{'address':'192.0.2.1'}]})
  @contextmanager
  def other_process(self,pid=456):
-  previous=self.pid;self.pid=pid
+  previous=self.pid;self.pid=pid;path='/proc/'+str(pid)+'/stat';created=path not in self.h.files
+  if created:self.h.files[path]=self.proc_stat(pid,str(pid)+'45')
   try:yield
-  finally:self.pid=previous
+  finally:
+   self.pid=previous
+   if created:self.h.files.pop(path,None)
  def lock_open(self,path,*args):
   self.assertEqual(path,'/var/lock/diversion-upgrade.lock');opener=self.pid
   def release():
@@ -55,9 +73,19 @@ class Upgrade(unittest.TestCase):
   return self.h.lua.table_from({'lock':lock,'close':close})
  def rename(self,a,b):
   if b==ROOT+'/state.json':self.lock_held_at_state_save.append(self.locked)
-  return self.h.rename(a,b)
+  result=self.h.rename(a,b)
+  if b==ROOT+'/state.json'and self.state_saved_hook:
+   hook=self.state_saved_hook;self.state_saved_hook=None;hook()
+  return result
  def kill(self,pid,sig):
-  self.killed.append((pid,sig));self.h.files.pop('/proc/'+str(abs(pid))+'/stat',None);return True
+  self.killed.append((pid,sig))
+  if self.kill_success and self.kill_exits:
+   for path,text in list(self.h.files.items()):
+    m=re.fullmatch(r'/proc/(\d+)/stat',path)
+    if not m or int(m.group(1))in self.stubborn_pids:continue
+    fields=text.split(') ',1)[1].split();match=int(m.group(1))==pid if pid>0 else fields[2]==str(-pid)
+    if match:self.h.files.pop(path,None)
+  return self.kill_success
  def mkdir(self,path,mode=None):
   result=self.h.mkdir(path)
   if result and self.lock_hook and 'lock'in path:
@@ -273,9 +301,11 @@ class Upgrade(unittest.TestCase):
   s=self.state();s.pid=999;s.start='old-start';s.deadline=900;self.save_state(s)
   self.h.files['/proc/999/stat']='999 (unrelated) S '+'0 '*18+'new-start 0'
   self.recover('auto');self.assertEqual(self.killed,[]);self.assertEqual(self.saved_state()['state'],'rolled_back')
- def test_abandoned_rollback_can_resume_without_killing_prior_installer(self):
+ def test_abandoned_rollback_resumes_after_installer_and_owner_exited(self):
   s=self.state();s.state='rolling_back';s.recovery=self.h.to_lua({'pid':999,'start':'dead-owner','boot':'boot-a'});self.save_state(s)
-  self.recover('auto');self.assertEqual(self.saved_state()['state'],'rolled_back');self.assertEqual(self.killed,[]);self.assertEqual(len(self.apk_installs()),1)
+  self.h.files.pop('/proc/123/stat',None)
+  with self.other_process(456):self.recover('auto')
+  self.assertEqual(self.saved_state()['state'],'rolled_back');self.assertEqual(self.killed,[]);self.assertEqual(len(self.apk_installs()),1)
  def test_manual_rollback_of_committed_transaction_remains_available(self):
   s=self.state();s.state='committed';self.save_state(s)
   self.recover('manual');self.assertEqual(self.saved_state()['state'],'rolled_back');self.assertEqual(len(self.apk_installs()),1)
@@ -323,4 +353,174 @@ class Upgrade(unittest.TestCase):
   except Exception:pass
   self.assertGreater(self.sleep_count,0);self.assertLessEqual(self.sleep_count,250)
   self.assertEqual(self.saved_state()['state'],'installing');self.assertEqual(self.lock_owner,456)
+ def crash_recovery_after_publication_before_installer_signal(self):
+  s=self.state();s.deadline=900;self.save_state(s)
+  self.h.files['/proc/456/stat']='456 (lua) S '+'0 '*18+'45645 0'
+  def crash():
+   published=self.saved_state()
+   self.assertEqual(published['state'],'rolling_back')
+   self.assertEqual(published['recovery']['pid'],456)
+   self.assertEqual(self.killed,[])
+   raise RuntimeError('fixture: recovery process dies after state rename, before signal')
+  self.state_saved_hook=crash
+  with self.other_process(456):
+   with self.assertRaises(Exception):self.recover('auto')
+  # A process death releases the kernel lock; its durable write survives.
+  self.h.files.pop('/proc/456/stat',None)
+  self.assertFalse(self.locked);self.assertEqual(self.saved_state()['state'],'rolling_back')
+  self.assertEqual(self.killed,[]);self.assertEqual(self.apk_installs(),[])
+  self.assertIn('/proc/123/stat',self.h.files)
+  self.h.files['/proc/789/stat']='789 (lua) S '+'0 '*18+'78945 0'
+ def test_successor_recovery_stops_installer_after_publish_before_kill_crash(self):
+  self.crash_recovery_after_publication_before_installer_signal()
+  with self.other_process(789):self.assertTrue(self.recover('auto'))
+  self.assertEqual(self.killed,[(-123,9)])
+  self.assertNotIn('/proc/123/stat',self.h.files)
+  self.assertEqual(self.saved_state()['state'],'rolled_back')
+ def test_abandoned_recovery_never_allows_live_installer_to_start_new_apk(self):
+  self.crash_recovery_after_publication_before_installer_signal()
+  resumed=[]
+  def resume_original_before_old_apk_finishes():
+   if '/proc/123/stat'in self.h.files:
+    resumed.append(True)
+    with self.other_process(123):
+     self.api.install_new("'/root/diversion-upgrade/unit/new/diversion-dns-c.apk' '/root/diversion-upgrade/unit/new/luci-app-diversion-dns.apk'")
+  self.apk_hook=resume_original_before_old_apk_finishes
+  with self.other_process(789):self.assertTrue(self.recover('auto'))
+  self.assertEqual(resumed,[],'original installer must be stopped before rollback reaches APK')
+  self.assertEqual(len(self.apk_installs()),1)
+  self.assertNotIn('/new/',self.apk_installs()[0])
+ def test_successor_does_not_signal_reused_installer_pid_after_recovery_crash(self):
+  self.crash_recovery_after_publication_before_installer_signal()
+  self.h.files['/proc/123/stat']='123 (unrelated) S '+'0 '*18+'77777 0'
+  with self.other_process(789):self.assertTrue(self.recover('auto'))
+  self.assertEqual(self.killed,[]);self.assertIn('/proc/123/stat',self.h.files)
+  self.assertEqual(self.saved_state()['state'],'rolled_back')
+ def test_self_failure_recovery_owner_is_never_killed_by_successor(self):
+  self.state()
+  def contender_during_self_recovery_apk():
+   current=self.saved_state()
+   self.assertEqual(current['state'],'rolling_back')
+   self.assertEqual(current['pid'],current['recovery']['pid'])
+   self.assertEqual(current['recovery']['pid'],123)
+   with self.other_process(789):self.assertTrue(self.recover('auto'))
+   self.assertEqual(self.killed,[]);self.assertIn('/proc/123/stat',self.h.files)
+  self.apk_hook=contender_during_self_recovery_apk
+  self.assertTrue(self.recover('failure'))
+  self.assertIsNone(self.apk_hook);self.assertEqual(self.saved_state()['state'],'rolled_back')
+  self.assertEqual(self.killed,[]);self.assertEqual(len(self.apk_installs()),1)
+ def test_live_previous_recovery_owner_is_waited_for_even_without_lock(self):
+  s=self.state();s.state='rolling_back';s.recovery=self.h.to_lua({'pid':456,'start':'45645','boot':'boot-a'});self.save_state(s)
+  for state in ['S','R','D','T','t']:
+   with self.subTest(owner_process_state=state):
+    self.calls.clear();self.killed.clear();self.save_state(s)
+    self.h.files['/proc/456/stat']='456 (lua) '+state+' '+'0 '*18+'45645 0'
+    with self.other_process(789):self.recover('auto')
+    self.assertEqual(self.killed,[]);self.assertEqual(self.apk_installs(),[])
+    self.assertEqual(self.saved_state()['recovery']['pid'],456)
+ def test_failed_installer_kill_prevents_rollback_apk(self):
+  self.crash_recovery_after_publication_before_installer_signal();self.kill_success=False;self.sleep_advances=True
+  with self.other_process(789):
+   try:self.recover('auto')
+   except Exception:pass
+  self.assertEqual(self.killed,[(-123,9)]);self.assertEqual(self.apk_installs(),[])
+  self.assertIn('/proc/123/stat',self.h.files);self.assertEqual(self.saved_state()['state'],'rolling_back')
+  self.assertTrue(self.saved_state().get('recovery_error'));self.assertFalse(self.saved_state().get('installer_quiesced',False))
+ def test_signal_success_without_installer_exit_prevents_rollback_apk(self):
+  self.crash_recovery_after_publication_before_installer_signal();self.kill_exits=False;self.sleep_advances=True
+  with self.other_process(789):
+   try:self.recover('auto')
+   except Exception:pass
+  self.assertEqual(self.killed,[(-123,9)]);self.assertEqual(self.apk_installs(),[])
+  self.assertGreater(self.sleep_count,0);self.assertLessEqual(self.sleep_count,250)
+  self.assertIn('/proc/123/stat',self.h.files);self.assertEqual(self.saved_state()['state'],'rolling_back')
+  self.assertTrue(self.saved_state().get('recovery_error'));self.assertFalse(self.saved_state().get('installer_quiesced',False))
+ def test_live_installer_descendant_blocks_old_apk_after_leader_signal(self):
+  self.crash_recovery_after_publication_before_installer_signal()
+  self.h.files['/proc/124/stat']=self.proc_stat(124,'12445',group=123,state='D')
+  self.stubborn_pids.add(124);self.sleep_advances=True
+  with self.other_process(789):
+   try:self.recover('auto')
+   except Exception:pass
+  self.assertEqual(self.killed,[(-123,9)]);self.assertNotIn('/proc/123/stat',self.h.files)
+  self.assertIn('/proc/124/stat',self.h.files);self.assertEqual(self.apk_installs(),[])
+  self.assertNotEqual(self.saved_state()['state'],'rolled_back');self.assertLessEqual(self.sleep_count,250)
+ def test_orphaned_installer_group_is_not_blindly_killed_or_overwritten(self):
+  self.crash_recovery_after_publication_before_installer_signal()
+  self.h.files.pop('/proc/123/stat',None)
+  self.h.files['/proc/124/stat']=self.proc_stat(124,'12445',group=123)
+  self.sleep_advances=True
+  with self.other_process(789):
+   try:self.recover('auto')
+   except Exception:pass
+  self.assertEqual(self.killed,[]);self.assertIn('/proc/124/stat',self.h.files)
+  self.assertEqual(self.apk_installs(),[]);self.assertNotEqual(self.saved_state()['state'],'rolled_back')
+ def test_only_zombie_or_dead_installer_descendants_allow_old_apk(self):
+  self.crash_recovery_after_publication_before_installer_signal()
+  self.h.files.pop('/proc/123/stat',None)
+  self.h.files['/proc/124/stat']=self.proc_stat(124,'12445',group=123,state='Z')
+  self.h.files['/proc/125/stat']=self.proc_stat(125,'12545',group=123,state='X')
+  with self.other_process(789):self.assertTrue(self.recover('auto'))
+  self.assertEqual(self.killed,[]);self.assertEqual(self.saved_state()['state'],'rolled_back')
+  self.assertEqual(len(self.apk_installs()),1)
+ def dead_recovery_with_orphan(self,child_state='S',old_boot='boot-a'):
+  s=self.state();s.state='rolling_back';s.boot=old_boot
+  s.recovery=self.h.to_lua({'pid':456,'start':'45645','boot':old_boot,'pgid':456});self.save_state(s)
+  self.h.files.pop('/proc/123/stat',None);self.h.files.pop('/proc/456/stat',None)
+  self.h.files['/proc/457/stat']=self.proc_stat(457,'45745',group=456,state=child_state)
+  return s
+ def test_dead_recovery_owner_orphan_apk_blocks_all_restore_mutation(self):
+  self.dead_recovery_with_orphan()
+  with self.other_process(789):self.assertTrue(self.recover('auto'))
+  self.assertEqual(self.killed,[]);self.assertEqual(self.apk_installs(),[])
+  self.assertFalse(any(cmd.startswith('tar ')for cmd in self.calls))
+  self.assertEqual(self.saved_state()['recovery']['pid'],456)
+  # Once the old APK has exited, the next independent worker can resume.
+  self.h.files.pop('/proc/457/stat')
+  with self.other_process(789):self.assertTrue(self.recover('auto'))
+  self.assertEqual(self.killed,[]);self.assertEqual(self.saved_state()['state'],'rolled_back')
+  self.assertEqual(len(self.apk_installs()),1)
+ def test_dead_recovery_owner_stopped_orphan_is_not_killed(self):
+  self.dead_recovery_with_orphan(child_state='T')
+  with self.other_process(789):self.assertTrue(self.recover('auto'))
+  self.assertEqual(self.killed,[]);self.assertEqual(self.apk_installs(),[])
+  self.assertFalse(any(cmd.startswith('tar ')for cmd in self.calls))
+  self.assertEqual(self.saved_state()['recovery']['pid'],456)
+ def test_recovery_group_number_from_previous_boot_does_not_block(self):
+  self.dead_recovery_with_orphan(old_boot='previous-boot')
+  with self.other_process(789):self.assertTrue(self.recover('auto'))
+  self.assertEqual(self.killed,[]);self.assertIn('/proc/457/stat',self.h.files)
+  self.assertEqual(self.saved_state()['state'],'rolled_back');self.assertEqual(len(self.apk_installs()),1)
+ def test_zombie_recovery_descendant_does_not_block(self):
+  self.dead_recovery_with_orphan(child_state='Z')
+  with self.other_process(789):self.assertTrue(self.recover('auto'))
+  self.assertEqual(self.killed,[]);self.assertEqual(self.saved_state()['state'],'rolled_back')
+ def test_recover_worker_dispatch_isolates_session_before_claim(self):
+  s=self.state();s.deadline=900;self.save_state(s)
+  self.h.files['/proc/789/stat']=self.proc_stat(789,'78945',group=600)
+  with self.other_process(789):self.assertEqual(self.run_mode('recover-worker'),0)
+  self.assertEqual(self.setsid_calls,[789]);self.assertEqual(self.saved_state()['recovery']['pgid'],789)
+  self.assertEqual(self.saved_state()['state'],'rolled_back')
+ def test_manual_rollback_dispatch_isolates_session_before_claim(self):
+  s=self.state();s.state='committed';self.save_state(s)
+  self.h.files['/proc/789/stat']=self.proc_stat(789,'78945',group=600)
+  with self.other_process(789):self.assertEqual(self.run_mode('rollback'),0)
+  self.assertEqual(self.setsid_calls,[789]);self.assertEqual(self.saved_state()['recovery']['pgid'],789)
+  self.assertEqual(self.saved_state()['state'],'rolled_back')
+ def test_already_isolated_recovery_dispatch_does_not_repeat_setsid(self):
+  s=self.state();s.deadline=900;self.save_state(s)
+  with self.other_process(789):self.assertEqual(self.run_mode('recover-worker'),0)
+  self.assertEqual(self.setsid_calls,[]);self.assertEqual(self.saved_state()['recovery']['pgid'],789)
+ def test_session_isolation_failure_stops_before_any_recovery_write(self):
+  s=self.state();s.deadline=900;self.save_state(s);before=self.saved_state()
+  self.h.files['/proc/789/stat']=self.proc_stat(789,'78945',group=600);self.setsid_success=False
+  with self.other_process(789):
+   with self.assertRaises(Exception):self.run_mode('recover-worker')
+  self.assertEqual(self.saved_state(),before);self.assertEqual(self.killed,[]);self.assertEqual(self.apk_installs(),[])
+ def test_session_isolation_is_verified_not_just_return_code(self):
+  s=self.state();s.deadline=900;self.save_state(s);before=self.saved_state()
+  self.h.files['/proc/789/stat']=self.proc_stat(789,'78945',group=600);self.setsid_changes_group=False
+  with self.other_process(789):
+   with self.assertRaises(Exception):self.run_mode('recover-worker')
+  self.assertEqual(self.saved_state(),before);self.assertEqual(self.killed,[]);self.assertEqual(self.apk_installs(),[])
 if __name__=='__main__':unittest.main()

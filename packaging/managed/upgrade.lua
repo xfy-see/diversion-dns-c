@@ -118,6 +118,46 @@ local function worker_failed(s)
  local status=text:match('^%d+ %b() (%S+)')
  return status=='T'or status=='t'or status=='Z'or status=='X'
 end
+-- A stopped recovery owner is still alive: never kill it or its APK children.
+local function process_live(identity)
+ if not identity or identity.boot~=boot()or not identity.pid or not identity.start or starttime(identity.pid)~=identity.start then return false end
+ local text=read('/proc/'..identity.pid..'/stat');local status=text and text:match('^%d+ %b() (%S+)')
+ return status and status~='Z'and status~='X'
+end
+local function group_live(pgid)
+ for pid in assert(F.dir('/proc'),'cannot inspect process groups')do
+  if pid:match('^%d+$')then
+   local text=read('/proc/'..pid..'/stat')
+   local status,group;if text then status,group=text:match('^%d+ %b() (%S+) %S+ (%S+)')end
+   if tonumber(group)==pgid and status~='Z'and status~='X'then return true end
+  end
+ end
+ return false
+end
+local function process_group(pid)
+ local text=read('/proc/'..pid..'/stat')
+ return text and tonumber(text:match('^%d+ %b() %S+ %S+ (%S+)'))
+end
+local function isolate_recovery()
+ local pid=N.getpid()
+ if process_group(pid)~=pid then assert(N.setsid(),'cannot isolate recovery session')end
+ assert(process_group(pid)==pid,'recovery session is not isolated')
+end
+local function stop_installer(s)
+ if s.boot~=boot()or not s.pid or s.pid==N.getpid()then return end
+ local started=starttime(s.pid)
+ -- A recycled PID must never be signalled. A surviving process group keeps
+ -- its old group ID allocated, so a different leader identity is unrelated.
+ if started and started~=s.start then return end
+ if process_live(s)then assert(N.kill(-s.pid,9),'cannot stop original installer')end
+ -- A dead leader may leave a shell/APK child. Do not blindly signal an
+ -- ownerless group; wait for it to drain before touching configs or APK.
+ for _=1,40 do
+  if not process_live(s)and not group_live(s.pid)then return end
+  N.nanosleep(0,50000000)
+ end
+ error('original installer process group has not stopped')
+end
 -- One kernel-owned lock covers preparation, state transitions, commit and
 -- the entire rollback. Never unlink it: unlinking permits two lock inodes.
 -- lockf locks are released by the kernel on process exit, including SIGKILL.
@@ -193,12 +233,22 @@ local function recover(reason,failure)
    if s.state~='rolling_back'and s.boot==boot()and now()<s.deadline and not worker_failed(s)then return true,'waiting'end
   elseif reason=='failure'then assert(s.state=='installing'and owns(s),'failure from stale worker')
   else error('invalid recovery reason')end
-  local previous=s.state
+  local previous=s.state;local old_recovery=s.recovery
+  if previous=='rolling_back'and old_recovery and old_recovery.pid~=N.getpid()then
+   if process_live(old_recovery)then return true,'waiting'end
+   -- A killed recovery leader can leave its shell/APK running. Its dedicated
+   -- session lets us wait without signalling the procd loop or descendants.
+   if old_recovery.boot==boot()and old_recovery.pgid and old_recovery.pgid==old_recovery.pid and group_live(old_recovery.pgid)then return true,'waiting'end
+  end
   -- Publish recovery ownership before considering the previous installer.
   -- Holding the lock through APK means other recovery requests only wait.
-  s.state='rolling_back';s.recovery={pid=N.getpid(),start=starttime(N.getpid()),boot=boot()}
+  s.state='rolling_back';s.recovery={pid=N.getpid(),start=starttime(N.getpid()),boot=boot(),pgid=process_group(N.getpid())==N.getpid()and N.getpid()or nil}
   s.failure=failure or s.failure;save(statefile,s);save(active,{root=root})
-  if previous~='rolling_back'and s.boot==boot()and s.pid and s.pid~=N.getpid()and s.start==starttime(s.pid)then N.kill(-s.pid,9);N.nanosleep(1)end
+  -- Claim publication can survive a crash BEFORE the original installer is
+  -- stopped. Every takeover must re-establish quiescence, even rolling_back.
+  local quiet,quiet_error=pcall(stop_installer,s)
+  if not quiet then s.recovery_error=tostring(quiet_error);save(statefile,s);return false,'installer-busy'end
+  s.installer_quiesced=true;s.recovery_error=nil;save(statefile,s)
   local ok,err=pcall(function()
    hook_locks_clear();local args=simulate('old',true)
    -- Restore valid application config before invoking old installation hooks.
@@ -221,8 +271,8 @@ if mode=='recover'then
  if read(active)then must('/root/diversion-upgrade/recovery/diversion-dns-upgrade-recovery start')end
  os.exit(0)
 end
-if mode=='recover-worker'then assert(recover('auto'),'rollback failed');os.exit(0)end
-if mode=='rollback'then assert(recover('manual'),'rollback failed');print(J.stringify(load(statefile)));os.exit(0)end
+if mode=='recover-worker'then isolate_recovery();assert(recover('auto'),'rollback failed');os.exit(0)end
+if mode=='rollback'then isolate_recovery();assert(recover('manual'),'rollback failed');print(J.stringify(load(statefile)));os.exit(0)end
 -- Preparation must succeed in full before any package/service mutation.
 local s,args=with_lock(function()
 assert(not F.stat(statefile),'transaction already exists')
@@ -263,7 +313,7 @@ local ready=false;for _=1,50 do if tonumber(read(root..'/ready')or'')==guardian 
 assert(ready,'guardian startup failed: no packages changed')
 local pid=detach(function()
  s=assert(with_worker_lock(function()
-  local t=load(statefile);assert(t.state=='prepared','transaction no longer prepared')
+  local t=load(statefile);assert(t.state=='prepared','transaction no longer prepared');assert(now()<t.deadline,'deadline expired before installation')
   t.pid=N.getpid();t.start=starttime(t.pid);t.state='installing';save(statefile,t);return t
  end),'recovery in progress')
  local ok,err=pcall(function()
