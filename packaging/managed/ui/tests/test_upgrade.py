@@ -14,7 +14,7 @@ class Upgrade(unittest.TestCase):
   h.files['/etc/diversion-dns-ui/profile.json']=json.dumps({'dns_host':'127.0.0.1','dns_port':15353})
   h.lua.globals().UP_RUN=self.command;h.lua.globals().arg=h.to_lua({0:'/usr/libexec/diversion-dns-upgrade',1:ROOT,2:'start'})
   h.lua.execute("require('nixio').getuid=function()return 0 end;local f=require('nixio.fs');f.chmod=function(p,m)assert(m=='600');return true end;f.lstat=function(p)return {type=p:match('%.apk$') and 'reg' or 'dir',uid=0,modestr='rwx------'}end;dofile=function()return {dns_query=function()return {ok=true,answers={{address='192.0.2.1'}}}end}end")
-  s=SOURCE;start=s.index('local function run(cmd)');end=s.index('local function must(',start);s=s[:start]+'local function run(cmd)return UP_RUN(cmd)end\n'+s[end:];s=s[:s.index("if mode=='status'")]+"return {packages=packages,simulate=simulate,installed=installed,health=health,recover=recover}"
+  s=SOURCE;start=s.index('local function run(cmd)');end=s.index('local function must(',start);s=s[:start]+'local function run(cmd)return UP_RUN(cmd)end\n'+s[end:];s=s[:s.index("if mode=='status'")]+"return {packages=packages,simulate=simulate,installed=installed,health=health,recover=recover,runtime_files=runtime_files}"
   self.api=h.lua.execute(s)
  def command(self,cmd):
   self.calls.append(cmd);a=shlex.split(cmd)
@@ -31,6 +31,20 @@ class Upgrade(unittest.TestCase):
   if a[0]=='tar':return '',0
   raise AssertionError(cmd)
  def state(self):return self.h.to_lua({'running':{'diversion-dns':True,'diversion-dns-ui':True},'protected':{p:'d'*64 for p in ['/etc/config/network','/etc/config/firewall','/etc/config/dhcp']},'configs':{'/etc/config/diversion-dns':'d'*64}})
+ def test_warm_file_is_recorded_as_mutable_not_all_config_files(self):
+  self.h.files['/etc/demo/config.conf']='cache_warm_file=/etc/demo/warm.txt\ncn_domain_file=/etc/demo/cn.txt\n'
+  self.assertEqual(self.h.to_py(self.api.runtime_files('/etc/demo/config.conf')),{'/etc/demo/warm.txt':True})
+ def test_no_warm_file_keeps_every_config_immutable(self):
+  self.h.files['/etc/demo/config.conf']='cn_domain_file=/etc/demo/cn.txt\n'
+  self.assertEqual(self.h.to_py(self.api.runtime_files('/etc/demo/config.conf')),{})
+ def test_warm_cannot_exempt_protected_config_or_static_inputs(self):
+  for path,extra in [('/etc/config/dhcp',''),('/etc/demo/config.conf',''),('/etc/demo/cn.txt','cn_domain_file=/etc/demo/cn.txt'),('/etc/demo/keep.txt','cache_keep_file=/etc/demo/keep.txt'),('/etc/demo/stale.txt','cache_stale_override=0:/etc/demo/stale.txt')]:
+   self.h.files['/etc/demo/config.conf']='cache_warm_file='+path+'\n'+extra+'\n'
+   with self.assertRaises(Exception):self.api.runtime_files('/etc/demo/config.conf')
+ def test_ambiguous_or_noncanonical_warm_paths_refused(self):
+  for value in ['warm.txt','/etc/demo/../config/dhcp','/etc//demo/warm.txt','/etc/demo/./warm.txt','/etc/demo/.','/etc/demo/warm.txt\ncache_warm_file=/etc/demo/other.txt']:
+   self.h.files['/etc/demo/config.conf']='cache_warm_file='+value+'\n'
+   with self.assertRaises(Exception):self.api.runtime_files('/etc/demo/config.conf')
  def test_verified_pair_prepares_without_service_mutation(self):
   self.api.packages('old');self.api.simulate('new');self.api.installed('old');self.assertFalse(any('/etc/init.d/'in x for x in self.calls));self.assertFalse(any(x.startswith('apk add')and'--simulate'not in x for x in self.calls))
  def test_bad_digest_rejected_before_install(self):

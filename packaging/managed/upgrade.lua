@@ -48,6 +48,28 @@ local function simulate(side)
   if action then assert((name=='diversion-dns-c'or name=='luci-app-diversion-dns')and(action=='Installing'or action=='Upgrading'or action=='Downgrading'or action=='Reinstalling'),'unexpected APK plan: '..line)end
  end;return args
 end
+-- Warm names are runtime output, not immutable configuration. Keep them in
+-- the archive, but do not treat a normal shutdown/save as configuration drift.
+local function runtime_files(cfg)
+ local values={};for line in (assert(read(cfg),'missing live config')..'\n'):gmatch('([^\n]*)\n')do
+  local key,value=line:match('^%s*([%w_]+)%s*=%s*(.-)%s*$')
+  if key then values[key]=values[key]or{};values[key][#values[key]+1]=value end
+ end
+ local warm=values.cache_warm_file;if not warm or #warm==0 or warm[1]==''then return {}end
+ assert(#warm==1,'ambiguous warm-file path');warm=warm[1]
+ -- Refuse aliases rather than accidentally exempt another configuration file.
+ assert(warm:sub(1,1)=='/'and not warm:find('//',1,true)and not warm:find('/%./')and not warm:find('/%.%./')and not warm:match('/%.%.?$'),'warm-file path must be absolute and normalized')
+ assert(warm~=cfg and warm:sub(1,12)~='/etc/config/','warm-file overlaps protected configuration')
+ for key,entries in pairs(values)do
+  if key=='cn_domain_file'or key=='cache_keep_file'or key=='cache_stale_override'then
+   for _,value in ipairs(entries)do
+    if key=='cache_stale_override'then value=value:match('^%d+:(.+)$')or value end
+    assert(value~=warm,'warm-file overlaps a static input')
+   end
+  end
+ end
+ return {[warm]=true}
+end
 local protected={'/etc/config/network','/etc/config/firewall','/etc/config/dhcp'}
 local function check_protected(s)for _,p in ipairs(protected)do assert(hash(p)==s.protected[p],'protected network/DHCP configuration changed')end end
 local function health(s)
@@ -108,7 +130,8 @@ assert(cfg:match('^/etc/[%w_%-]+/config%.conf$'),'unsupported live config path')
 local list={};for _,p in ipairs(paths)do if F.stat('/'..p)then list[#list+1]=q(p)end end
 must('tar -czpf '..q(root..'/configs.tar.gz')..' -C / '..table.concat(list,' '))
 local hashes=must('find '..table.concat(list,' '):gsub("'etc/","'/etc/")..' -type f -exec sha256sum {} \\;')
-for digest,path in hashes:gmatch('([a-f0-9]+)%s+([^\n]+)')do s.configs[path]=digest end
+s.runtime_files=runtime_files(cfg)
+for digest,path in hashes:gmatch('([a-f0-9]+)%s+([^\n]+)')do if not s.runtime_files[path]then s.configs[path]=digest end end
 assert(type(arg[0])=='string'and arg[0]:sub(1,1)=='/','invoke guard by absolute path');must('cp '..q(arg[0])..' '..q(root..'/guard.lua'));save(statefile,s);save(active,{root=root})
 return s,args
 end)
