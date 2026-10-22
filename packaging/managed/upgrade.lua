@@ -8,7 +8,7 @@ local mode=arg[2];assert(not arg[3]and(mode=='start'or mode=='status'or mode=='r
 local function q(s)return "'"..tostring(s):gsub("'","'\\''").."'"end
 local function read(p)local f=io.open(p);if not f then return nil end;local s=f:read(2097153);f:close();assert(#s<=2097152,'file too large');return s end
 local function load(p)return J.parse(assert(read(p),'missing '..p))end
-local function save(p,v)local f=assert(io.open(p..'.new','w'));f:write(J.stringify(v));assert(f:close());assert(F.chmod(p..'.new',384));assert(os.rename(p..'.new',p))end
+local function save(p,v)local f=assert(io.open(p..'.new','w'));f:write(J.stringify(v));assert(f:close());assert(F.chmod(p..'.new','600'));assert(os.rename(p..'.new',p))end
 local function run(cmd)local f=assert(io.popen('('..cmd..") 2>&1; printf '\nRC=%s\n' \"$?\""));local s=f:read(2097153)or'';f:close();assert(#s<=2097152,'command output too large');local b,rc=s:match('^(.*)\nRC=(%d+)\n$');return b or'',tonumber(rc)or 255 end
 local function must(cmd)local b,rc=run(cmd);assert(rc==0,'command failed: '..cmd..'\n'..b:sub(-2000));return b end
 local function hash(path)return must('sha256sum '..q(path)):match('^([a-f0-9]+)')end
@@ -16,7 +16,7 @@ local function now()return tonumber(assert(read('/proc/uptime')):match('^[%d.]+'
 local function boot()return read('/proc/sys/kernel/random/boot_id')end
 local names={'diversion-dns-c','luci-app-diversion-dns'};local services={'diversion-dns','diversion-dns-ui'}
 local statefile=root..'/state.json';local plan=load(root..'/plan.json')
-local function secure(path)local s=assert(F.lstat(path),'missing protected path');assert(s.type=='dir'and s.uid==0 and s.mode%512==448,'transaction path must be root-only directory')end
+local function secure(path)local s=assert(F.lstat(path),'missing protected path');assert(s.type=='dir'and s.uid==0 and s.modestr=='rwx------','transaction path must be root-only directory')end
 secure('/root/diversion-upgrade');secure(root)
 local function packages(side)
  local p=assert(plan[side]);assert(type(p.version)=='string'and p.version:match('^[%w._~+%-]+$'),'invalid package version');assert(type(p.source_commit)=='string'and #p.source_commit==40 and p.source_commit:match('^[a-f0-9]+$'),'invalid commit')
@@ -59,7 +59,7 @@ local function health(s)
  local ui=J.parse(must('/usr/libexec/diversion-dns-ui-status'));assert(ui and ui.selected,'UI status failed');check_protected(s)
 end
 local function recover(s)
- assert(F.mkdir(root..'/recovery-lock',448),'recovery already running')
+ assert(F.mkdir(root..'/recovery-lock','700'),'recovery already running')
  s.state='rolling_back';save(statefile,s)
  local ok,err=pcall(function()
   local args=simulate('old');must('apk add --wait 10 --allow-untrusted --no-network '..args)
@@ -87,7 +87,7 @@ assert(not F.stat(active),'another upgrade or recovery is pending')
 local route=read('/etc/diversion-dns-ui/transaction.json')and load('/etc/diversion-dns-ui/transaction.json')
 assert(not route or route.state=='committed'or route.state=='rolled_back','routing transaction pending')
 -- Preparation must succeed in full before any package/service mutation.
-assert(F.mkdir('/var/lock/diversion-upgrade',448),'another upgrade is preparing; inspect preparation lock before retry')
+assert(F.mkdir('/var/lock/diversion-upgrade','700'),'another upgrade is preparing; inspect preparation lock before retry')
 local prepared,s,args=pcall(function()
 installed('old');local args=simulate('new');packages('old')
 local s={state='prepared',running={},protected={},configs={},boot=boot(),deadline=now()+120,started=os.time()}

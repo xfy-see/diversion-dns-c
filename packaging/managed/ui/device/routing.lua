@@ -6,7 +6,7 @@ local P=dofile(B..'/public-status.lua')
 local function quote(s)return "'"..tostring(s):gsub("'","'\\''").."'"end
 local function read(p)local f=io.open(p);if not f then return nil end;local s=f:read(131073);f:close();assert(#s<=131072,'oversized state');return s end
 local function load(p)local s=read(p);return s and assert(J.parse(s),'invalid state JSON') or nil end
-local function save(p,v)local f=assert(io.open(p..'.new','w'));f:write(assert(J.stringify(v)));assert(f:close());assert(F.chmod(p..'.new',384));assert(os.rename(p..'.new',p))end
+local function save(p,v)local f=assert(io.open(p..'.new','w'));f:write(assert(J.stringify(v)));assert(f:close());assert(F.chmod(p..'.new','600'));assert(os.rename(p..'.new',p))end
 local function run(c)local f=assert(io.popen('('..c..") 2>&1; printf '\nRC=%s\n' \"$?\""));local s=f:read(131073)or'';f:close();assert(#s<=131072,'oversized command response');local b,r=s:match('^(.*)\nRC=(%d+)\n$');return b or'',tonumber(r)or 255 end
 local function uptime()return assert(tonumber((read('/proc/uptime')or''):match('^[%d.]+')),'no monotonic clock')end
 local function boot()return read('/proc/sys/kernel/random/boot_id')end
@@ -101,7 +101,7 @@ local function identity(pid)local s=read('/proc/'..pid..'/stat');return s and s:
 local function process_start(pid)local s=identity(pid);if not s then return nil end;local i=0;for value in s:gmatch('%S+')do i=i+1;if i==20 then return value end end end
 local function release()os.remove(R..'/route-lock/identity');os.remove(R..'/route-lock/pid');F.rmdir(R..'/route-lock')end
 local function mutex(role)
- F.mkdir(R,448);if not F.mkdir(R..'/route-lock',448)then error('routing operation already running')end
+ F.mkdir(R,'700');if not F.mkdir(R..'/route-lock','700')then error('routing operation already running')end
  local f=assert(io.open(R..'/route-lock/pid','w'));f:write(N.getpid());f:close();save(R..'/route-lock/identity',{pid=N.getpid(),start=process_start(N.getpid()),role=role or 'preparing'})
 end
 function M.recover()

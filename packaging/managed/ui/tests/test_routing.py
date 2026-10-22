@@ -13,7 +13,7 @@ class Routing(unittest.TestCase):
   h.files[D+'/routing.json']=json.dumps(self.c);h.files['/proc/uptime']='1000.0 300.0';h.files['/proc/sys/kernel/random/boot_id']='boot-a'
   self.peers={A:['0.0.0.0/0','::/0','10.0.0.1/32'],B:['10.0.0.2/32'],U:['10.0.0.3/32']};self.badroute=False;self.ip={4:'198.51.100.2',6:'2001:db8::2'}
   h.lua.globals().ROUTE_RUN=self.run
-  h.lua.execute("require('nixio.fs').chmod=function()return true end;dofile=function()return {canonical_ip=function(ip,af)if type(ip)~='string'then return nil end;if af==4 and ip:match('^%d+%.%d+%.%d+%.%d+$')then return ip end;if af==6 and ip:find(':',1,true)then return ip end end}end")
+  h.lua.execute("require('nixio.fs').chmod=function(p,m)assert(m=='600');return true end;dofile=function()return {canonical_ip=function(ip,af)if type(ip)~='string'then return nil end;if af==4 and ip:match('^%d+%.%d+%.%d+%.%d+$')then return ip end;if af==6 and ip:find(':',1,true)then return ip end end}end")
   s=S.read_text();start=s.index('local function run(c)');end=s.index('local function uptime()',start);self.api=h.lua.execute(s[:start]+'local function run(c)return ROUTE_RUN(c)end\n'+s[end:]);self.t=self.api._test
  def run(self,cmd):
   # unittest also has run(); dispatch TestResult to superclass.
