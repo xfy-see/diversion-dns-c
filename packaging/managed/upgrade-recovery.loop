@@ -1,0 +1,9 @@
+#!/bin/sh
+# Runs independently of the UI service and survives package downgrade/removal.
+umask 077
+trap '' HUP
+while [ -s /root/diversion-upgrade/active.json ]; do
+ /bin/sh /root/diversion-upgrade/recovery/dispatch
+ [ -s /root/diversion-upgrade/active.json ] || break
+ sleep 5
+done

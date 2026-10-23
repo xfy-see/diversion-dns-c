@@ -1,0 +1,69 @@
+#!/bin/sh
+# Stage a package-independent boot recovery entry before an upgrade is published.
+set -eu
+[ "$(id -u)" = 0 ] || { echo 'root required' >&2; exit 1; }
+[ "$#" = 1 ] || exit 1
+base=/root/diversion-upgrade
+saved=$base/recovery
+entry=/etc/rc.d/S93diversion-dns-upgrade-recovery
+init=$saved/diversion-dns-upgrade-recovery
+case "$1" in prepare|start) ;; *) exit 1;; esac
+path_metadata() {
+ # BusyBox stat is optional on OpenWrt; nixio is already required by the guard.
+ # lstat checks the path itself, so symbolic links never satisfy dir/reg.
+ /usr/bin/lua - "$1" <<'LUA'
+local s=require('nixio.fs').lstat(arg[1])
+if not s then os.exit(1) end
+io.write(string.format('%d:%s:%s',s.uid,s.type,s.modestr))
+LUA
+}
+secure_dir() { [ "$(path_metadata "$1")" = 0:dir:rwx------ ]; }
+regular_root() { case "$(path_metadata "$1")" in 0:reg:*) return 0;; *) return 1;; esac; }
+secure_dir "$base" || { echo 'unsafe upgrade root' >&2; exit 1; }
+verify_saved() {
+ secure_dir "$saved" && regular_root "$saved/SHA256SUMS" || return 1
+ # Never feed an arbitrary manifest path to sha256sum; require exactly our files.
+ [ "$(wc -l < "$saved/SHA256SUMS")" -eq 3 ] || return 1
+ for name in diversion-dns-upgrade-recovery loop dispatch; do
+  [ "$(path_metadata "$saved/$name")" = 0:reg:rwx------ ] || return 1
+  digest=$(sha256sum "$saved/$name"); digest=${digest%% *}
+  [ "$(grep -Fxc "$digest  $name" "$saved/SHA256SUMS")" = 1 ] || return 1
+ done
+ # Unknown files may be administrator changes. Refuse rather than overwrite.
+ [ "$(find "$saved" -mindepth 1 -maxdepth 1 | wc -l)" -eq 4 ] || return 1
+}
+verify_entry() {
+ [ -L "$entry" ] && [ "$(readlink "$entry")" = "$init" ]
+}
+if [ "$1" = start ]; then
+ verify_saved && verify_entry || { echo 'boot recovery not prepared' >&2; exit 1; }
+ exec "$init" start
+fi
+# Caller holds its global preparation lock; do not alter an active transaction.
+[ ! -e "$base/active.json" ] || { echo 'upgrade already active' >&2; exit 1; }
+source=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+for suffix in init loop dispatch; do
+ regular_root "$source/diversion-dns-upgrade-recovery.$suffix" || { echo 'missing verified bootstrap source' >&2; exit 1; }
+done
+if [ -e "$entry" ] || [ -L "$entry" ]; then
+ verify_entry || { echo 'unknown boot entry; refusing overwrite' >&2; exit 1; }
+fi
+if [ -e "$saved" ] || [ -L "$saved" ]; then
+ verify_saved || { echo 'modified boot recovery; inspect before retry' >&2; exit 1; }
+ # An existing installation is reused only if it matches this verified bundle.
+ cmp -s "$source/diversion-dns-upgrade-recovery.init" "$init"
+ cmp -s "$source/diversion-dns-upgrade-recovery.loop" "$saved/loop"
+ cmp -s "$source/diversion-dns-upgrade-recovery.dispatch" "$saved/dispatch"
+else
+ umask 077
+ staging=$base/recovery.new
+ mkdir -m 700 "$staging" || { echo 'bootstrap staging exists; inspect before retry' >&2; exit 1; }
+ cp "$source/diversion-dns-upgrade-recovery.init" "$staging/diversion-dns-upgrade-recovery"
+ cp "$source/diversion-dns-upgrade-recovery.loop" "$staging/loop"
+ cp "$source/diversion-dns-upgrade-recovery.dispatch" "$staging/dispatch"
+ chmod 700 "$staging/diversion-dns-upgrade-recovery" "$staging/loop" "$staging/dispatch"
+ (cd "$staging" && sha256sum diversion-dns-upgrade-recovery loop dispatch > SHA256SUMS)
+ mv "$staging" "$saved"
+fi
+if [ ! -L "$entry" ]; then ln -s "$init" "$entry"; fi
+verify_saved && verify_entry

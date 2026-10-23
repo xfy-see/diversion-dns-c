@@ -1,0 +1,8 @@
+#!/bin/sh
+# The old guard is copied outside package-owned paths before replacement.
+test -s /root/diversion-upgrade/active.json || exit 0
+root=$(jsonfilter -i /root/diversion-upgrade/active.json -e '@.root')
+case "$root" in /root/diversion-upgrade/*) ;; *) exit 1;; esac
+id=${root#/root/diversion-upgrade/}
+case "$id" in ''|*[!A-Za-z0-9_-]*) exit 1;; esac
+exec /usr/bin/lua "$root/guard.lua" "$root" recover-worker

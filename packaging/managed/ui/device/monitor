@@ -2,6 +2,7 @@
 umask 077
 mkdir -p /var/run/diversion-dns-ui
 while :; do
+ /usr/libexec/diversion-dns-upgrade-recover >/dev/null 2>&1
  /usr/libexec/diversion-dns-ui-control collect >/dev/null 2>&1
  sleep 20
 done

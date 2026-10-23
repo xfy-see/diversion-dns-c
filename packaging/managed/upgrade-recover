@@ -1,0 +1,5 @@
+#!/bin/sh
+# Request a separate procd worker. Never perform rollback in the UI monitor's
+# process tree: rollback may restart that UI service and kill its descendants.
+test -s /root/diversion-upgrade/active.json || exit 0
+exec /root/diversion-upgrade/recovery/diversion-dns-upgrade-recovery start

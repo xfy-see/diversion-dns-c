@@ -1,4 +1,4 @@
--- Device-scoped observation adapter. Never writes network/DNS/firewall configuration.
+-- Observation by default; explicit local routing profile enables guarded peer switching.
 local J=require('luci.jsonc');local N=require('nixio');local F=require('nixio.fs')
 local B='/usr/share/diversion-dns-ui';local R='/var/run/diversion-dns-ui'
 local M={};local Q=dofile(B..'/query.lua');local T=dofile(B..'/telemetry.lua')
@@ -27,9 +27,17 @@ local function profile()
  assert(p.selected==(p.kind=='local' and 'wg0' or p.kind=='listener' and 'upstream' or 'unmanaged'),'invalid selected mode')
  return p
 end
+local function routing()
+ if not read('/etc/diversion-dns-ui/routing.json')then return nil end
+ return dofile(B..'/routing.lua')
+end
 local function action_map()
  local a={};for _,k in ipairs({'switch-aws','switch-nobrand','switch-usss','switch-usvless'})do a[k]={allowed=false,reason='本设备未部署该受管出口；保留现有网络配置'}end
  for _,k in ipairs({'rollback','rescue','recover','retry-recovery'})do a[k]={allowed=false,reason='本设备未部署 PNW 事务回退与应急恢复机制；不套用主路由规则'}end
+ local router=routing();local r=router and router.status()
+ if r and r.enabled then
+  for _,k in ipairs({'switch-aws','switch-nobrand','rollback'})do a[k]={allowed=not r.pending,reason=r.pending and '存在待恢复事务' or nil}end
+ end
  a.check={allowed=true};a.diagnose={allowed=true};return a
 end
 local function busy()
@@ -56,6 +64,15 @@ function M.status()
   current.topology_verified=type(p.policy_fingerprint)=='string' and #p.policy_fingerprint==64 and policy_fingerprint()==p.policy_fingerprint
   if not current.topology_verified then current.mode_text='现有策略与已验证快照不同；分流规则需要重新核对'end
  end
+ local router=routing();local rs=router and router.status()
+ if rs and rs.enabled then
+  current.routing=rs;current.configured_selected=rs.runtime.configured_selected;current.selected=rs.runtime.selected;current.exit_names.aws='AWS';current.exit_names.nobrand='NoBrand';current.topology_verified=rs.runtime.ok;current.pending=rs.pending;current.running=current.running or rs.pending;current.previous_exit=rs.previous_exit or J.null
+  current.mode_text=rs.scope;current.control_note='仅操作显式配置的两个 WireGuard 默认 peer；验证失败自动回退。'
+  -- luci.jsonc serializes repeated table references as null; own the probe once.
+  if rs.public_exit then current.public_exit=rs.public_exit;rs.public_exit=nil end
+  if rs.transaction then current.last={action='switch-'..(rs.transaction.target or ''),state=rs.transaction.state,message=rs.transaction.message,time=rs.transaction.finished}end
+  if not rs.runtime.ok then current.health={ok=false,selected=current.selected,finished=os.time(),checks={runtime_selection=false},details={runtime_selection={ok=false,error='配置选择与运行 peer / 路由不一致'}}}end
+ elseif rs and rs.error then current.control_note='路由控制配置无效：'..rs.error end
  return current
 end
 local function classify(p,name)
@@ -148,25 +165,43 @@ function M.diagnose()
 end
 function M.main(args)
  local mode=args[1];if mode=='status'then return M.status()end
- if mode=='collect'then return {ok=dofile(B..'/window.lua').collect()}end
+ if mode=='collect'then local router=routing();if router then pcall(router.recover)end;return {ok=dofile(B..'/window.lua').collect()}end
  if mode=='query'then assert(not args[4],'unexpected arguments');return M.query(args[2],args[3] or 'router')end
- if mode=='start'then
-  local action=args[2];assert((action=='check' or action=='diagnose') and not args[3],'本设备未部署该控制能力，操作已拒绝')
+ if mode=='query-status'then
+  local id=args[2];assert(type(id)=='string' and #id<64 and id:match('^%d+%-%d+$') and not args[3],'invalid query id')
+  local task=load(R..'/query.json');assert(task.id==id,'查询结果已被替换或不存在，请重新查询')
+  if task.state=='running' and (not busy() or os.time()-(task.started or 0)>120)then
+   return {id=id,state='failed',error=busy() and '查询超过 120 秒；后台任务结束前不会启动重复查询' or '查询工作进程已退出，未产生结果'}
+  end
+  return task
+ end
+ if mode=='start' or mode=='query-start'then
+  local action=mode=='query-start' and 'query' or args[2];local router=routing();local input,source,id
+  if action=='query' then
+   assert(mode=='query-start' and not args[4],'unexpected query arguments')
+   local why;input,why=Q.validate_input(args[2]);assert(input,why);source=args[3] or 'router'
+   assert(source=='router' or source=='lan','本设备仅支持本机和普通 LAN 新连接推断')
+   profile();id=tostring(os.time())..'-'..tostring(N.getpid())
+  end
+  if router and action and (action:match('^switch%-')or action=='rollback')then assert(not args[3],'unexpected arguments');return router.start(action)end
+  assert(action=='query' or ((action=='check' or action=='diagnose') and not args[3]),'本设备未部署该控制能力，操作已拒绝')
   F.mkdir(R,'700');local lock=R..'/lock'
   if F.stat(lock) and not busy()then os.remove(lock..'/pid');F.rmdir(lock)end
   assert(F.mkdir(lock,'700'),'已有检测或诊断任务正在运行')
   -- Reserve the lock with the live parent PID before fork; never clear a live task.
   local f=assert(io.open(lock..'/pid','w'));f:write(N.getpid());f:close()
+  if id then save(R..'/query.json',{id=id,state='running',started=os.time()})end
   local pid=N.fork();if not pid then os.remove(lock..'/pid');F.rmdir(lock);error('cannot start worker')end
   if pid==0 then
    N.setsid();local null=N.open('/dev/null','r+');if null then N.dup(null,N.stdout);N.dup(null,N.stderr);N.dup(null,N.stdin);null:close()end
    local f=assert(io.open(lock..'/pid','w'));f:write(N.getpid());f:close();local started=ms()
    save(R..'/last.json',{action=action,state='running',time=os.time()})
-   local ok,result=pcall(action=='check' and M.check or M.diagnose)
-   save(R..'/last.json',{action=action,state=ok and 'success' or 'failed',time=os.time(),duration_ms=ms()-started,message=ok and (action=='check' and (result.ok and '检测完成，全部项目通过' or '检测完成，有失败项；未更改网络') or '诊断已保存') or tostring(result):sub(1,300)})
+   local ok,result=pcall(function()if action=='query'then return M.query(input,source)elseif action=='check'then return M.check()else return M.diagnose()end end)
+   if id then save(R..'/query.json',{id=id,state=ok and 'complete' or 'failed',result=ok and result or nil,error=not ok and tostring(result):sub(1,300) or nil,finished=os.time()})end
+   save(R..'/last.json',{action=action,state=ok and 'success' or 'failed',time=os.time(),duration_ms=ms()-started,message=ok and (action=='query' and '查询完成' or action=='check' and (result.ok and '检测完成，全部项目通过' or '检测完成，有失败项；未更改网络') or '诊断已保存') or tostring(result):sub(1,300)})
    os.remove(lock..'/pid');F.rmdir(lock);os.exit(ok and 0 or 1)
   end
-  return {accepted=true}
+  return {accepted=true,query_id=id}
  end
  error('unsupported operation')
 end

@@ -1,5 +1,5 @@
 """Managed APK payload and lifecycle checks; no compiler or device access."""
-import importlib.util,json,re,subprocess,tempfile,unittest
+import importlib.util,json,re,subprocess,tempfile,unittest,os,signal,time
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 spec=importlib.util.spec_from_file_location('managed',ROOT/'scripts/managed-packages.py');M=importlib.util.module_from_spec(spec);spec.loader.exec_module(M)
@@ -15,6 +15,8 @@ class ManagedPackage(unittest.TestCase):
    self.assertEqual(core['etc/config/diversion-dns']['mode'],0o600)
    self.assertFalse(set(core)&set(ui))
    self.assertNotIn('usr/share/diversion-dns-ui/control.lua',ui)
+   for name in ['upgrade-arm','upgrade-recovery.init','upgrade-recovery.loop','upgrade-recovery.dispatch']:
+    self.assertEqual(ui['usr/libexec/diversion-dns-'+name]['mode'],0o755)
    self.assertNotIn('etc/config/network',core|ui);self.assertNotIn('etc/config/dhcp',core|ui)
    self.assertIn("option enabled '0'",(roots[M.CORE]/'etc/config/diversion-dns').read_text())
    self.assertIn("option enabled '0'",(roots[M.UI]/'etc/config/diversion-dns-ui').read_text())
@@ -87,6 +89,38 @@ class ManagedPackage(unittest.TestCase):
       subprocess.run(['sh','-c',script],check=True,capture_output=True)
      calls=(root/'calls').read_text().splitlines();self.assertEqual(calls,['running','stop','start'] if running else ['running'])
      self.assertFalse((root/f'var/run/{service}-package-upgrade').exists())
+ def test_guarded_package_hooks_leave_live_service_untouched(self):
+  for name in ['core','ui']:
+   with self.subTest(name=name),tempfile.TemporaryDirectory()as td:
+    root=Path(td);(root/'etc/init.d').mkdir(parents=True)
+    service='diversion-dns'if name=='core'else'diversion-dns-ui'
+    for daemon in [service,'rpcd']:
+     p=root/'etc/init.d'/daemon;p.write_text('#!/bin/sh\necho called >> "'+str(root/'calls')+'"\nexit 1\n');p.chmod(0o755)
+    for phase in ['pre-upgrade','post-upgrade']:
+     script=(ROOT/f'packaging/managed/hooks/{name}.{phase}').read_text()
+     script=re.sub(r'/(?:etc|var|tmp)/',lambda m:str(root)+m.group(),script)
+     subprocess.run(['sh','-c',script],check=True,capture_output=True,env=dict(os.environ,DIVERSION_DNS_GUARDED_UPGRADE='1'))
+    self.assertFalse((root/'calls').exists())
+ def test_killed_preupgrade_does_not_leave_a_lock_blocking_the_next_upgrade(self):
+  for name in ['core','ui']:
+   with self.subTest(name=name),tempfile.TemporaryDirectory() as td:
+    root=Path(td);(root/'etc/init.d').mkdir(parents=True);(root/'var/run').mkdir(parents=True);(root/'tmp').mkdir()
+    service='diversion-dns'if name=='core'else'diversion-dns-ui';hold=root/'hold';hold.touch();entered=root/'entered'
+    daemon=root/'etc/init.d'/service
+    daemon.write_text('#!/bin/sh\nif [ "$1" = stop ]; then touch "'+str(entered)+'"; while [ -e "'+str(hold)+'" ]; do sleep 0.05; done; fi\nexit 0\n');daemon.chmod(0o755)
+    rpc=root/'etc/init.d/rpcd';rpc.write_text('#!/bin/sh\nexit 0\n');rpc.chmod(0o755)
+    def hook(phase):return re.sub(r'/(?:etc|var|tmp)/',lambda m:str(root)+m.group(),(ROOT/f'packaging/managed/hooks/{name}.{phase}').read_text())
+    proc=subprocess.Popen(['sh','-c',hook('pre-upgrade')],start_new_session=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    try:
+     deadline=time.monotonic()+3
+     while not entered.exists()and time.monotonic()<deadline:time.sleep(.01)
+     self.assertTrue(entered.exists());os.killpg(proc.pid,signal.SIGKILL);proc.communicate(timeout=3)
+     self.assertFalse((root/f'var/run/{service}-package-upgrade.lock').exists())
+     hold.unlink()
+     for phase in ['pre-upgrade','post-upgrade']:subprocess.run(['sh','-c',hook(phase)],check=True,capture_output=True,timeout=3)
+     self.assertFalse((root/f'var/run/{service}-package-upgrade').exists())
+    finally:
+     if proc.poll()is None:os.killpg(proc.pid,signal.SIGKILL);proc.communicate(timeout=3)
  def test_hooks_syntax_and_initial_install_do_not_enable_dns(self):
   for p in (ROOT/'packaging/managed/hooks').iterdir():subprocess.run(['sh','-n',p],check=True)
   self.assertFalse((ROOT/'packaging/managed/hooks/core.post-install').exists())
