@@ -119,7 +119,7 @@ class Tests(unittest.TestCase):
         self.run_lua(r"""
           for _,s in ipairs({'www.example.com','EXAMPLE.COM.','xn--fiqs8s.example','127.0.0.1','2001:db8::1','::1','::'}) do assert(Q.validate_input(s),s) end
           for _,s in ipairs({'', ' a.com','a.com\n','a;id','$(id)','a..com','-a.com','a-.com','a/b','a:80',
-            '1.2.3.256','01.2.3.4','1.2.3','2001:::1','1::2::3','2001:db8:1:2:3:4:5','example.com:443',string.rep('a',64)..'.com'}) do assert(Q.validate_input(s)==nil,s) end
+            '1.2.3.256','0192.0.2.4','1.2.3','2001:::1','1::2::3','2001:db8:1:2:3:4:5','example.com:443',string.rep('a',64)..'.com'}) do assert(Q.validate_input(s)==nil,s) end
         """)
 
     def test_exact_suffix_keyword_and_unsupported_regex(self):
@@ -139,8 +139,8 @@ class Tests(unittest.TestCase):
           local function u16(x)return string.char(math.floor(x/256),x%256)end
           local question='\3www\7example\3com\0'..u16(1)..u16(1)
           local packet=u16(123)..u16(33152)..u16(1)..u16(1)..u16(0)..u16(0)..question..
-            string.char(192,12)..u16(1)..u16(1)..'\0\0\0\60'..u16(4)..string.char(1,2,3,4)
-          local r=Q.parse_dns(packet,123,question);assert(r.ok and #r.answers==1 and r.answers[1].address=='1.2.3.4')
+            string.char(192,12)..u16(1)..u16(1)..'\0\0\0\60'..u16(4)..string.char(192,0,2,4)
+          local r=Q.parse_dns(packet,123,question);assert(r.ok and #r.answers==1 and r.answers[1].address=='192.0.2.4')
           assert(not pcall(Q.parse_dns,packet,124,question))
           assert(not pcall(Q.parse_dns,packet:sub(1,-2),123,question))
           local truncated=packet:sub(1,2)..u16(33664)..packet:sub(5);assert(not pcall(Q.parse_dns,truncated,123,question))
@@ -161,19 +161,19 @@ class Tests(unittest.TestCase):
             if command:find('nft list chain',1,true) then
               body='@cn4 @cn6 @cnsite4 @cnsite6 meta mark set 0x00000001'
             elseif command:find('nft get element',1,true) then
-              if mode=='hit' and command:find(' cn4 ',1,true) then body='elements = { 1.2.3.4 }'
+              if mode=='hit' and command:find(' cn4 ',1,true) then body='elements = { 192.0.2.4 }'
               elseif mode=='unsupported' then body='Operation not supported';rc=1
               else body='No such file or directory';rc=1 end
-            elseif command:find('route get',1,true) then body='1.2.3.4 dev wg_vpn table 100'
+            elseif command:find('route get',1,true) then body='192.0.2.4 dev wg_vpn table 100'
             end
             return {read=function() return body..'\\nPNW_QUERY_RC='..rc..'\\n' end,close=function() end}
           end
-          local r=Q.lookup('1.2.3.4',{selected='aws'});assert(r.answers[1].expected_path=='tunnel')
-          mode='hit';r=Q.lookup('1.2.3.4',{selected='aws'});assert(r.answers[1].expected_path=='WAN' and #r.answers[1].sets==1)
-          mode='unsupported';r=Q.lookup('1.2.3.4',{selected='aws'});assert(r.answers[1].expected_path=='unknown')
-          mode='miss';r=Q.lookup('1.2.3.4',{selected='aws',emergency=true});assert(r.answers[1].expected_path=='blocked')
+          local r=Q.lookup('192.0.2.4',{selected='aws'});assert(r.answers[1].expected_path=='tunnel')
+          mode='hit';r=Q.lookup('192.0.2.4',{selected='aws'});assert(r.answers[1].expected_path=='WAN' and #r.answers[1].sets==1)
+          mode='unsupported';r=Q.lookup('192.0.2.4',{selected='aws'});assert(r.answers[1].expected_path=='unknown')
+          mode='miss';r=Q.lookup('192.0.2.4',{selected='aws',emergency=true});assert(r.answers[1].expected_path=='blocked')
           r=Q.lookup('2001:db8::1',{selected='usss'});assert(r.answers[1].expected_path=='blocked')
-          r=Q.lookup('192.168.100.1',{selected='aws'});assert(r.answers[1].expected_path=='local')
+          r=Q.lookup('192.168.50.1',{selected='aws'});assert(r.answers[1].expected_path=='local')
         """)
 
 if __name__ == '__main__':

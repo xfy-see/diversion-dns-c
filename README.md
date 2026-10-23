@@ -121,3 +121,8 @@ Linux ARM64 包用于目标设备的独立校验。CI/mock 回归不会改生产
 统一测试入口、场景矩阵与使用方式见 [自动化测试集](docs/test-suite.md)。
 运行 `python3 scripts/testsuite.py plan --profile release` 可查看交付覆盖清单；
 设备测试默认仅生成计划，使用独立端口、集合和资源限额，执行前需配置已验证产物及 SSH 主机密钥。
+
+## Deployment privacy
+
+Keep real device identities in local configuration. See [privacy and migration](docs/privacy.md)
+for compatibility, pre-publication scanning and historical-data limits.

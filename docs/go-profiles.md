@@ -72,14 +72,14 @@ python3 benchmarks/build-go-profiles.py \
 查询链如下：
 
 1. 先检查内存缓存；缓存命中也执行最终 CN-site 地址学习。
-2. CN-site 域名直接查询默认 DNS 示例地址 `192.168.100.1:53`，绑定 `br-lan` 并使用直连 socket mark `0x01000000`。
+2. CN-site 域名直接查询默认 DNS 示例地址 `192.168.50.1:53`，绑定 `br-lan` 并使用直连 socket mark `0x01000000`。
 3. 其他域名查询 `1.1.1.1:53`，绑定既有 WireGuard 接口示例 `c131tm`，使用隧道 mark `0x02000000`。
 4. CN-site 回答写入已有 `inet mosdns_cn` 表的 `cn_site4` / `cn_site6` 集合，然后返回。没有 `223.5.5.5` 首查、CN-IP 回答选择或 dnsmasq `dns_seen4/6` 重复学习。
 
 运行前需要准备并核实：
 
 - `/etc/mosdns/cn-site.txt` 为实际 CN-site 规则文件。
-- 当前路由默认 DNS 的数字 IP 地址；若它不是 `192.168.100.1`，修改示例。程序不会动态追踪 `/etc/resolv.conf` 中的变化。
+- 当前路由默认 DNS 的数字 IP 地址；若它不是 `192.168.50.1`，修改示例。程序不会动态追踪 `/etc/resolv.conf` 中的变化。
 - `br-lan` 与实际 WireGuard 接口；`c131tm` 是此前隔离测试的示例名称，测试清理后不保证仍存在。
 - 已有 `inet mosdns_cn` nft 表，集合 `cn_site4` 类型为 `ipv4_addr`、`cn_site6` 类型为 `ipv6_addr`，以及需要的超时设置。示例不会创建它们。
 - 已有出口规则能够让 `0x01000000` 直连、`0x02000000` 经隧道，并拦截隧道不可用时的错误出口。`bind_to_device` 和 `so_mark` 不会自动创建隧道、路由或防泄漏规则。

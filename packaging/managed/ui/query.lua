@@ -122,7 +122,15 @@ function M.lookup(input,ctx)
  ctx=ctx or {};local name,kind=M.validate_input(input)
  if not name then return {ok=false,error=kind,input=tostring(input or ''):sub(1,254)} end
  local source=ctx.source or 'router'
- if source~='router' and source~='lan' and source~='192.168.100.19' then return {ok=false,error='unsupported source selector'} end
+ local bypass
+ if source~='router' and source~='lan' then
+  local ok,config=pcall(function() return require('luci.jsonc').parse(read('/etc/pnw-control/expected-egress.json',65536) or '{}') end)
+  local item=ok and type(config)=='table' and config.query_source or nil
+  if type(item)~='table' or type(item.ipv4)~='string' or not ipv4(item.ipv4) or type(item.mac)~='string' or not item.mac:match('^%x%x:%x%x:%x%x:%x%x:%x%x:%x%x$') or type(item.rule_comment)~='string' or #item.rule_comment<1 or #item.rule_comment>128 or item.rule_comment:find('[%z\1-\31]') or (source~='bypass' and source~=item.ipv4) then
+   return {ok=false,error='source selector is not configured locally'}
+  end
+  bypass=item
+ end
  local out={ok=true,input=name,kind=kind,source=source,time=os.time(),inference_only=true,answers={},dns={},notes={
   '根据当前分类集合推断普通新连接；不代表实际连接或公网出口证据。',
   '显式标记、协议端口、源 MAC、其他策略路由、旧连接和客户端自用 DNS 可能改变结果。',
@@ -137,9 +145,9 @@ function M.lookup(input,ctx)
  local chain=source=='router' and 'router_output' or 'split';local rules,rc=run('nft list chain inet diversion_dns '..chain)
  local policy_known=rc==0 and rules:find('@cn4',1,true) and rules:find('@cnsite4',1,true) and rules:find('@cn6',1,true) and rules:find('@cnsite6',1,true) and rules:find('meta mark set 0x00000001',1,true)
  local downloader=false
- if source=='192.168.100.19' then
-  local neighbor=select(1,run('ip -4 neigh show to 192.168.100.19 dev br-lan'))
-  downloader=rules:find('ether saddr 02:42:c0:a8:64:13',1,true)~=nil and rules:find('qBittorrent dedicated client WAN',1,true)~=nil and neighbor:lower():find('lladdr 02:42:c0:a8:64:13',1,true)~=nil
+ if bypass then
+  local neighbor=select(1,run('ip -4 neigh show to '..q(bypass.ipv4)..' dev br-lan'))
+  downloader=rules:lower():find('ether saddr '..bypass.mac:lower(),1,true)~=nil and rules:find(bypass.rule_comment,1,true)~=nil and neighbor:lower():find('lladdr '..bypass.mac:lower(),1,true)~=nil
   out.notes[#out.notes+1]='下载器按现场 MAC 豁免与当前 IPv4 邻居映射核验；本机 DNS 结果不代表下载器自己的 WAN DNS 结果。'
  end
  local set_available={}
@@ -155,7 +163,7 @@ function M.lookup(input,ctx)
   end
   local base=select(1,run('ip -'..a.family..' route get '..q(a.address)..' mark 0'))
   local localpath=reserved(a.address,a.family) or base:match('^local ') or base:find('dev br-lan',1,true)
-  if source=='192.168.100.19' and not downloader then a.reason='下载器 MAC 豁免或邻居映射未确认'
+  if bypass and not downloader then a.reason='下载器 MAC 豁免或邻居映射未确认'
   elseif not policy_known or not membership_known then a.reason='当前策略或集合无法完整读取'
   elseif localpath then a.expected_path='local';a.reason='本地／保留地址或 LAN 路由'
   elseif downloader then a.expected_path='WAN';a.reason='下载器源 MAC 的 WAN 豁免已匹配'

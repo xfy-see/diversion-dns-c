@@ -61,17 +61,17 @@ splitmix64）的随机 16 位 DNS ID，不把客户端 ID 发给上游；回复�
 重发，共享原 5 秒交换预算；TC 转 TCP 后停止 UDP 重发。
 
 **已知限制（M4，mipsel）：** 默认每次上游 UDP 查询使用全新 socket 与内核随机源端口（热路径可把
-`socket`/`connect` 挪到空闲时预开，但端口仍不复用）。在 mipsel_24kc（.122，Linux 6.12.94）
+`socket`/`connect` 挪到空闲时预开，但端口仍不复用）。在 mipsel_24kc（测试机 A，Linux 6.12.94）
 上，冷缓存 / 首次上游 UDP 查询相对 v0.1.1 基线约多 **+4–5 ms P50**、约 **+5 ms P99**
 （2026-10-13 六轮中位数消融：冷 A P99 约 **7.3 → ~12 ms**）；热路径无明显回归。
-同机测得该路径上 conntrack 约每条冷查询增加 1 条。aarch64（.131）冷路径无实质回归。
+同机测得该路径上 conntrack 约每条冷查询增加 1 条。aarch64（测试机 B）冷路径无实质回归。
 
 **可选 opt-in（`udp_sport_reuse`）：** 设置 `udp_sport_reuse=1` 启用有时限、按次数轮换的小容量
 UDP 源端口复用，以降低上述 MIPS 冷查询代价。配套键：`udp_sport_reuse_max_uses`（默认 16）、
 `udp_sport_reuse_ttl_ms`（默认 2000）、`udp_sport_reuse_pool`（默认 2）。启用会削弱每查询源端口
 唯一性（随机 ID 仍在）；仅在接受该安全权衡时打开。默认 `0` 时行为与不启用时完全一致。
 
-**.122 实测（2026-10-13，mipsel_24kc）：** 主要改善冷 **AAAA**——6 轮全部改善；冷 A 无稳定收益；TCP 受顺序效应影响大，无稳定结论。启用池后 500 QPS 累计 30 分钟：900,000/900,000 成功、零漏发、整体 P99 2.976 ms。协议、nft、队列/TCP 限制、池边界、interval 重叠、链路本地 IPv6 功能测试通过。默认保持 `udp_sport_reuse=0`（每查询新源端口）；启用会削弱源端口唯一性（上游随机 DNS ID 仍保留）。仅当慢速 MIPS 上冷 AAAA 延迟重要时建议启用。
+**测试机 A 实测（2026-10-13，mipsel_24kc）：** 主要改善冷 **AAAA**——6 轮全部改善；冷 A 无稳定收益；TCP 受顺序效应影响大，无稳定结论。启用池后 500 QPS 累计 30 分钟：900,000/900,000 成功、零漏发、整体 P99 2.976 ms。协议、nft、队列/TCP 限制、池边界、interval 重叠、链路本地 IPv6 功能测试通过。默认保持 `udp_sport_reuse=0`（每查询新源端口）；启用会削弱源端口唯一性（上游随机 DNS ID 仍保留）。仅当慢速 MIPS 上冷 AAAA 延迟重要时建议启用。
 
 nft 普通集合仍有 generation 前后校验和完整 Netlink 成功回执；集合类型和 interval 标志
 都由 Netlink GETSET 读取，不再调用 `nft list set`（普通集合每次写入 0 次 exec，interval
@@ -251,10 +251,10 @@ retain their route through the separate conntrack pinning rules.
 
 With M4, **by default** each upstream UDP exchange uses a fresh socket and a kernel-chosen
 ephemeral source port (used sockets are never reused; idle pre-open only moves
-`socket`/`connect` off the hot path). On mipsel_24kc (.122, Linux 6.12.94), cold-cache /
+`socket`/`connect` off the hot path). On mipsel_24kc (测试机 A, Linux 6.12.94), cold-cache /
 first-use upstream UDP queries pay roughly **+4–5 ms P50** and **~+5 ms P99** vs v0.1.1
 (2026-10-13 six-run median ablation: cold A P99 about **7.3 → ~12 ms**). Hot path is
-unaffected. Conntrack grows about one entry per cold query on that path. aarch64 (.131)
+unaffected. Conntrack grows about one entry per cold query on that path. aarch64 (测试机 B)
 showed no material cold regression.
 
 **Opt-in `udp_sport_reuse`:** set `udp_sport_reuse=1` to enable a timed, use-capped small
@@ -264,6 +264,6 @@ UDP source-port reuse pool and reduce that MIPS cold cost. Companion keys:
 (random upstream IDs remain); use only if that tradeoff is acceptable. Default `0` keeps
 behavior identical to main without the pool.
 
-**.122 results (2026-10-13, mipsel_24kc):** mainly improves cold **AAAA** — improved in all 6 runs; cold A showed no stable gain; TCP had strong ordering effects, so no stable conclusion. With the pool enabled, 500 QPS for 30 min cumulative: 900,000/900,000 success, zero missed sends, overall P99 2.976 ms. Functional tests passed: protocol, nft, queue/TCP limits, pool boundaries, interval overlap, link-local IPv6. Default stays `udp_sport_reuse=0` (new source port per query); enabling weakens source-port uniqueness (random upstream DNS ID remains). Recommended only if cold AAAA latency on slow MIPS matters.
+**测试机 A results (2026-10-13, mipsel_24kc):** mainly improves cold **AAAA** — improved in all 6 runs; cold A showed no stable gain; TCP had strong ordering effects, so no stable conclusion. With the pool enabled, 500 QPS for 30 min cumulative: 900,000/900,000 success, zero missed sends, overall P99 2.976 ms. Functional tests passed: protocol, nft, queue/TCP limits, pool boundaries, interval overlap, link-local IPv6. Default stays `udp_sport_reuse=0` (new source port per query); enabling weakens source-port uniqueness (random upstream DNS ID remains). Recommended only if cold AAAA latency on slow MIPS matters.
 
 Route lookups must include both static CN-IP and dynamic DNS-learned sets. Do not remove dnsmasq learning until these lookups and C writes have passed real A/AAAA, first-connection, reload and rollback tests.

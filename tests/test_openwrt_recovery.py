@@ -175,7 +175,7 @@ class RecoveryFixture(unittest.TestCase):
             "dhcp.@dnsmasq[0].server": self.initial_servers,
             "dhcp.@dnsmasq[0].cachesize": "1500",
             "dhcp.@dnsmasq[0].filter_aaaa": "0",
-            "network.lan.ipaddr": "192.168.100.1",
+            "network.lan.ipaddr": "192.168.50.1",
         }
         self.statefile = self.root / "mock-state.json"
         self.statefile.write_text(json.dumps({"uci": self.initial_options,
@@ -290,7 +290,7 @@ class RecoveryFixture(unittest.TestCase):
         self.assertEqual(state["uci"]["dhcp.@dnsmasq[0].server"], ["127.0.0.1#15363"])
         self.assertEqual(state["uci"]["dhcp.@dnsmasq[0].cachesize"], "0")
         self.assertEqual(state["uci"]["dhcp.@dnsmasq[0].filter_aaaa"], "0")
-        self.assertEqual(state["uci"]["network.lan.ipaddr"], "192.168.100.1")
+        self.assertEqual(state["uci"]["network.lan.ipaddr"], "192.168.50.1")
         self.assertFalse((self.base / "degraded").exists())
         self.assertFalse((self.base / "recovery-auto").exists())
         self.assertFalse((self.base / "recovering").exists())

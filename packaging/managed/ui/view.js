@@ -292,7 +292,7 @@ return view.extend({
    result.push(message((r.ok === false ? '查询未完成：' + (r.error || r.reason || '请查看详情') : '查询目标：' + value(r.input)) + ' · ' + time(r.time), r.ok === false ? 'bad' : 'neutral'));
    if (!connected) result.push(message('页面已失联，以下查询结果为历史记录。', 'bad'));
    result.push(E('p', { 'class': 'pnw-muted' }, '以下为查询时快照；出口或配置变化后，结果不会自动刷新，请重新查询。'));
-   result.push(E('p', {}, '查询时来源：' + ({ router: '路由器本机', lan: '普通 LAN 客户端', '192.168.100.19': '下载器 192.168.100.19' }[r.source] || value(r.source)) + ' · 查询时域名分类：' + ({ cn: '国内', foreign: '国外', unknown: '未确定' }[c.group] || '未确定') + (c.complete === false ? '（规则依据不完整）' : '')));
+   result.push(E('p', {}, '查询时来源：' + ({ router: '路由器本机', lan: '普通 LAN 客户端', bypass: '本地配置的豁免客户端' }[r.source] || value(r.source)) + ' · 查询时域名分类：' + ({ cn: '国内', foreign: '国外', unknown: '未确定' }[c.group] || '未确定') + (c.complete === false ? '（规则依据不完整）' : '')));
    if (Array.isArray(c.matches) && c.matches.length) result.push(table(['命中规则文件', '规则'], c.matches.map(function(m) { return row([value(m.file), value(m.rule)]); })));
    if (Array.isArray(r.dns) && r.dns.length) result.push(table(['DNS 类型', '解析结果', '耗时'], r.dns.map(function(d) { return row([value(d.qtype), (d.ok === true ? '完成' : '失败') + ' · ' + value(d.rcode) + (d.error ? ' · ' + d.error : ''), duration(d.duration_ms)]); })));
    if (Array.isArray(r.answers)) result.push(table(['地址族', '地址', '查询时预计路径', '查询时规则依据'], r.answers.map(function(a) {
@@ -331,7 +331,7 @@ return view.extend({
   }
   var refreshButton = E('button', { 'type': 'button', 'class': 'cbi-button', 'click': function() { refresh().catch(function() {}); } }, '刷新状态');
   var queryInput = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'placeholder': '例如 example.com 或 1.1.1.1', 'aria-label': '待查询的域名或 IP', 'maxlength': '253', 'autocomplete': 'off', 'spellcheck': 'false' });
-  var querySource = E('select', { 'class': 'cbi-input-select', 'aria-label': '查询流量来源' }, [E('option', { 'value': 'router' }, '路由器本机'), E('option', { 'value': 'lan' }, '普通 LAN 客户端'), E('option', { 'value': '192.168.100.19' }, '下载器 192.168.100.19')]);
+  var querySource = E('select', { 'class': 'cbi-input-select', 'aria-label': '查询流量来源' }, [E('option', { 'value': 'router' }, '路由器本机'), E('option', { 'value': 'lan' }, '普通 LAN 客户端'), E('option', { 'value': 'bypass' }, '本地配置的豁免客户端')]);
   function query() {
    if (queryButton.disabled) return;
    var input = queryInput.value.trim();
@@ -357,7 +357,7 @@ return view.extend({
    E('section', { 'class': 'pnw-card' }, [E('h3', {}, '出口与恢复操作'), part('switchHelp', 'p'),
     E('div', { 'class': 'pnw-actions' }, [button('切换 AWS 新加坡', 'switch-aws'), button('切换 nobrand', 'switch-nobrand'), button('切换美国 SS', 'switch-usss'), button('切换美国 VLESS', 'switch-usvless'), button('回滚上次出口', 'rollback')]), part('rollbackTarget', 'p', { 'class': 'pnw-muted' }),
     E('div', { 'class': 'pnw-actions' }, [button('恢复国内联网（应急）', 'rescue'), button('恢复正常分流', 'recover'), button('检测出口可用性', 'check'), button('采集诊断（3 秒）', 'diagnose'), button('重试未完成回退', 'retry-recovery')]),
-    E('p', { 'class': 'pnw-muted', 'data-device-hide': '1' }, '国内应急保留 LAN、静态租约和管理入口，停止海外标记流量；AI 服务不会自动改走 WAN。美国出口仅使用 IPv4，境外 IPv6 阻断，国内 IPv6 保留。美国 SS 与 VLESS 共用 186.241.86.13，不属于独立线路冗余。'), part('last', 'p', { 'class': 'pnw-preserve' })]),
+    E('p', { 'class': 'pnw-muted', 'data-device-hide': '1' }, '国内应急保留 LAN、静态租约和管理入口，停止海外标记流量；AI 服务不会自动改走 WAN。美国出口仅使用 IPv4，境外 IPv6 阻断，国内 IPv6 保留。出口身份以设备本地配置和实际检测为准；两个出口是否独立需由部署配置确认。'), part('last', 'p', { 'class': 'pnw-preserve' })]),
    E('div', { 'class': 'pnw-grid' }, [E('section', { 'class': 'pnw-card' }, metric('最近操作耗时', 'operationTime', 'operationTimeNote')), E('section', { 'class': 'pnw-card' }, metric('最近检测耗时', 'checkTime', 'checkTimeNote'))]),
    E('section', { 'class': 'pnw-card' }, [E('h3', {}, '国内 / 国外 DNS'), E('p', { 'class': 'pnw-muted' }, '当前配置的 DNS 上游与转发链。并发、故障切换和缓存会影响每次请求，以下不代表某次请求实际命中的服务器。'), E('div', { 'class': 'pnw-grid' }, [card('国内 DNS', 'dnsCn'), card('国外 DNS', 'dnsForeign')])]),
    E('section', { 'class': 'pnw-card' }, [E('h3', {}, 'DNS 实际请求指标'), part('telemetryInfo', 'p', { 'class': 'pnw-muted' }), E('div', { 'class': 'pnw-grid' }, [metric('国内缓存命中率', 'cacheCnRate', 'cacheCnNote'), metric('国外缓存命中率', 'cacheForeignRate', 'cacheForeignNote')]), E('div', { 'class': 'pnw-grid' }, [metric('请求成功率', 'successRate', 'successNote'), metric(self.deviceMode ? '近期 DNS 耗时' : '最近 DNS 耗时', 'latency', 'latencyNote')]), E('details', {}, [E('summary', {}, '全部缓存与分组明细'), metric('全部缓存命中率', 'cacheRate', 'cacheNote'), part('groupMetrics')]),
@@ -377,7 +377,7 @@ return view.extend({
     E('p',{'class':'pnw-muted'},'统计包含访问域名，仅在现有管理登录下查看。导出文件分享前请检查隐私。重启开启新累计周期；这些观察不能证明网站访问成功或代替版本间同流量对照。')]),
    E('section', { 'class': 'pnw-card' }, [E('h3', {}, '最近出口检测'), part('checks'), E('h3', {}, '实际公网出口'), E('div', { 'class': 'pnw-grid pnw-egress-grid' }, [card('国内公网出口', 'domesticPublicExit'), card('国外公网出口', 'publicExit')]), part('peers', 'p', { 'class': 'pnw-muted' }), part('endpoint', 'p', { 'class': 'pnw-muted' })]),
    E('section', { 'class': 'pnw-card' }, [E('h3', {}, '域名 / IP 分流查询'), E('div', { 'class': 'pnw-query' }, [queryInput, querySource, queryButton]), part('queryResult')]),
-   E('p', { 'class': 'pnw-muted', 'data-device-hide': '1' }, 'qBittorrent 独立地址 192.168.100.19，IPv4 / IPv6 及 DNS 均走 WAN；NAS 192.168.100.15 保留原分流。管理地址为 http://192.168.100.19:8848/。'),
+   E('p', { 'class': 'pnw-muted', 'data-device-hide': '1' }, '客户端豁免由设备本地配置和当前规则决定；本页不会新增或修改豁免。'),
    E('button', { 'type': 'button', 'class': 'cbi-button', 'click': function() {
     var url = URL.createObjectURL(new Blob([parts.diagnostic.textContent], { type: 'application/json' }));
     var a = document.createElement('a'); a.href = url; a.download = 'pnw-diagnostic.json'; a.click(); setTimeout(function() { URL.revokeObjectURL(url); }, 1000);

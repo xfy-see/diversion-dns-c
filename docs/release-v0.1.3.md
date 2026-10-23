@@ -15,7 +15,7 @@
 
 ## 安装边界
 
-`openwrt-recovery-v0.1.3.tar.gz` 单独提供覆盖脚本、README、LICENSE 和精确提交/源码树/逐文件 SHA256 清单。它针对 `192.168.100.1` 已有的定制布局，依赖现有 `dns-mode.sh`、策略及守护服务、15363 端口、UCI、flock、Lua/nixio。先阅读包内 README 并备份、准备设备端定时撤回，再验证依赖和路径；不能直接套用到未知布局。
+`openwrt-recovery-v0.1.3.tar.gz` 单独提供覆盖脚本、README、LICENSE 和精确提交/源码树/逐文件 SHA256 清单。它针对 匹配布局的设备 已有的定制布局，依赖现有 `dns-mode.sh`、策略及守护服务、15363 端口、UCI、flock、Lua/nixio。先阅读包内 README 并备份、准备设备端定时撤回，再验证依赖和路径；不能直接套用到未知布局。
 
 APK 为未签名的动态 POSIX-lite 包，仍只安装程序，不包含服务配置、自动恢复覆盖层、LuCI 或自启动，也不会自动接管 DNS。发布本身不部署设备。PCRE2 包保留 PCRE2 并关闭 Unicode/JIT。包版本高于 `0.1.2-r1`，低于历史实验包 `0.2.0-r1`。
 

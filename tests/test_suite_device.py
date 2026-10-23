@@ -56,13 +56,13 @@ class ConfigTests(unittest.TestCase):
                 '-o', 'ConnectTimeout=5', '-o', 'ServerAliveInterval=5',
                 '-o', 'ServerAliveCountMax=2', 'root@' + address], production_files=production,
                 memory_limit_mib=24, min_available_kib=8000, max_conntrack=12000)
-        self.cfg = dict(schema_version=1, target=host('192.168.100.122', ['/usr/sbin/app', '/etc/app.conf']),
-            client=host('192.168.100.131', []), listen_port=15491, fixture_port=15531,
+        self.cfg = dict(schema_version=1, target=host('192.168.50.122', ['/usr/sbin/app', '/etc/app.conf']),
+            client=host('192.168.50.131', []), listen_port=15491, fixture_port=15531,
             fixture_ttl=30, cpu=4, workers=32, repeats=3,
             versions=[dict(name='V0', commit='a'*40, run_id=123, binary=file('binary'),
                            receipt=dict(**file('receipt.json'), key='V0'))],
             helpers=dict(load=file('load'), fixture=dict(**file('fixture'),
-                listen_address='192.168.100.131', listen_port=15531, ttl=30, command_args=[])))
+                listen_address='192.168.50.131', listen_port=15531, ttl=30, command_args=[])))
 
     def read(self, profile='device-smoke'):
         path = self.root / 'config.json'
@@ -98,7 +98,7 @@ class ConfigTests(unittest.TestCase):
             self.read()
 
     def test_fixture_flag_matches_bind(self):
-        self.cfg['helpers']['fixture']['command_args'] = ['-addr', '192.168.100.131:15531']
+        self.cfg['helpers']['fixture']['command_args'] = ['-addr', '192.168.50.131:15531']
         self.read()
         self.cfg['helpers']['fixture']['command_args'] = ['-addr', '0.0.0.0:53']
         with self.assertRaisesRegex(ValueError, 'fixture args'):

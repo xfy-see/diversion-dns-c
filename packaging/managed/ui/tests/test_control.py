@@ -13,6 +13,7 @@ class Harness:
  def __init__(self, selected='aws'):
   self.lua=LuaRuntime(unpack_returned_tuples=True)
   self.files={B+'/emergency.nft':'table inet pnw_emergency { chain local { type filter hook output priority -129; policy accept; meta mark 1 drop; } }\n', '/etc/passwd':'root:x:0:0::/:/bin/sh\n', '/proc/loadavg':'0.1 0.1 0.1', '/proc/meminfo':'MemAvailable: 10000\n', '/etc/config/firewall':'protected firewall', '/etc/config/dhcp':'protected dhcp', B+'/us-exits.json':'private placeholder', B+'/foreign-v4-dns.conf':'filter', '/etc/diversion-dns-c/config.conf':'foreign_interface=wg_vpn\nforeign_mark=1\nforeign_upstream=1.1.1.1:53\nforeign_upstream=8.8.8.8:53\n', '/etc/diversion-dns-c/policy.nft':('oifname != "wg_vpn"\n'*4), '/etc/nftables.d/97-pnw-egress-bind.nft':('chain post { type filter hook postrouting priority 0;\n oifname != "wg_vpn"\n}\nchain forward { type filter hook forward priority 0;\n oifname != "wg_vpn"\n}\n')}
+  self.files[B+'/expected-egress.json']=json.dumps({id:{'ipv4':'198.51.100.13','endpoint_ipv4':'203.0.113.13'} for id in ('usss','usvless')})
   self.dirs={R,'/sys/class/net/wg_vpn','/sys/class/net/pnwuss0','/sys/class/net/pnwuvl0'}
   self.config={'network.route_gfw_v4.interface':'wg_vpn','network.route_gfw_v6.interface':'wg_vpn'}
   for name in ('aws','nobrand'):
@@ -112,7 +113,7 @@ class Harness:
   if s.startswith('uclient-fetch ') or 'probe-fetch' in s:
    if 'probe-fetch' in s:assert self.active and self.probe_rules;self.probes+=1
    af='6' if '-6 ' in s or s.endswith(' 6') else '4'
-   ip='2001:db8::1' if af=='6' else ('186.241.86.13' if self.current() in ('usss','usvless') else '203.0.113.1')
+   ip='2001:db8::1' if af=='6' else ('198.51.100.13' if self.current() in ('usss','usvless') else '203.0.113.1')
    return 'ip='+ip+'\n',0
   if 'dns-probe.lua 1.1.1.1 53 example.com' in s and self.active:assert self.probe_rules;self.probes+=1;return 'DNS passed',0
   if 'recover.sh manual' in s:
@@ -142,6 +143,21 @@ class ControllerTests(unittest.TestCase):
   h=Harness();r=h.to_py(h.api.public_probe('4',False));self.assertTrue(r['reachability']);self.assertEqual(r['identity_status'],'unconfigured');self.assertEqual(r['ip'],'203.0.113.1')
  def test_wrong_expected_identity_fails_check(self):
   h=Harness();h.files[B+'/expected-egress.json']=json.dumps({'aws':{'ipv4':'198.51.100.99'}});h.api.health();s=h.get(R+'/health.json');self.assertFalse(s['checks']['https_ipv4']);self.assertEqual(s['public_exit']['ipv4']['identity_status'],'mismatch')
+ def test_proxy_identity_and_endpoint_are_independent_local_configuration(self):
+  h=Harness();h.files[B+'/expected-egress.json']=json.dumps({'usss':{'ipv4':'198.51.100.13','endpoint_ipv4':'203.0.113.77'}})
+  h.api.switch('usss');self.assertTrue(any("route get '203.0.113.77' mark 512" in e for e in h.events))
+  self.assertEqual(h.get(R+'/public-exit.json')['ipv4']['identity_status'],'verified')
+ def test_proxy_missing_or_invalid_configuration_refuses_before_route_changes(self):
+  for config in [None,{}, {'usss':{'ipv4':'198.51.100.13'}}, {'usss':{'endpoint_ipv4':'203.0.113.13'}}, {'usss':{'ipv4':'198.51.100.13','endpoint_ipv4':'203.0.113.13;id'}}, {'usss':{'ipv4':'999.1.1.1','endpoint_ipv4':'203.0.113.13'}}]:
+   h=Harness()
+   if config is None:h.files.pop(B+'/expected-egress.json')
+   else:h.files[B+'/expected-egress.json']=json.dumps(config)
+   with self.assertRaises(Exception):h.api.switch('usss')
+   self.assertEqual(h.current(),'aws');self.assertNotIn(B+'/pending.json',h.files)
+   self.assertFalse(any(e.startswith('uci -t ') or e.startswith('wg set ') for e in h.events))
+ def test_proxy_missing_identity_never_becomes_reachability_only(self):
+  h=Harness('usss');h.files.pop(B+'/expected-egress.json')
+  with self.assertRaises(Exception):h.api.public_probe('4',False)
  def test_failed_recover_creates_and_keeps_marker_and_containment(self):
   h=Harness();h.fail['probe-fetch']=('network unreachable',1);h.worker('recover');s=h.get(R+'/result.json');self.assertEqual(s['state'],'failed');self.assertTrue(h.active);self.assertIn(B+'/emergency',h.files);self.assertFalse(h.probe_rules);self.assertNotIn('nft delete table inet pnw_emergency',h.events)
  def test_recovery_only_releases_after_isolated_probes(self):
