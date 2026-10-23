@@ -41,6 +41,7 @@ typedef enum {
     CACHE_PREFETCH, CACHE_PREFETCH_MAX, CACHE_MAX_BYTES, CACHE_FOREIGN_RESERVE,
     CACHE_WARM_FILE, CACHE_WARM_MAX, CACHE_WARM_QPS, CACHE_WARM_SAVE,
     CACHE_KEEP_FILE, CACHE_KEEP_QPS, CACHE_KEEP_PERCENT,
+    STATS_FILE, STATS_INTERVAL,
     KEY_COUNT
 } config_key;
 static const char *const key_names[KEY_COUNT] = {
@@ -53,7 +54,8 @@ static const char *const key_names[KEY_COUNT] = {
     "cache_stale_ttl", "cache_stale_ttl_cn", "cache_stale_answer_ttl", "cache_stale_override",
     "cache_prefetch_percent", "cache_prefetch_max", "cache_max_bytes", "cache_foreign_reserve_percent",
     "cache_warm_file", "cache_warm_max", "cache_warm_qps", "cache_warm_save_interval",
-    "cache_keep_file", "cache_keep_qps", "cache_keep_percent"
+    "cache_keep_file", "cache_keep_qps", "cache_keep_percent",
+    "stats_file", "stats_interval"
 };
 /* 可重复（列表）键；其余键只能出现一次。 */
 static bool list_key(size_t k) { return k <= FOREIGN_UPSTREAM || k == CACHE_STALE_OVERRIDE; }
@@ -72,6 +74,7 @@ typedef struct {
     unsigned failures, jitter;
 } keep_entry;
 struct md_engine {
+    md_stats *stats;
     md_domain *cn;
     md_cache *cache;
     md_nft *nft;
@@ -396,6 +399,17 @@ static int build_config(md_engine *e, const config *c, const char *path, char *e
         if (md_domain_load(e->cn, v->text, err)) return config_error(err, path, v->line, err);
     }
     if (build_cache(e, c, capacity, lazy, path, err)) return -1;
+    uint32_t stats_interval;
+    if (config_number(c, STATS_INTERVAL, 60, 5, 3600, false, &stats_interval, path, err)) return -1;
+    const char *stats_path = value(c, STATS_FILE);
+    if (*stats_path) {
+        size_t len = strlen(stats_path);
+        if (stats_path[0] != '/' || len < 6 || len > 1000 || strcmp(stats_path + len - 5, ".json"))
+            return config_error(err, path, key_line(c, STATS_FILE), "stats_file requires absolute .json path (max 1000 bytes)");
+        if (!e->check && !(e->stats = md_stats_new(stats_path, stats_interval, e->cache, err)))
+            return config_error(err, path, key_line(c, STATS_FILE), err);
+    } else if (c->keys[STATS_INTERVAL].count)
+        return config_error(err, path, key_line(c, STATS_INTERVAL), "stats_interval requires stats_file");
     /* Opt-in UDP source-port reuse. Default off keeps M4 per-query new ports.
      * Applied only after the rest of the config succeeds so a failed load cannot
      * leave a previous process-wide setting from a partial parse. */
@@ -411,13 +425,15 @@ static int build_config(md_engine *e, const config *c, const char *path, char *e
 
 /* view 是 response 当前内容的整包校验结果（上游接收或缓存命中时各解析一次）；
  * TTL 规范化只原地改 TTL，view 仍然有效，随后 nft 与缓存写入共用它。 */
-static int finalize(md_engine *e, bool cn, md_packet *response, md_dns_view *view, uint64_t deadline, char *err) {
-    if (md_now() >= deadline) return fail(err, "query execution deadline exceeded");
-    if (response->len && md_dns_normalize_ttl_view(response, view, err)) return -1;
+static int finalize(md_engine *e, bool cn, md_packet *response, md_dns_view *view, md_dns_query *qv, uint64_t deadline, char *err) {
+    if (md_now() >= deadline) { qv->stats_error = MD_SE_DEADLINE; return fail(err, "query execution deadline exceeded"); }
+    if (response->len && md_dns_normalize_ttl_view(response, view, err)) { qv->stats_error = MD_SE_RESPONSE; return -1; }
+    if (response->len) qv->stats_rcode = md_dns_view_rcode(response, view);
     md_trace_mark(MD_T_NFT0);
     int rc = cn && e->nft && response->len ? md_nft_apply_view(e->nft, response, view, err) : 0;
+    if (rc) qv->stats_error = MD_SE_NFT;
     md_trace_mark(MD_T_NFT1);
-    if (!rc && md_now() >= deadline) rc = fail(err, "query execution deadline exceeded");
+    if (!rc && md_now() >= deadline) { qv->stats_error = MD_SE_DEADLINE; rc = fail(err, "query execution deadline exceeded"); }
     return rc;
 }
 /* A forwarding error never crosses from CN to foreign or vice versa. Store
@@ -429,25 +445,26 @@ static int64_t stale_for(const md_engine *e, const md_dns_query *qv) {
         if (md_domain_match(e->overrides[i].domains, qv->q.name)) return e->overrides[i].seconds;
     return -1;
 }
-static int resolve_ex(md_engine *e, bool cn, const md_packet *query, const md_dns_query *qv, md_packet *response, uint64_t deadline, bool refresh, char *err);
-static int resolve(md_engine *e, bool cn, const md_packet *query, const md_dns_query *qv, md_packet *response, uint64_t deadline, char *err) {
+static int resolve_ex(md_engine *e, bool cn, const md_packet *query, md_dns_query *qv, md_packet *response, uint64_t deadline, bool refresh, char *err);
+static int resolve(md_engine *e, bool cn, const md_packet *query, md_dns_query *qv, md_packet *response, uint64_t deadline, char *err) {
     return resolve_ex(e, cn, query, qv, response, deadline, false, err);
 }
 /* refresh=true：后台刷新/prefetch/预热。CN 答案同样经 finalize 写 nft，
  * 使新地址在客户端使用前进入集合；SERVFAIL 不会覆盖仍有效的正向旧答案。 */
-static int resolve_ex(md_engine *e, bool cn, const md_packet *query, const md_dns_query *qv, md_packet *response, uint64_t deadline, bool refresh, char *err) {
-    if (md_now() >= deadline) return fail(err, "query execution deadline exceeded");
+static int resolve_ex(md_engine *e, bool cn, const md_packet *query, md_dns_query *qv, md_packet *response, uint64_t deadline, bool refresh, char *err) {
+    if (md_now() >= deadline) { qv->stats_error = MD_SE_DEADLINE; return fail(err, "query execution deadline exceeded"); }
     upstream_group *group = &e->upstreams[cn ? 0 : 1];
     md_dns_view *view = md_dns_view_scratch();
-    if (!view) return fail(err, "out of memory for DNS view");
+    if (!view) { qv->stats_error = MD_SE_MEMORY; return fail(err, "out of memory for DNS view"); }
     md_trace_mark(MD_T_UP_SEND);
     int rc = md_forward_q(group->items, group->count, group->concurrent, query, qv, response, view, err);
+    if (rc) qv->stats_error = strstr(err, "upstream query timed out after 5 seconds") ? MD_SE_UPSTREAM_TIMEOUT : MD_SE_UPSTREAM;
     md_trace_mark(MD_T_UP_RECV);
     /* md_forward_view 只交出已校验的响应；防御性地在 view 缺失时重新解析。 */
     if (response->len && (!view->valid || view->len != response->len) && md_dns_view_parse(response, view, err)) {
-        response->len = 0; return -1;
+        qv->stats_error = MD_SE_RESPONSE; response->len = 0; return -1;
     }
-    if (!rc) rc = finalize(e, cn, response, view, deadline, err);
+    if (!rc) rc = finalize(e, cn, response, view, qv, deadline, err);
     if (response->len && e->cache) {
         md_cache_put_opts po = { cn ? MD_CACHE_CN : MD_CACHE_FOREIGN, e->override_count ? stale_for(e, qv) : -1, refresh };
         (void)md_cache_put_ex(e->cache, query, qv, response, view, md_now(), &po);
@@ -725,6 +742,7 @@ md_engine *md_engine_load(const char *path, bool check, char *err) {
 int md_engine_start(md_engine *e, char *err) {
     if (!e || e->check || !e->wake_ok || e->stopping) return fail(err, "engine is not ready to start");
     if (e->runtime_started) return 0;
+    if (md_stats_start(e->stats, err)) return -1;
     if (e->cache && (e->warm_file || e->stats_interval || e->keep_count)) {
         int rc = md_thread_create(&e->maintenance, maintenance_thread, e);
         if (rc) return fail(err, "cache maintenance thread: %s", strerror(rc));
@@ -733,6 +751,7 @@ int md_engine_start(md_engine *e, char *err) {
     e->runtime_started = true;
     return 0;
 }
+md_stats *md_engine_stats(md_engine *e) { return e ? e->stats : NULL; }
 size_t md_engine_listener_count(const md_engine *e) { return e ? e->listener_count : 0; }
 const md_listener *md_engine_listener(const md_engine *e, size_t i) { return e && i < e->listener_count ? &e->listeners[i] : NULL; }
 const md_server_limits *md_engine_server_limits(const md_engine *e) { return e ? &e->limits : NULL; }
@@ -766,8 +785,9 @@ unsigned md_engine_dispatch_q(md_engine *e, size_t entry, const md_packet *q, md
     md_cache_hit info;
     int hit = md_cache_get_ex(e->cache, q, qv, r, view, md_now(), cn ? MD_CACHE_CN : MD_CACHE_FOREIGN,
                               MD_CACHE_COUNT | MD_CACHE_CLAIM, &info);
+    qv->stats_cache = e->cache ? (hit == 2 ? 3 : hit == 1 ? 2 : 1) : 0;
     if (e->cache) qv->cache_memo = info.prefetch_due ? 1 : 0;
-    if (hit == 1 && !cn && !info.prefetch_due && !finalize(e, false, r, view, md_now() + 5, err)) { md_trace_flag(MD_TF_HIT_FRESH); return MD_LANE_REPLY; }
+    if (hit == 1 && !cn && !info.prefetch_due && !finalize(e, false, r, view, qv, md_now() + 5, err)) { md_trace_flag(MD_TF_HIT_FRESH); return MD_LANE_REPLY; }
     r->len = 0;
     if (hit) return MD_LANE_CACHED;
     return cn ? MD_LANE_CN : MD_LANE_FOREIGN;
@@ -790,16 +810,18 @@ int md_engine_query_q(md_engine *e, size_t entry, const md_packet *q, md_dns_que
     if (!md_dns_query_ok(q, qv) && md_dns_query_parse(q, qv, err)) return -1;
     bool cn = route_cn(e, qv);
     md_dns_view *view = md_dns_view_scratch();
-    if (!view) return fail(err, "out of memory for DNS view");
+    if (!view) { qv->stats_error = MD_SE_MEMORY; return fail(err, "out of memory for DNS view"); }
+    qv->stats_error = 0;
     md_trace_mark(MD_T_ENGINE0);
     md_cache_hit info; bool counted = qv->cache_memo >= 0;
     int hit = md_cache_get_ex(e->cache, q, qv, r, view, md_now(), cn ? MD_CACHE_CN : MD_CACHE_FOREIGN,
                               counted ? 0u : MD_CACHE_COUNT | MD_CACHE_CLAIM, &info);
+    qv->stats_cache = e->cache ? (hit == 2 ? 3 : hit == 1 ? 2 : 1) : 0;
     bool prefetch = counted ? qv->cache_memo == 1 : info.prefetch_due;
     qv->cache_memo = 0; /* a re-run with the same qv must not prefetch again */
     if (hit == 2) { md_trace_flag(MD_TF_HIT_STALE); refresh_start(e, cn, q, qv, false); }
     else if (hit) { md_trace_flag(MD_TF_HIT_FRESH); if (prefetch) refresh_start(e, cn, q, qv, true); }
-    int rc = hit ? finalize(e, cn, r, view, deadline, err) : resolve(e, cn, q, qv, r, deadline, err);
+    int rc = hit ? finalize(e, cn, r, view, qv, deadline, err) : resolve(e, cn, q, qv, r, deadline, err);
     md_trace_mark(MD_T_ENGINE1);
     if (hit) return rc;
     if (!rc && !r->len) return fail(err, "upstream completed without a response");
@@ -820,6 +842,7 @@ void md_engine_free(md_engine *e) {
         if (e->warm_file) (void)warm_save(e);
         if (getenv("DIVERSION_CACHE_STATS")) print_cache_stats(e);
     }
+    md_stats_free(e->stats);
     md_trace_close();
     /* 契约测试/诊断：DIVERSION_NFT_STATS=1 时退出前打印 nft 写入计数（默认不打印）。 */
     if (e->nft && getenv("DIVERSION_NFT_STATS")) {

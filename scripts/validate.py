@@ -65,7 +65,7 @@ def main():
             integration='fixed_integration.py' if fixed else 'integration.py'
             run(label+'-integration',[sys.executable,source/'c/tests'/integration,app],env)
             if fixed:
-                for suite in ('cache_refresh_safety', 'cache_warm_safety', 'cache_keep'):
+                for suite in ('cache_refresh_safety', 'cache_warm_safety', 'cache_keep', 'stats'):
                     runner = source/'c/tests'/(suite+'_test.py')
                     # Preserve validation of historical bundles whose source
                     # predates these standalone regression suites.

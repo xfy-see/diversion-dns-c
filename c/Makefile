@@ -33,7 +33,7 @@ ifeq ($(SANITIZE),1)
 CFLAGS += -O1 -fsanitize=address,undefined -fno-omit-frame-pointer
 LDFLAGS += -fsanitize=address,undefined
 endif
-LIBSRC = coremain/engine.c pkg/dns.c pkg/upstream.c pkg/domain.c pkg/util.c plugin/cache.c plugin/nftset.c
+LIBSRC = coremain/engine.c pkg/dns.c pkg/upstream.c pkg/domain.c pkg/util.c pkg/stats.c plugin/cache.c plugin/nftset.c
 LIBOBJ = $(patsubst %.c,$(BUILD)/%.o,$(LIBSRC))
 APPOBJ = $(BUILD)/main.o $(BUILD)/pkg/server.o
 TESTS = dns_test cache_domain_test fixed_config_test fixed_engine_test nft_netlink_test
@@ -80,6 +80,7 @@ integration: $(BUILD)/mosdns-c
 	python3 tests/cache_refresh_safety_test.py --application $(BUILD)/mosdns-c --output $(BUILD)/cache-refresh-$$(date +%s)-$$$$
 	python3 tests/cache_warm_safety_test.py --application $(BUILD)/mosdns-c --output $(BUILD)/cache-warm-$$(date +%s)-$$$$
 	python3 tests/cache_keep_test.py --application $(BUILD)/mosdns-c --output $(BUILD)/cache-keep-$$(date +%s)-$$$$
+	python3 tests/stats_test.py --application $(BUILD)/mosdns-c --output $(BUILD)/stats-$$(date +%s)-$$$$
 test: unit integration
 clean:
 	rm -f $(BUILD)/mosdns-c $(BUILD)/libmosdns-c.a $(LIBOBJ) $(APPOBJ) $(addprefix $(BUILD)/tests/,$(TESTS) $(DRIVERS))

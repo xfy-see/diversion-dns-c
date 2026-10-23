@@ -39,6 +39,8 @@ typedef struct job {
     size_t entry;
     md_dns_query qv; /* 收包时唯一一次请求解析；acquire_job 清零（valid=false） */
     md_trace tr;     /* 诊断计时（DIVERSION_TRACE），acquire_job 清零 */
+    md_stats *stats; uint64_t stats_start, stats_queue_us, stats_service_us;
+    unsigned stats_error;
     md_packet query, response;
 } job;
 /* 每条 lane 的待执行队列、正在访问上游的 job 链表与 outstanding；后者包含排队、
@@ -53,6 +55,7 @@ typedef struct {
  * 完成队列才是结果来源。 */
 typedef struct {
     md_engine *engine;
+    md_stats *stats;
     pthread_mutex_t lock;
     lane lanes[MD_LANE_COUNT];
     job *done_head, *done_tail;
@@ -137,7 +140,19 @@ static job *acquire_job(pool *p) {
     }
     return j;
 }
+static void stats_done(job *j, bool sent, unsigned error) {
+    if (!j->stats_start) return;
+    if (!error) error = j->stats_error ? j->stats_error : j->qv.stats_error;
+    md_stats_done(j->stats, &j->qv, j->slot >= 0, j->stats_start,
+                  j->stats_queue_us, j->stats_service_us, sent,
+                  sent && j->response.len >= 4 && (md_read16(j->response.data+2) & 0x0200), error);
+    j->stats_start = 0;
+}
+static void stats_begin(pool *p, job *j) {
+    j->stats = p->stats; j->stats_start = md_stats_begin(p->stats);
+}
 static void recycle_job(pool *p, job *j) {
+    stats_done(j, false, MD_SE_DISCONNECTED);
     if (p->idle_count < MAX_IDLE_JOBS) {
         j->next = p->idle; p->idle = j; p->idle_count++;
     } else free(j);
@@ -202,11 +217,13 @@ static void trace_done(job *j) {
 static void reply_udp(job *j) {
     if (j->slot >= 0) return;
     md_dns_limit_udp_q(&j->query, &j->qv, &j->response);
+    bool sent = false;
     if (j->response.len) {
         ssize_t ignored = sendto(j->socket, j->response.data, j->response.len, 0,
                                 (struct sockaddr *)&j->peer, j->peer_len);
-        (void)ignored;
+        sent = ignored == (ssize_t)j->response.len;
     }
+    stats_done(j, sent, sent ? 0 : MD_SE_SEND);
     trace_done(j);
 }
 /* 每个 worker 建立自己的上游连接池，退出时释放；执行期间独占取出的 job。
@@ -231,6 +248,8 @@ static void *work(void *arg) {
             j->running_next = l->running; l->running = j; running = true;
         }
         pthread_mutex_unlock(&p->lock);
+        uint64_t stats_picked = j->stats_start ? md_now_ns() : 0;
+        if (stats_picked) j->stats_queue_us = (stats_picked - j->stats_start) / 1000;
         char err[MD_ERROR_SIZE] = {0};
         if (md_trace_enabled) {
             j->tr.t[MD_T_PICKUP] = md_now_ns();
@@ -238,14 +257,18 @@ static void *work(void *arg) {
             md_trace_cur = &j->tr;
         }
         if (stale) {
+            j->stats_error = MD_SE_QUEUE_TIMEOUT; j->qv.stats_rcode = 2;
             fprintf(stderr, "query dropped: queued %llu ms (queue_timeout_ms=%llu)\n",
                     (unsigned long long)waited, (unsigned long long)p->queue_timeout);
             if (md_dns_error_q(&j->query, &j->qv, &j->response, 2)) j->response.len = 0;
         } else if (md_engine_query_q(p->engine, j->entry, &j->query, &j->qv, &j->response, err)) {
+            j->qv.stats_rcode = 2;
+            if (!j->qv.stats_error) j->qv.stats_error = MD_SE_UPSTREAM;
             fprintf(stderr, "query failed: %s\n", err);
             md_trace_flag(MD_TF_ERROR);
             if (md_dns_error_q(&j->query, &j->qv, &j->response, 2)) j->response.len = 0;
         }
+        if (stats_picked) j->stats_service_us = (md_now_ns() - stats_picked) / 1000;
         md_trace_cur = NULL;
         job *followers = NULL;
         if (running) {
@@ -261,6 +284,16 @@ static void *work(void *arg) {
             if (md_trace_enabled) {
                 memcpy(f->tr.t + MD_T_PICKUP, j->tr.t + MD_T_PICKUP, (MD_T_REPLY - MD_T_PICKUP) * sizeof(f->tr.t[0]));
                 f->tr.flags |= MD_TF_FOLLOWER | (j->tr.flags & ~(uint32_t)MD_TF_LOOP_REPLY);
+            }
+            f->qv.stats_rcode = j->qv.stats_rcode;
+            f->qv.stats_error = j->qv.stats_error;
+            f->qv.stats_cache = j->qv.stats_cache;
+            f->qv.stats_coalesced = true;
+            f->stats_error = j->stats_error;
+            if (f->stats_start) {
+                uint64_t picked = stats_picked > f->stats_start ? stats_picked : f->stats_start;
+                f->stats_queue_us = (picked - f->stats_start) / 1000;
+                f->stats_service_us = (md_now_ns() - picked) / 1000;
             }
             f->response.len = j->response.len;
             if (j->response.len) {
@@ -338,6 +371,7 @@ static void tcp_read(pool *p, connection *c, int slot) {
             if (c->header_len == 2) {
                 c->expected = md_read16(c->header);
                 if (c->expected < 12 || !(c->body = malloc(c->expected))) {
+                    md_stats_event(p->stats, c->expected < 12 ? MD_SV_INVALID_TCP : MD_SV_MEMORY);
                     close_connection(p, c); return;
                 }
             }
@@ -345,19 +379,22 @@ static void tcp_read(pool *p, connection *c, int slot) {
             c->body_len += (size_t)n;
             if (c->body_len == c->expected) {
                 job *j = acquire_job(p);
-                if (!j) { close_connection(p, c); return; }
+                if (!j) { md_stats_event(p->stats, MD_SV_MEMORY); close_connection(p, c); return; }
                 memcpy(j->query.data, c->body, c->expected);
                 j->query.len = c->expected;
                 if (md_trace_enabled) j->tr.t[MD_T_RECV] = md_now_ns();
                 j->entry = c->entry; j->slot = slot; j->generation = c->generation;
                 char err[MD_ERROR_SIZE];
                 if (md_dns_query_parse(&j->query, &j->qv, err) || (j->qv.q.flags & 0x8000)) {
+                    md_stats_event(p->stats, MD_SV_INVALID_TCP);
                     recycle_job(p, j); close_connection(p, c); return;
                 }
+                stats_begin(p, j);
                 /* 快路径只处理引擎确认可直接返回的鲜缓存，其他查询按 lane 执行完整查询图。 */
                 if (md_trace_enabled) md_trace_cur = &j->tr;
                 j->lane = md_engine_dispatch_q(p->engine, j->entry, &j->query, &j->qv, &j->response);
                 md_trace_cur = NULL;
+                if (j->stats_start) j->stats_service_us = (md_now_ns() - j->stats_start) / 1000;
                 if (md_trace_enabled) j->tr.t[MD_T_DISPATCHED] = md_now_ns();
                 if (j->lane == MD_LANE_REPLY) {
                     j->tr.flags |= MD_TF_LOOP_REPLY;
@@ -365,6 +402,7 @@ static void tcp_read(pool *p, connection *c, int slot) {
                     c->output = j; c->sent = 0; c->write_start = md_now_ms();
                     md_write16(c->header, (uint16_t)j->response.len);
                 } else if (!enqueue(p, j)) {
+                    stats_done(j, false, MD_SE_QUEUE_FULL);
                     recycle_job(p, j); close_connection(p, c); return;
                 }
                 free(c->body); c->body = NULL; c->busy = true;
@@ -387,10 +425,11 @@ static void tcp_write(pool *p, connection *c) {
         ssize_t n = sendmsg(c->fd, &msg, 0);
         if (n < 0 && errno == EINTR) continue;
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
-        if (n <= 0) { close_connection(p, c); return; }
+        if (n <= 0) { stats_done(j, false, MD_SE_SEND); close_connection(p, c); return; }
         c->sent += (size_t)n; c->last = md_now_ms();
     }
     if (md_trace_enabled) { j->tr.flags |= MD_TF_TCP; trace_done(j); }
+    stats_done(j, true, 0);
     release_job(p, j); c->output = NULL; c->busy = false;
     c->header_len = c->body_len = c->expected = c->sent = 0;
 }
@@ -429,7 +468,7 @@ static int admit(pool *p, connection *cs, const tcp_limits *t, const uint8_t key
     if (same >= t->max_per_ip) victim = oldest_same;
     else if (free_slot < 0) victim = oldest;
     else return free_slot;
-    if (victim >= 0) close_connection(p, &cs[victim]);
+    if (victim >= 0) { md_stats_event(p->stats, MD_SV_TCP_EVICT); close_connection(p, &cs[victim]); }
     return victim;
 }
 /* 期限检查：busy 且尚无回复的连接由 worker 持有，不受期限影响（与原空闲超时一致）。 */
@@ -443,7 +482,7 @@ static void udp_read(pool *p, int fd, size_t entry) {
     /* Bound each drain so a hot UDP listener cannot starve TCP/completions. */
     for (unsigned i = 0; i < 16; i++) {
         job *j = acquire_job(p);
-        if (!j) return;
+        if (!j) { md_stats_event(p->stats, MD_SV_MEMORY); return; }
         j->peer_len = sizeof(j->peer);
         ssize_t n = recvfrom(fd, j->query.data, MD_MAX_PACKET, 0,
                              (struct sockaddr *)&j->peer, &j->peer_len);
@@ -451,10 +490,12 @@ static void udp_read(pool *p, int fd, size_t entry) {
         j->query.len = (size_t)n; j->socket = fd; j->entry = entry; j->slot = -1;
         if (md_trace_enabled) j->tr.t[MD_T_RECV] = md_now_ns();
         char err[MD_ERROR_SIZE];
-        if (md_dns_query_parse(&j->query, &j->qv, err) || (j->qv.q.flags & 0x8000)) { recycle_job(p, j); continue; }
+        if (md_dns_query_parse(&j->query, &j->qv, err) || (j->qv.q.flags & 0x8000)) { md_stats_event(p->stats, MD_SV_INVALID_UDP); recycle_job(p, j); continue; }
+        stats_begin(p, j);
         if (md_trace_enabled) md_trace_cur = &j->tr;
         j->lane = md_engine_dispatch_q(p->engine, entry, &j->query, &j->qv, &j->response);
         md_trace_cur = NULL;
+        if (j->stats_start) j->stats_service_us = (md_now_ns() - j->stats_start) / 1000;
         if (md_trace_enabled) j->tr.t[MD_T_DISPATCHED] = md_now_ns();
         if (j->lane == MD_LANE_REPLY) {
             j->tr.flags |= MD_TF_LOOP_REPLY;
@@ -462,11 +503,9 @@ static void udp_read(pool *p, int fd, size_t entry) {
             recycle_job(p, j); continue;
         }
         if (!enqueue(p, j)) {
-            if (!md_dns_error_q(&j->query, &j->qv, &j->response, 2)) {
-                ssize_t ignored = sendto(fd, j->response.data, j->response.len, 0,
-                                        (struct sockaddr *)&j->peer, j->peer_len);
-                (void)ignored;
-            }
+            j->stats_error = MD_SE_QUEUE_FULL; j->qv.stats_rcode = 2;
+            if (md_dns_error_q(&j->query, &j->qv, &j->response, 2)) j->response.len = 0;
+            reply_udp(j);
             recycle_job(p, j);
         }
     }
@@ -493,7 +532,7 @@ int md_server_run(md_engine *e, unsigned workers, char *err) {
     struct pollfd *pf = calloc(max_polled, sizeof(*pf));
     int *slots = calloc(max_polled, sizeof(*slots));
     uint64_t *generations = calloc(max_polled, sizeof(*generations));
-    pool p = {.engine = e, .wake = {-1, -1}, .queue_timeout = limits->queue_timeout_ms};
+    pool p = {.engine = e, .stats = md_engine_stats(e), .wake = {-1, -1}, .queue_timeout = limits->queue_timeout_ms};
     int udp_rcvbuf[64] = {0};
     unsigned started = 0;
     if (!fds || !cs || !threads || !roles || !pf || !slots || !generations) {
@@ -569,7 +608,11 @@ int md_server_run(md_engine *e, unsigned workers, char *err) {
             connection *c = &cs[i];
             if (c->fd < 0) continue;
             if (c->busy && !c->output) continue;
-            if (expired(c, &tl, now)) { close_connection(&p, c); continue; }
+            if (expired(c, &tl, now)) {
+                if (c->output) md_stats_event(p.stats, MD_SV_TCP_WRITE_TIMEOUT);
+                else if (c->header_len) md_stats_event(p.stats, MD_SV_TCP_READ_TIMEOUT);
+                close_connection(&p, c); continue;
+            }
             pf[n] = (struct pollfd){c->fd, c->output ? POLLOUT : POLLIN, 0};
             generations[n] = c->generation; slots[n++] = i;
         }
@@ -588,7 +631,7 @@ int md_server_run(md_engine *e, unsigned workers, char *err) {
                 if (fd < 0) break;
                 uint8_t key[16]; source_key(&peer, key);
                 int slot = admit(&p, cs, &tl, key);
-                if (slot < 0 || nonblock(fd)) { close(fd); continue; }
+                if (slot < 0 || nonblock(fd)) { if (slot < 0) md_stats_event(p.stats, MD_SV_TCP_LIMIT); close(fd); continue; }
                 cs[slot].fd = fd; cs[slot].last = md_now_ms();
                 memcpy(cs[slot].source, key, sizeof(key));
                 cs[slot].entry = l->entry;
@@ -614,16 +657,16 @@ cleanup:
     for (unsigned i = 0; i < MD_LANE_COUNT; i++) pthread_cond_broadcast(&p.lanes[i].ready);
     pthread_mutex_unlock(&p.lock);
     for (unsigned i = 0; i < started; i++) pthread_join(threads[i], NULL);
-    for (int i = 0; i < (int)max_connections; i++) close_connection(&p, &cs[i]);
+    for (int i = 0; i < (int)max_connections; i++) { if (cs[i].output) stats_done(cs[i].output, false, MD_SE_SHUTDOWN); close_connection(&p, &cs[i]); }
     job *j;
     for (unsigned i = 0; i < MD_LANE_COUNT; i++) {
         j = p.lanes[i].head;
-        while (j) { job *next = j->next; free(j); j = next; }
+        while (j) { job *next = j->next; stats_done(j, false, MD_SE_SHUTDOWN); free(j); j = next; }
     }
     j = p.done_head;
-    while (j) { job *next = j->next; free(j); j = next; }
+    while (j) { job *next = j->next; stats_done(j, false, MD_SE_SHUTDOWN); free(j); j = next; }
     j = p.idle;
-    while (j) { job *next = j->next; free(j); j = next; }
+    while (j) { job *next = j->next; stats_done(j, false, MD_SE_SHUTDOWN); free(j); j = next; }
     for (size_t i = 0; i < count; i++) if (fds[i] >= 0) close(fds[i]);
     if (p.wake[0] >= 0) close(p.wake[0]);
     if (p.wake[1] >= 0) close(p.wake[1]);
