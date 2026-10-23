@@ -56,7 +56,7 @@ NFT_CASES = {
         ("fast-existing", 0), ("fast-interval", 4), ("fast-error", 4))
        for family in ("ipv4", "ipv6")},
 }
-TEST_COUNTS = {"final_apk_loopback_integration": 12, "netlink_mock_assertions": 170,
+TEST_COUNTS = {"final_apk_loopback_integration": 13, "netlink_mock_assertions": 170,
                "nft_cli_checks": 30, "regex_concurrent_matches": 43200,
                "portable_regex_comparisons": 81089, "unexpected_regex_differences": 0,
                "known_budget_differences": 2}
@@ -259,6 +259,10 @@ def verify_commands(files, state, apk_name):
 def verify_tests(files, state, source, commands, logs):
     cases = nft_cases(source)
     test_counts = dict(TEST_COUNTS, nft_cli_checks=len(cases))
+    # Historical build summaries recorded 12; their frozen source and raw logs
+    # still must independently prove the full 13-test corpus checked below.
+    if state["application_version"] in ("0.1.0", "0.1.1", "0.1.2", "0.1.3"):
+        test_counts["final_apk_loopback_integration"] = 12
     require(all(type(state["tests"].get(key)) is int and state["tests"][key] == value
                 for key, value in test_counts.items()), "test summary counts differ")
     endings = {"qemu-dns_test": "dns/upstream tests passed",
@@ -357,7 +361,7 @@ def _verify_apk(folder, commit, run_id, attempt, arch, checkout):
     require(state["status"] == "passed" and "error" not in state and state["unsigned"] is True
             and state["signing_keys_created"] is False and state["same_sdk_application_matches_apk"] is True,
             "APK build failed, signed, created keys or mismatched tested application")
-    require(state["application_version"] in ("0.1.0", "0.1.1", "0.1.2", "0.1.3") and state["package_version"] == state["application_version"] + "-r1",
+    require(state["application_version"] in ("0.1.0", "0.1.1", "0.1.2", "0.1.3", "0.1.4") and state["package_version"] == state["application_version"] + "-r1",
             "buildinfo release version differs")
     apk_name = "diversion-dns-c-lite-" + state["package_version"] + "_" + arch + "_" + commit[:12] + ".apk"
     require(state["apk"]["filename"] == apk_name, "release APK filename differs")

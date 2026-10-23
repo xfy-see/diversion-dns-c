@@ -2,9 +2,19 @@
 
 独立的 C11/POSIX DNS 分流程序，从 mosdns C r12 导入后专用于 CN-site 场景。源码仍在 `c/`；运行时已去掉 YAML、插件图和 sequence，改用有界 `key=value` 配置与固定请求链。
 
-原始问题名匹配 CN 规则后，走共享缓存及唯一 CN/foreign 上游组；CN 回答包含缓存命中都经过原有 nft 最终处理。保留数字 UDP/TCP 上游、TCP 持久连接、TTL/LRU/lazy 缓存、Linux mark/接口绑定和 domain/full/keyword/regexp。没有跨组 fallback、热重载、服务安装或系统 DNS 接管。GPL-3.0-or-later。运行时不依赖 YAML；历史 YAML 配置仅作迁移输入与证据保留。
+原始问题名匹配 CN 规则后，走共享缓存及唯一 CN/foreign 上游组；CN 回答包含缓存命中都经过 nft 最终处理。保留数字 UDP/TCP 上游、TCP 持久连接、TTL/LRU/lazy 缓存、Linux mark/接口绑定和 domain/full/keyword/regexp。程序不提供跨组 fallback 或热重载；独立程序包不安装服务，可选 managed APK 提供服务与 LuCI，需显式配置启用，不自动接管系统 DNS。GPL-3.0-or-later。运行时不依赖 YAML；历史 YAML 配置仅作迁移输入与证据保留。
 
-## v0.1.3
+## v0.1.4
+
+[下载 v0.1.4](https://github.com/xfy-see/diversion-dns-c/releases/tag/v0.1.4) · [发布说明、24 项资产与升级注意](docs/release-v0.1.4.md)
+
+v0.1.4 汇总 v0.1.3 之后的境外缓存优化、常用域名定时维护、持续统计与 Top 50、OpenWrt 服务/LuCI 安装包、受保护升级与恢复，以及本地私有配置和发布隐私检查。新增缓存、定时维护、统计和出口切换能力均需显式启用；默认不改变现有路由或系统 DNS。
+
+双架构现在同时提供三种未签名 `0.1.4-r1` APK：`diversion-dns-c-lite` 只包含程序；`diversion-dns-c` 提供受管理的核心服务；`luci-app-diversion-dns` 提供与同版本核心配套的管理页面。按实际需求选择，安装布局和依赖见 [managed APK 说明](packaging/managed/README.md)。保留 PCRE2/lite 验证包和独立自动恢复覆盖包，后者不能直接套用到任意路由器。
+
+既有双架构真机证据对应 PR #31 候选提交 `3f658e4`，不代表本次 `0.1.4-r1` 最终包已完成设备验收；本次发布不部署生产主路由。正式发布及构建来源以 Release 和 `release-verification.json` 为准。[回滚新增配置残留 #32](https://github.com/xfy-see/diversion-dns-c/issues/32) 与 [查询/诊断共享状态 #33](https://github.com/xfy-see/diversion-dns-c/issues/33) 仍未解决。
+
+## v0.1.3（历史版本）
 
 [下载 v0.1.3](https://github.com/xfy-see/diversion-dns-c/releases/tag/v0.1.3) · [发布说明与升级注意](docs/release-v0.1.3.md)
 
@@ -40,6 +50,7 @@ v0.1.2 包含上游 UDP 随机 ID/源端口、DNS 解析复用、nft 并发回�
 默认读取 [config.conf](config.conf)。`check` 现在会加载全部 CN 规则文件并编译 regexp，不打开 listener、不查询上游、不写 nft；规则文件缺失也会失败。相对路径基于进程工作目录或 `-d` 指定目录。
 
 - [完整配置与迁移契约](docs/fixed-splitter.md)：全部键、限制、固定路由、缓存/nft 语义及部署前检查
+- [常用境外域名定时维护](docs/scheduled-cache-keep.md)、[运行统计与 Top 50](docs/runtime-stats.md)、[OpenWrt 服务与 LuCI](packaging/managed/README.md)：默认开关、指标口径、依赖和操作边界
 - [历史集成优化与验收记录](https://github.com/xfy-see/diversion-dns-c/blob/d9c4645109e97395d766a5c4a81223b39caf6249/docs/integrated-validation-20261010.md)：可选 POSIX-lite、`-Os`/LTO、OpenWrt 动态包及各自测试边界
 - [C 运行与验证说明](c/README.md)：依赖、服务限制、CI 和历史验证边界
 - [历史本地验证](https://github.com/xfy-see/diversion-dns-c/blob/d9c4645109e97395d766a5c4a81223b39caf6249/docs/specialized-validation-20261009.md) 与 [历史同机体积对照](https://github.com/xfy-see/diversion-dns-c/blob/d9c4645109e97395d766a5c4a81223b39caf6249/docs/specialized-size.md)：通过项、限制和复现依据
@@ -64,9 +75,9 @@ python3 scripts/migrate-site-config.py docs/go-profiles-site-only.yaml -o /tmp/s
 | Linux ARM64 static | 固定 Zig 0.14.1、PCRE2 10.48，静态 musl 程序和全部测试程序 |
 | Linux x86_64 static | 同样固定依赖的静态 musl 程序和全部测试程序 |
 
-同一工作流还显式构建并验证 POSIX-lite：native/sanitizer 覆盖 macOS ARM64 和 Linux x86_64，静态 musl 覆盖 Linux ARM64/x86_64。它们分别保存在 `experimental-lite-*` Actions 产物中，并在 manifest 内记录 backend；默认产物仍为 PCRE2，lite 不进入原有 CI 预发布；正式版本（v0.1.0 至 v0.1.3）另行收录经过同源验证的 lite 包。OpenWrt APK 另走 [SDK 实验流程](packaging/openwrt/README.md)。
+同一工作流还显式构建并验证 POSIX-lite：native/sanitizer 覆盖 macOS ARM64 和 Linux x86_64，静态 musl 覆盖 Linux ARM64/x86_64。它们分别保存在 `experimental-lite-*` Actions 产物中，并在 manifest 内记录 backend；默认产物仍为 PCRE2，lite 不进入原有 CI 预发布；正式版本（v0.1.0 至 v0.1.4）另行收录经过同源验证的 lite 包。OpenWrt APK 另走 [SDK 构建流程](packaging/openwrt/README.md)；v0.1.4 同时发布裸程序、managed core 和 LuCI APK。
 
-每个正式版本由各自的一次性发布 job（`release-010`、`release-011`、`release-012`、`release-013`）发布，只在 `VERSION` 与该版本一致时运行；它还等待双 APK job，并独立验证下载内容；已有 tag/release 一律不覆盖。v0.1.3 还显式核验同一 main 提交的 kernel、delivery 及独立测试套件，并提供带源码摘要清单的自动恢复覆盖包。
+每个正式版本由各自的一次性发布 job（`release-010`、`release-011`、`release-012`、`release-013`、`release-014`）发布，只在 `VERSION` 与该版本一致时运行；它还等待双 APK job，并独立验证下载内容；已有 tag/release 一律不覆盖。v0.1.3 起还显式核验同一 main 提交的 kernel、delivery 及独立测试套件，并提供带源码摘要清单的自动恢复覆盖包。v0.1.4 另核验每个 SDK 架构的 core/LuCI 包身份、依赖与 payload，资产清单固定为 24 项；UI 的包元数据为 `noarch`，下载文件名保留 SDK 架构以区分来源。
 
 main 分支的四个编译/测试 job 成功后，delivery job 会生成 `ci-<commit>-run<id>-attempt<n>` 预发布版本。四个同源 `.tar.gz` 下载包与 `SHA256SUMS` 可以直接从 GitHub Releases 下载，无需 Actions 登录；它们保留 Actions 包内同一份文件。
 

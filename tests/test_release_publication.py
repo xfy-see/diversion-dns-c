@@ -33,6 +33,7 @@ def load_publisher(name, version):
 pub = load_publisher("publish_010", "0.1.0")
 pub012 = load_publisher("publish_012", "0.1.2")
 pub013 = load_publisher("publish_013", "0.1.3")
+pub014 = load_publisher("publish_014", "0.1.4")
 
 
 @contextmanager
@@ -50,9 +51,9 @@ def publisher_source(publisher):
 
 class VersionContracts(unittest.TestCase):
     def test_application_recipe_and_metadata_share_version(self):
-        self.assertEqual((ROOT / "VERSION").read_text(), "0.1.3\n")
-        self.assertIn('puts("mosdns-c 0.1.3 fixed-splitter")', (ROOT / "c/main.c").read_text())
-        self.assertIn("PKG_VERSION:=0.1.3\nPKG_RELEASE:=1\n", (ROOT / "packaging/openwrt/Makefile").read_text())
+        self.assertEqual((ROOT / "VERSION").read_text(), "0.1.4\n")
+        self.assertIn('puts("mosdns-c 0.1.4 fixed-splitter")', (ROOT / "c/main.c").read_text())
+        self.assertIn("PKG_VERSION:=0.1.4\nPKG_RELEASE:=1\n", (ROOT / "packaging/openwrt/Makefile").read_text())
         self.assertIn("application_version", (ROOT / "scripts/artifacts.py").read_text())
 
     def test_only_main_push_release_job_gets_write_permission(self):
@@ -159,7 +160,7 @@ class PublishSequenceContractsMixin:
             error = None
             try:
                 self.pub.publish_assets([asset], commit, "release notes", 11, 1, 12, 1,
-                                        *([13, 1] if self.pub is pub013 else []))
+                                        *([13, 1] if self.pub in (pub013, pub014) else []))
             except ValueError as exc:
                 error = str(exc)
         return calls, error
@@ -310,7 +311,7 @@ class Release012Contracts(unittest.TestCase):
         self.assertEqual(blocks[0].replace("0.1.0", "0.1.1"), blocks[1])
         self.assertEqual(blocks[1].replace("0.1.1", "0.1.2"), blocks[2])
         self.assertIn("run: python3 scripts/publish-v0.1.2.py", blocks[2])
-        self.assertEqual(workflow.count("contents: write"), 5)
+        self.assertEqual(workflow.count("contents: write"), 6)
 
     def test_other_source_version_skips_before_any_github_read(self):
         for version in ("0.1.0", "0.1.1", "0.2.0"):
@@ -424,9 +425,8 @@ class PublishSequenceContracts013(PublishSequenceContractsMixin, unittest.TestCa
 
 class Release013Contracts(unittest.TestCase):
     def test_current_version_assets_notes_and_job(self):
-        self.assertEqual((ROOT / "VERSION").read_text().strip(), pub013.VERSION)
+        self.assertEqual(pub013.VERSION, "0.1.3")
         self.assertEqual(pub013.PACKAGE_VERSION, "0.1.3-r1")
-        self.assertIn(f'puts("{pub013.CLI_VERSION}")', (ROOT / "c/main.c").read_text())
         names = pub013.expected_asset_names()
         self.assertEqual(len(names), 18)
         self.assertIn("openwrt-recovery-v0.1.3.tar.gz", names)
@@ -563,6 +563,27 @@ class RecoveryOverlayContracts(unittest.TestCase):
                     path.write_bytes(gzip.compress(self.tar(changed)))
                     with self.assertRaises(ValueError):
                         pub013.verify_recovery_overlay(path, self.commit)
+
+
+class Release014Common(GitHubReadContractsMixin, PublishSequenceContractsMixin, ArtifactDownloadContractsMixin, unittest.TestCase):
+    pub = pub014
+
+
+class Release014Contracts(unittest.TestCase):
+    def test_current_version_assets_and_job(self):
+        self.assertEqual((ROOT / "VERSION").read_text().strip(), pub014.VERSION)
+        self.assertEqual(pub014.PACKAGE_VERSION, "0.1.4-r1")
+        self.assertIn(f'puts("{pub014.CLI_VERSION}")', (ROOT / "c/main.c").read_text())
+        self.assertEqual(len(pub014.expected_asset_names()), 24)
+        notes = (ROOT / pub014.NOTES).read_text()
+        for name in pub014.expected_asset_names():
+            self.assertIn(name, notes)
+        workflow = (ROOT / ".github/workflows/build.yml").read_text().split("  release-014:\n", 1)[1]
+        for token in ("needs: [native, static, delivery]", "refs/heads/main", "cancel-in-progress: false",
+                      "persist-credentials: false", "contents: write", "python3 scripts/publish-v0.1.4.py"):
+            self.assertIn(token, workflow)
+        self.assertEqual(pub014.BUILD_JOBS + pub014.APK_JOBS + pub014.SUITE_JOBS,
+                         pub013.BUILD_JOBS + pub013.APK_JOBS + pub013.SUITE_JOBS)
 
 
 if __name__ == "__main__":

@@ -17,7 +17,7 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(argv[1], "version")) {
         if (argc != 2) { fputs("version takes no arguments\n", stderr); return 1; }
-        puts("mosdns-c 0.1.3 fixed-splitter"); return 0;
+        puts("mosdns-c 0.1.4 fixed-splitter"); return 0;
     }
     if (!strcmp(argv[1], "stats")) {
         if (argc == 2) return md_stats_show("/tmp/diversion-dns-stats.json");

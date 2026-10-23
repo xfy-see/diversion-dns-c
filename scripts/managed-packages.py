@@ -19,6 +19,17 @@ CORE_DEPS=['libc','libpthread','procd','uci','nftables']
 UI_DEPS=['luci-base','luci-lib-jsonc','luci-lib-nixio','rpcd-mod-file','uclient-fetch','ca-bundle','libustream-mbedtls20201210','procd','uci','ip-full','nftables','wireguard-tools']
 
 
+def package_version(application_version,commit):
+    """Use stable APK versions from 0.1.4, preserving historical evidence names."""
+    if not isinstance(application_version,str) or not re.fullmatch(r'(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)',application_version):
+        raise ValueError('invalid application version')
+    if not isinstance(commit,str) or not re.fullmatch(r'[0-9a-f]{40}',commit):
+        raise ValueError('invalid source commit')
+    version=tuple(map(int,application_version.split('.')))
+    suffix='_pre20261019~'+commit[:12] if version<(0,1,4) else ''
+    return application_version+suffix+'-r1'
+
+
 def sha(data):return hashlib.sha256(data).hexdigest()
 
 def put(root,path,data,mode=0o644):
@@ -98,15 +109,15 @@ def verify_metadata(meta,expected,name,arch,version,deps):
 
 def build(source,binary,work,out,apktool,commit,arch,version,run):
     source,binary,work,out,apktool=map(Path,(source,binary,work,out,apktool))
-    package_version=version+'_pre20261019~'+commit[:12]+'-r1'
+    pkg_version=package_version(version,commit)
     roots=stage(source,binary,work/'managed-roots',commit)
-    result={'source_commit':commit,'version':package_version,'packages':{}}
+    result={'source_commit':commit,'version':pkg_version,'packages':{}}
     empty=work/'managed-empty-keys';empty.mkdir()
     for name,root in roots.items():
         pkgarch=arch if name==CORE else 'noarch'
-        deps=CORE_DEPS if name==CORE else [CORE+'='+package_version]+UI_DEPS
-        path=out/(name+'-'+package_version+'_'+pkgarch+'.apk')
-        cmd=['sudo','sh','-ec',ROOT_OWNER_SCRIPT,'managed-root-owner',root,str(os.getuid())+':'+str(os.getgid()),apktool,'mkpkg','--info','name:'+name,'--info','version:'+package_version,'--info','arch:'+pkgarch,'--info','license:GPL-3.0-or-later','--info','description:Managed DNS '+('core service' if name==CORE else 'statistics and diagnostics'),'--info','origin:diversion-dns-c','--info','url:https://github.com/xfy-see/diversion-dns-c','--info','repo-commit:'+commit,'--info','depends:'+' '.join(deps),'--files',root,'--output',path]
+        deps=CORE_DEPS if name==CORE else [CORE+'='+pkg_version]+UI_DEPS
+        path=out/(name+'-'+pkg_version+'_'+pkgarch+'.apk')
+        cmd=['sudo','sh','-ec',ROOT_OWNER_SCRIPT,'managed-root-owner',root,str(os.getuid())+':'+str(os.getgid()),apktool,'mkpkg','--info','name:'+name,'--info','version:'+pkg_version,'--info','arch:'+pkgarch,'--info','license:GPL-3.0-or-later','--info','description:Managed DNS '+('core service' if name==CORE else 'statistics and diagnostics'),'--info','origin:diversion-dns-c','--info','url:https://github.com/xfy-see/diversion-dns-c','--info','repo-commit:'+commit,'--info','depends:'+' '.join(deps),'--files',root,'--output',path]
         prefix='core' if name==CORE else 'ui'
         hooks={}
         for hook in sorted((source/'packaging/managed/hooks').glob(prefix+'.*')):
@@ -114,7 +125,7 @@ def build(source,binary,work,out,apktool,commit,arch,version,run):
         run('managed-pack-'+name,cmd)
         raw,_=run('managed-metadata-'+name,[apktool,'adbdump','--format','json',path]);meta=json.loads(raw)
         if meta.get('scripts',{})!=hooks:raise ValueError('APK hook mismatch')
-        expected=contents(root);verify_metadata(meta,expected,name,pkgarch,package_version,deps)
+        expected=contents(root);verify_metadata(meta,expected,name,pkgarch,pkg_version,deps)
         (out/(name+'-metadata.json')).write_text(json.dumps(meta,indent=2)+'\n')
         run('managed-integrity-'+name,[apktool,'verify','--allow-untrusted','--no-network','--keys-dir',empty,path])
         extracted=work/('managed-extracted-'+name);extracted.mkdir()
@@ -137,7 +148,7 @@ def verify_evidence(files,state,source,commands,logs):
     import tempfile
     managed=json.loads(files['managed-packages.json'])
     if managed!=state['managed'] or set(managed['packages'])!={CORE,UI}:raise ValueError('managed manifest mismatch')
-    commit=state['source_commit'];version=state['application_version']+'_pre20261019~'+commit[:12]+'-r1'
+    commit=state['source_commit'];version=package_version(state['application_version'],commit)
     if managed['source_commit']!=commit or managed['version']!=version:raise ValueError('managed provenance mismatch')
     original=json.loads(files['apk-metadata.json'])
     elf=next(item for directory in original['paths'] for item in directory.get('files',[]) if directory.get('name')=='usr/sbin' and item['name']=='diversion-dns-c-lite')

@@ -132,6 +132,8 @@ class Evidence:
                       "pcre2_reference": {"archive_sha256": verify.builder.PCRE2_SHA256, "driver": record()},
                       "runtime_scope": "official SDK musl runtime under QEMU; not installed firmware or device acceptance",
                       "not_tested": ["router installation", "real kernel nftables", "hardware compatibility", "RSS/QPS", "sustained stability", "actual flash increment"]}
+        if version in ("0.1.0", "0.1.1", "0.1.2", "0.1.3"):
+            self.state["tests"]["final_apk_loopback_integration"] = 12
         self.manifest = {"source_commit": self.commit, "recipe_sha256": record(self.source["packaging/openwrt/Makefile"])["sha256"],
                          "source_files_sha256": {n: record(d)["sha256"] for n, d in self.source.items() if n == "LICENSE" or n.startswith("c/")}}
         self.nft = {"ok": True, "count": len(cases), "sanitized": False, "device_or_kernel_evidence": False, "commands": [],
@@ -203,8 +205,9 @@ class ReleaseInputs(unittest.TestCase):
     def test_current_release_both_architectures_accept_complete_evidence(self):
         for arch in verify.builder.TARGETS:
             with self.subTest(arch=arch):
-                fixture = self.fixture(arch, "0.1.2")
+                fixture = self.fixture(arch, "0.1.4")
                 self.assertEqual(fixture.check(), fixture.state)
+                self.assertEqual(fixture.state["tests"]["final_apk_loopback_integration"], 13)
                 self.assertEqual(fixture.state["tests"]["nft_cli_checks"], 86)
                 fixture.state["application_version"] = "0.1.1"
                 fixture.state["package_version"] = "0.1.1-r1"
@@ -239,6 +242,22 @@ class ReleaseInputs(unittest.TestCase):
             with self.subTest(arch=arch):
                 fixture = self.fixture(arch, "0.1.3")
                 self.assertEqual(fixture.check()["application_version"], "0.1.3")
+                self.assertEqual(fixture.state["tests"]["final_apk_loopback_integration"], 12)
+
+    def test_integration_summary_count_is_versioned_but_raw_corpus_remains_required(self):
+        for version, wrong_count in (("0.1.3", 13), ("0.1.4", 12)):
+            with self.subTest(version=version):
+                fixture = self.fixture(version=version)
+                original_count = fixture.state["tests"]["final_apk_loopback_integration"]
+                fixture.state["tests"]["final_apk_loopback_integration"] = wrong_count
+                fixture.refresh()
+                with self.assertRaisesRegex(ValueError, "test summary counts differ"):
+                    fixture.check()
+                fixture.state["tests"]["final_apk_loopback_integration"] = original_count
+                fixture.outputs["qemu-final-apk-integration"] = fixture.outputs["qemu-final-apk-integration"].replace("Ran 13", "Ran 12")
+                fixture.refresh()
+                with self.assertRaisesRegex(ValueError, "integration corpus"):
+                    fixture.check()
 
     def test_checksums_reject_traversal_duplicates_and_invalid_hashes(self):
         fixture = self.fixture()

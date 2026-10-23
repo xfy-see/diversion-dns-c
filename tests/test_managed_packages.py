@@ -1,8 +1,119 @@
 """Managed APK payload and lifecycle checks; no compiler or device access."""
-import importlib.util,json,re,subprocess,tempfile,unittest,os,signal,time
+import importlib.util,json,re,subprocess,tempfile,unittest,os,signal,time,shutil
 from pathlib import Path
+from unittest import mock
 ROOT=Path(__file__).resolve().parents[1]
 spec=importlib.util.spec_from_file_location('managed',ROOT/'scripts/managed-packages.py');M=importlib.util.module_from_spec(spec);spec.loader.exec_module(M)
+
+
+class PackageVersion(unittest.TestCase):
+    def test_historical_versions_keep_exact_evidence_names(self):
+        for version in ('0.0.0', '0.1.0', '0.1.1', '0.1.2', '0.1.3'):
+            with self.subTest(version=version):
+                self.assertEqual(M.package_version(version, 'abcdef012345' + '9' * 28),
+                                 version + '_pre20261019~abcdef012345-r1')
+
+    def test_stable_versions_use_numeric_version_order(self):
+        for version in ('0.1.4', '0.1.10', '0.2.0', '1.0.0', '10.0.0'):
+            with self.subTest(version=version):
+                for commit in ('a' * 40, 'b' * 40):
+                    self.assertEqual(M.package_version(version, commit), version + '-r1')
+
+    def test_invalid_versions_and_commits_are_rejected(self):
+        versions = ('', 'v0.1.4', '0.1', '0.1.4.0', '00.1.4', '0.01.4', '0.1.04',
+                    '-1.0.0', '0.1.4-rc1', '0.1.4+r1', ' 0.1.4', '0.1.4\n',
+                    '０.1.4', None, 1, True, b'0.1.4')
+        commits = ('', 'a' * 39, 'a' * 41, 'A' * 40, 'g' * 40, 'a' * 40 + '\n',
+                   '../' + 'a' * 37, None, 1, True, b'a' * 40)
+        for version in versions:
+            with self.subTest(version=version), self.assertRaisesRegex(ValueError, 'application version'):
+                M.package_version(version, 'a' * 40)
+        for version in ('0.1.3', '0.1.4'):
+            for commit in commits:
+                with self.subTest(version=version, commit=commit), self.assertRaisesRegex(ValueError, 'source commit'):
+                    M.package_version(version, commit)
+
+    def test_build_rejects_invalid_identity_before_staging_or_commands(self):
+        for version, commit in (('v0.1.4', 'a' * 40), ('0.1.4', 'A' * 40)):
+            with self.subTest(version=version, commit=commit), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                runner = mock.Mock(side_effect=AssertionError('external command'))
+                with mock.patch.object(M, 'stage') as stage, self.assertRaises(ValueError):
+                    M.build(ROOT, root / 'elf', root, root, root / 'apk', commit,
+                            'mipsel_24kc', version, runner)
+                stage.assert_not_called()
+                runner.assert_not_called()
+
+    def test_build_and_evidence_verifier_agree_for_legacy_and_stable_packages(self):
+        for version, expected_version in (('0.1.3', '0.1.3_pre20261019~aaaaaaaaaaaa-r1'),
+                                          ('0.1.4', '0.1.4-r1')):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                binary = root / 'elf'
+                binary.write_bytes(b'fixture ELF, never executed')
+                work, out = root / 'work', root / 'out'
+                work.mkdir()
+                out.mkdir()
+                metadata, roots, commands, logs = {}, {}, {}, {}
+
+                def runner(label, argv):
+                    argv = list(map(str, argv))
+                    commands[label] = argv
+                    name = M.CORE if label.endswith(M.CORE) else M.UI
+                    if label.startswith('managed-pack-'):
+                        self.assertEqual(argv[:4], ['sudo', 'sh', '-ec', M.ROOT_OWNER_SCRIPT])
+                        info = dict(argv[i + 1].split(':', 1) for i, arg in enumerate(argv) if arg == '--info')
+                        self.assertEqual(info['version'], expected_version)
+                        self.assertEqual(info['repo-commit'], 'a' * 40)
+                        info['depends'] = info['depends'].split()
+                        roots[name] = Path(argv[argv.index('--files') + 1])
+                        expected = M.contents(roots[name])
+                        info['installed-size'] = sum(row['bytes'] for row in expected.values())
+                        hooks = {}
+                        for i, arg in enumerate(argv):
+                            if arg == '--script':
+                                kind, path = argv[i + 1].split(':', 1)
+                                hooks[kind] = Path(path).read_text()
+                        metadata[name] = {'info': info, 'scripts': hooks, 'paths': [
+                            {'name': str(Path(path).parent), 'acl': {'user': 'root', 'group': 'root'},
+                             'files': [{'name': Path(path).name, 'hash': row['sha256'], 'size': row['bytes'],
+                                        'acl': {'mode': row['mode'], 'user': 'root', 'group': 'root'}}]}
+                            for path, row in expected.items()]}
+                        Path(argv[argv.index('--output') + 1]).write_bytes(b'synthetic APK, never executed')
+                    elif label.startswith('managed-metadata-'):
+                        logs[label] = json.dumps(metadata[name])
+                        return logs[label], 0
+                    elif label.startswith('managed-extract-'):
+                        destination = Path(argv[argv.index('--destination') + 1])
+                        shutil.copytree(roots[name], destination, dirs_exist_ok=True)
+                    elif not label.startswith('managed-integrity-'):
+                        self.fail('unmocked external command: ' + label)
+                    return '', 0
+
+                result = M.build(ROOT, binary, work, out, root / 'fake-apk', 'a' * 40,
+                                 'mipsel_24kc', version, runner)
+                self.assertEqual(result['version'], expected_version)
+                self.assertEqual(result['packages'][M.UI]['depends'][0], M.CORE + '=' + expected_version)
+                self.assertEqual(set(commands), set(M.command_names()))
+                files = {path.name: path.read_bytes() for path in out.iterdir()}
+                files['apk-metadata.json'] = json.dumps({'paths': [{'name': 'usr/sbin', 'files': [
+                    {'name': 'diversion-dns-c-lite', 'hash': M.sha(binary.read_bytes()),
+                     'size': binary.stat().st_size}]}]}).encode()
+                source = {str(p.relative_to(ROOT)): p.read_bytes()
+                          for p in (ROOT / 'packaging/managed').rglob('*') if p.is_file()}
+                state = {'managed': result, 'source_commit': 'a' * 40,
+                         'application_version': version, 'architecture': 'mipsel_24kc'}
+                self.assertEqual(M.verify_evidence(files, state, source, commands, logs), result)
+                for bad_version in ('v0.1.4', '0.1.04'):
+                    state['application_version'] = bad_version
+                    with self.assertRaisesRegex(ValueError, 'application version'):
+                        M.verify_evidence(files, state, source, commands, logs)
+                state['application_version'] = version
+                state['source_commit'] = 'A' * 40
+                with self.assertRaisesRegex(ValueError, 'source commit'):
+                    M.verify_evidence(files, state, source, commands, logs)
+
+
 class ManagedPackage(unittest.TestCase):
  def test_stage_owns_only_its_paths_and_never_ships_network_controller(self):
   with tempfile.TemporaryDirectory() as td:

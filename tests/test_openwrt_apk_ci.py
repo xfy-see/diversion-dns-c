@@ -44,7 +44,7 @@ def load(name):
 
 def metadata(arch="aarch64_cortex-a53"):
     return {
-        "info": {"name": "diversion-dns-c-lite", "arch": arch, "version": "0.1.3-r1",
+        "info": {"name": "diversion-dns-c-lite", "arch": arch, "version": "0.1.4-r1",
                  "depends": ["libc", "libpthread"],
                  "installed-size": sum(map(len, CONTENTS.values()))},
         "paths": [{"name": str(Path(name).parent), "acl": {"mode": 0o755}, "files": [
@@ -345,7 +345,7 @@ class SyntheticBuild:
             for name in self.module.TESTS:
                 self.write(self.build / "tests" / name)
             if not self.omit_apk:
-                self.write(self.sdk / "bin/packages" / self.arch / "local/diversion-dns-c-lite-0.1.3-r1.apk", b"fake APK container")
+                self.write(self.sdk / "bin/packages" / self.arch / "local/diversion-dns-c-lite-0.1.4-r1.apk", b"fake APK container")
         elif command[0] == "make" and "defconfig" in command:
             label = "sdk-defconfig"
         elif command[0] == "make" and "package/diversion-dns-c-lite/compile" in command:
@@ -386,7 +386,7 @@ class SyntheticBuild:
         elif command[0].endswith("/sstrip"):
             label = "sstrip-rebuilt"
         elif command[0].endswith("/wrappers/packaged-app"):
-            label, text = "apk-version", "mosdns-c 0.1.3 fixed-splitter\n"
+            label, text = "apk-version", "mosdns-c 0.1.4 fixed-splitter\n"
         elif "/wrappers/" in command[0]:
             name = Path(command[0]).name
             label = "qemu-" + name
@@ -465,7 +465,9 @@ class BuildOrchestrationContracts(unittest.TestCase):
                 self.assertTrue(state["unsigned"])
                 self.assertFalse(state["signing_keys_created"])
                 self.assertTrue(state["same_sdk_application_matches_apk"])
-                self.assertEqual(state["tests"]["final_apk_loopback_integration"], 12)
+                self.assertEqual(state["application_version"], "0.1.4")
+                self.assertEqual(state["package_version"], "0.1.4-r1")
+                self.assertEqual(state["tests"]["final_apk_loopback_integration"], 13)
                 wrapper = build.work / "wrappers/packaged-app"
                 self.assertIn(str(build.work / "package-extracted" / APP), wrapper.read_text())
                 self.assertIn("-L " + str(build.toolchain), wrapper.read_text())
