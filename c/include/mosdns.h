@@ -160,11 +160,15 @@ md_cache *md_cache_new_ex(size_t capacity, const md_cache_options *o);
 enum {
     MD_CS_FRESH, MD_CS_STALE, MD_CS_COLD, MD_CS_EVICTED, MD_CS_EXPIRED, MD_CS_BYPASS,
     MD_CS_REFRESH_OK, MD_CS_REFRESH_FAIL, MD_CS_REFRESH_KEPT, MD_CS_PREFETCH,
-    MD_CS_EVICTIONS, MD_CS_WARM, MD_CS_COUNT
+    MD_CS_EVICTIONS, MD_CS_WARM, MD_CS_KEEP_QUERY, MD_CS_KEEP_OK, MD_CS_KEEP_FAIL, MD_CS_KEEP_DEFER, MD_CS_COUNT
 };
 typedef struct { uint64_t v[2][MD_CS_COUNT]; size_t entries[2]; uint64_t bytes[2]; } md_cache_stats;
 extern const char *const md_cache_stat_names[MD_CS_COUNT];
 typedef struct { bool prefetch_due; } md_cache_hit;
+/* Read-only metadata for scheduled maintenance: no hit counters, hotness,
+ * LRU movement, copying or prefetch claims. Expired entries may be returned. */
+typedef struct { uint64_t stored, expires; bool positive; } md_cache_lifetime;
+bool md_cache_peek(md_cache *c, const md_packet *q, const md_dns_query *qv, md_cache_lifetime *life);
 /* flags for md_cache_get_ex */
 #define MD_CACHE_COUNT 1u     /* count one logical request, including entry hotness */
 #define MD_CACHE_CLAIM 2u     /* claim a due prefetch (only one claimer wins) */

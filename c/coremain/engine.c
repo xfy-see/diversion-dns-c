@@ -40,6 +40,7 @@ typedef enum {
     CACHE_STALE, CACHE_STALE_CN, CACHE_STALE_ANSWER, CACHE_STALE_OVERRIDE,
     CACHE_PREFETCH, CACHE_PREFETCH_MAX, CACHE_MAX_BYTES, CACHE_FOREIGN_RESERVE,
     CACHE_WARM_FILE, CACHE_WARM_MAX, CACHE_WARM_QPS, CACHE_WARM_SAVE,
+    CACHE_KEEP_FILE, CACHE_KEEP_QPS, CACHE_KEEP_PERCENT,
     KEY_COUNT
 } config_key;
 static const char *const key_names[KEY_COUNT] = {
@@ -51,7 +52,8 @@ static const char *const key_names[KEY_COUNT] = {
     "nftset_hit_window_ms",
     "cache_stale_ttl", "cache_stale_ttl_cn", "cache_stale_answer_ttl", "cache_stale_override",
     "cache_prefetch_percent", "cache_prefetch_max", "cache_max_bytes", "cache_foreign_reserve_percent",
-    "cache_warm_file", "cache_warm_max", "cache_warm_qps", "cache_warm_save_interval"
+    "cache_warm_file", "cache_warm_max", "cache_warm_qps", "cache_warm_save_interval",
+    "cache_keep_file", "cache_keep_qps", "cache_keep_percent"
 };
 /* 可重复（列表）键；其余键只能出现一次。 */
 static bool list_key(size_t k) { return k <= FOREIGN_UPSTREAM || k == CACHE_STALE_OVERRIDE; }
@@ -62,6 +64,13 @@ typedef struct { config_values keys[KEY_COUNT]; size_t last_line; } config;
 typedef struct refresh_job refresh_job;
 typedef struct { md_upstream *items; size_t count; unsigned concurrent; } upstream_group;
 typedef struct { uint32_t seconds; md_domain *domains; } stale_override;
+#define KEEP_MAX 256u
+#define KEEP_FILE_MAX 65536u
+typedef struct {
+    char line[280]; /* same key flags/type/name syntax as restart warm file */
+    uint64_t next_ns;
+    unsigned failures, jitter;
+} keep_entry;
 struct md_engine {
     md_domain *cn;
     md_cache *cache;
@@ -78,6 +87,9 @@ struct md_engine {
     stale_override overrides[STALE_OVERRIDE_MAX]; size_t override_count;
     uint32_t prefetch_max, warm_max, warm_qps, warm_save, stats_interval;
     char *warm_file;
+    keep_entry *keep; size_t keep_count, keep_cursor;
+    uint32_t keep_qps, keep_percent;
+    uint64_t keep_next_ns;
     pthread_t maintenance; bool maintenance_running;
 };
 struct refresh_job {
@@ -271,6 +283,7 @@ static int validate_nft(const char *s, bool ipv6, char *err) {
     md_nft_free(test); return 0;
 }
 /* 缓存策略键：新键全部默认关闭/不改变旧行为（见 docs/fixed-splitter.md）。 */
+static int keep_load(md_engine *e, const char *path, char *err);
 static int build_cache(md_engine *e, const config *c, uint32_t capacity, uint32_t lazy, const char *path, char *err) {
     uint32_t stale, stale_cn, answer, prefetch, prefetch_max, max_bytes, reserve, warm_max, warm_qps, warm_save;
     if (config_number(c, CACHE_STALE, 0, 0, 86400, false, &stale, path, err) ||
@@ -317,6 +330,22 @@ static int build_cache(md_engine *e, const config *c, uint32_t capacity, uint32_
         return config_error(err, path, key_line(c, CACHE_WARM_FILE), "invalid cache_warm_file path");
     if (*warm && !(e->warm_file = strdup(warm))) return config_error(err, path, key_line(c, CACHE_WARM_FILE), "out of memory");
     e->prefetch_max = prefetch_max; e->warm_max = warm_max; e->warm_qps = warm_qps; e->warm_save = warm_save;
+    if (config_number(c, CACHE_KEEP_QPS, 2, 1, 2, false, &e->keep_qps, path, err) ||
+        config_number(c, CACHE_KEEP_PERCENT, 10, 1, 50, false, &e->keep_percent, path, err)) return -1;
+    for (config_key k = CACHE_KEEP_FILE; k <= CACHE_KEEP_PERCENT; k++) {
+        if (c->keys[k].count && (!capacity || !c->keys[CACHE_KEEP_FILE].count))
+            return config_error(err, path, key_line(c, k), "cache_keep_* requires cache_keep_file and nonzero cache_size");
+    }
+    const char *keep = value(c, CACHE_KEEP_FILE);
+    if (*keep) {
+        struct stat ks, ws;
+        if (*warm && (!strcmp(keep, warm) || (!stat(keep, &ks) && !stat(warm, &ws) &&
+            ks.st_dev == ws.st_dev && ks.st_ino == ws.st_ino)))
+            return config_error(err, path, key_line(c, CACHE_KEEP_FILE), "fixed keep list must differ from writable cache_warm_file");
+        if (keep_load(e, keep, err)) return config_error(err, path, key_line(c, CACHE_KEEP_FILE), err);
+        if (e->keep_count > capacity / 2)
+            return config_error(err, path, key_line(c, CACHE_KEEP_FILE), "fixed keep list exceeds half of cache_size");
+    }
     md_cache_options o = {0};
     o.lazy_ttl = lazy; o.stale_ttl[MD_CACHE_CN] = stale_cn; o.stale_ttl[MD_CACHE_FOREIGN] = stale;
     o.stale_answer_ttl = answer; o.max_bytes = max_bytes; o.foreign_reserve_percent = reserve; o.prefetch_percent = prefetch;
@@ -583,6 +612,7 @@ static int warm_query(const char *line, md_packet *q) {
     }
     q->len = len; return 0;
 }
+#include "cache_keep.h"
 /* 可被 stopping 打断的实时等待；返回 true 表示应退出。 */
 static bool maintenance_wait(md_engine *e, uint64_t ms) {
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
@@ -652,11 +682,20 @@ static void warm_load(md_engine *e) {
 static void *maintenance_thread(void *opaque) {
     md_engine *e = opaque;
     if (e->warm_file) warm_load(e);
-    uint64_t since_save = 0, since_stats = 0;
-    while (!maintenance_wait(e, 1000)) {
-        if (e->warm_file && ++since_save >= e->warm_save) { since_save = 0; (void)warm_save(e); }
-        if (e->stats_interval && ++since_stats >= e->stats_interval) { since_stats = 0; print_cache_stats(e); }
+    /* The fixed-list scheduler has one sequential upstream operation at most.
+     * It never occupies foreground worker queues. Wakeups/clock reads exist
+     * only in this opt-in maintenance thread, never on the query hot path. */
+    md_packet *q = e->keep_count ? malloc(sizeof(*q)) : NULL;
+    md_packet *r = e->keep_count ? malloc(sizeof(*r)) : NULL;
+    if (e->keep_count && (!q || !r)) fprintf(stderr, "cache keep: cannot allocate packets\n");
+    uint64_t saved = md_now(), printed = saved;
+    while (!maintenance_wait(e, e->keep_count ? 100 : 1000)) {
+        if (q && r) keep_tick(e, q, r);
+        uint64_t now = md_now();
+        if (e->warm_file && now - saved >= e->warm_save) { saved = now; (void)warm_save(e); }
+        if (e->stats_interval && now - printed >= e->stats_interval) { printed = now; print_cache_stats(e); }
     }
+    free(q); free(r);
     return NULL;
 }
 md_engine *md_engine_load(const char *path, bool check, char *err) {
@@ -686,7 +725,7 @@ md_engine *md_engine_load(const char *path, bool check, char *err) {
 int md_engine_start(md_engine *e, char *err) {
     if (!e || e->check || !e->wake_ok || e->stopping) return fail(err, "engine is not ready to start");
     if (e->runtime_started) return 0;
-    if (e->cache && (e->warm_file || e->stats_interval)) {
+    if (e->cache && (e->warm_file || e->stats_interval || e->keep_count)) {
         int rc = md_thread_create(&e->maintenance, maintenance_thread, e);
         if (rc) return fail(err, "cache maintenance thread: %s", strerror(rc));
         e->maintenance_running = true;
@@ -789,7 +828,7 @@ void md_engine_free(md_engine *e) {
                 (unsigned long long)st.applies, (unsigned long long)st.skipped, (unsigned long long)st.transactions);
     }
     for (size_t i = 0; i < e->override_count; i++) md_domain_free(e->overrides[i].domains);
-    free(e->warm_file); if (e->wake_ok) pthread_cond_destroy(&e->wake);
+    free(e->keep); free(e->warm_file); if (e->wake_ok) pthread_cond_destroy(&e->wake);
     md_domain_free(e->cn); md_cache_free(e->cache); md_nft_free(e->nft);
     free(e->upstreams[0].items); free(e->upstreams[1].items); free(e->listeners);
     pthread_mutex_destroy(&e->lock); free(e);
