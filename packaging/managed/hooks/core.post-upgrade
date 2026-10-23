@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+if [ -f /var/run/diversion-dns-package-upgrade ]; then
+ /etc/init.d/diversion-dns start
+ rm -f /var/run/diversion-dns-package-upgrade
+fi

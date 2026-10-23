@@ -1,0 +1,41 @@
+#!/bin/sh /etc/rc.common
+START=94
+STOP=10
+USE_PROCD=1
+start_service() {
+ local enabled config_file nft_init cpu memory_limit cache_stats
+ config_load diversion-dns
+ config_get_bool enabled main enabled 0
+ [ "$enabled" = 1 ] || return 0
+ config_get config_file main config_file /etc/diversion-dns/config.conf
+ case "$config_file" in
+  /etc/diversion-dns/config.conf|/etc/diversion-dns-c-lite/config.conf|/etc/diversion-dns-c-test/config.conf) ;;
+  *) logger -t diversion-dns 'Unsupported configuration path'; return 1;;
+ esac
+ [ -f "$config_file" ] && [ ! -L "$config_file" ] || return 1
+ /usr/libexec/diversion-dns-c check -c "$config_file" || return 1
+ config_get_bool nft_init main nft_init 0
+ config_get cpu main cpu 0
+ config_get memory_limit main memory_limit 0
+ config_get cache_stats main cache_stats 0
+ for value in "$cpu" "$memory_limit" "$cache_stats"; do
+  case "$value" in ''|*[!0-9]*) return 1;; esac
+ done
+ [ "$cpu" -le 64 ] && [ "$memory_limit" -le 2147483647 ] && [ "$cache_stats" -le 86400 ] || return 1
+ if [ "$nft_init" = 1 ]; then
+  [ -f /etc/diversion-dns/nft-init.nft ] && [ ! -L /etc/diversion-dns/nft-init.nft ] || return 1
+  nft -f /etc/diversion-dns/nft-init.nft || return 1
+ fi
+ procd_open_instance
+ procd_set_param command /usr/libexec/diversion-dns-c start -c "$config_file"
+ [ "$cpu" -eq 0 ] || procd_append_param command --cpu "$cpu"
+ [ "$cache_stats" -eq 0 ] || procd_set_param env DIVERSION_CACHE_STATS="$cache_stats"
+ procd_set_param file "$config_file"
+ procd_set_param respawn 3600 5 3
+ procd_set_param limits core=0 nofile=1024
+ [ "$memory_limit" -eq 0 ] || procd_append_param limits as="$memory_limit"
+ procd_set_param stdout 1
+ procd_set_param stderr 1
+ procd_close_instance
+}
+service_triggers() { procd_add_reload_trigger diversion-dns; }

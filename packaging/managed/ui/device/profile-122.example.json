@@ -1,0 +1,12 @@
+{
+  "device": "122",
+  "config": "/etc/diversion-dns-c-lite/config.conf",
+  "service": "diversion-dns",
+  "dns_host": "127.0.0.1",
+  "dns_port": 15353,
+  "direct_listener": false,
+  "table": "mark_routing",
+  "tunnel": "wg0",
+  "selected": "wg0",
+  "expected_config_sha": ""
+}

@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+/etc/init.d/diversion-dns-ui stop
+/etc/init.d/diversion-dns-ui disable
+rm -f /var/run/diversion-dns-ui-package-upgrade

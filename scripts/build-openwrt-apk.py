@@ -127,6 +127,7 @@ def main():
     parser.add_argument("--source-ref", default="HEAD")
     parser.add_argument("--qemu", type=Path, help="optional existing emulator path for local testing")
     parser.add_argument("--jobs", type=int, default=4)
+    parser.add_argument("--managed", action="store_true", help="also build the core service and LuCI companion APKs")
     args = parser.parse_args()
     require(1 <= args.jobs <= 32, "jobs must be 1..32")
     target = TARGETS[args.arch]
@@ -138,7 +139,7 @@ def main():
     # Helpers and recipe must correspond to the same frozen commit as the C code.
     for name in ["scripts/build-openwrt-apk.py", "scripts/check-openwrt-elf.py",
                  "scripts/stage-openwrt-package.py", "packaging/openwrt/Makefile",
-                 "packaging/openwrt/targets.json", "c/Makefile", "c/main.c", "VERSION", "c/tests/nft_cli_contract.json"]:
+                 "packaging/openwrt/targets.json", "c/Makefile", "c/main.c", "VERSION", "c/tests/nft_cli_contract.json"] + (["scripts/managed-packages.py"] if args.managed else []):
         expected = subprocess.check_output(["git", "show", commit + ":" + name], cwd=ROOT)
         require((ROOT / name).read_bytes() == expected, "uncommitted build input: " + name)
     version = (ROOT / "VERSION").read_text().strip()
@@ -328,6 +329,9 @@ def main():
             require(digest(staged / "src" / name) == expected_hash, "staged source changed")
         require(digest(apk) == state["apk"]["sha256"], "APK changed during verification")
         no_signing_keys(sdk)
+        if args.managed:
+            state["managed"] = load_script("managed-packages").build(
+                source, binary, work, out, apktool, commit, args.arch, version, run)
         state["signing_keys_created"] = False
         state["status"] = "passed"
         save()
@@ -347,6 +351,9 @@ def main():
             "GCC runtime portions: GPLv3 with GCC Runtime Library Exception 3.1.\n"
             "https://www.gnu.org/licenses/gcc-exception-3.1.html\n"
             "GCC 14.3.0 source: https://gcc.gnu.org/git/?p=gcc.git;a=tree;hb=releases/gcc-14.3.0\n")
+        if args.managed:
+            readme = out / "README.txt"
+            readme.write_text("This artifact also includes two managed candidate APKs; see managed-packages.json and source packaging/managed/README.md for lifecycle and deployment boundaries. The following legacy notes apply only to diversion-dns-c-lite.\n\n" + readme.read_text())
         paths = sorted(path for path in out.rglob("*") if path.is_file())
         (out / "SHA256SUMS").write_text("".join(f"{digest(path)}  {path.relative_to(out)}\n" for path in paths))
         print(json.dumps({"status": "passed", "output": str(out), "apk": state["apk"], "elf": state["elf"]}), flush=True)

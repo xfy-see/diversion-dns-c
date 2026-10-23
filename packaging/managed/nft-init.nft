@@ -1,0 +1,2 @@
+# Optional, operator-owned nft initialization. Disabled by default.
+# Use idempotent add table/set definitions; never flush shared rules.

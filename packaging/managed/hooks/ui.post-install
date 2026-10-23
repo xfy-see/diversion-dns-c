@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+rm -f /tmp/luci-indexcache.*
+/etc/init.d/rpcd reload

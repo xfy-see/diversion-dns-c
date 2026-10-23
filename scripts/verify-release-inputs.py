@@ -201,7 +201,7 @@ def verify_source(files, commit, checkout, state):
 
 def verify_commands(files, state, apk_name):
     rows = state["commands"]
-    require(isinstance(rows, list) and [row["name"] for row in rows] == list(COMMANDS),
+    require(isinstance(rows, list) and [row["name"] for row in rows] == list(COMMANDS) + (load_helper("managed-packages").command_names() if "managed" in state else []),
             "command sequence missing, duplicated or unexpected")
     commands, logs = {}, {}
     for row in rows:
@@ -368,6 +368,10 @@ def _verify_apk(folder, commit, run_id, attempt, arch, checkout):
                 "sdk.config", "regex-differential.json", "pcre2-reference-build.json",
                 "logs/sdk-no-unused-signing-keys.patch", "nft-cli/result.json", "nft-cli/grammar-nft"}
     required.update("logs/" + name + ".log" for name in COMMANDS)
+    if "managed" in state:
+        helper = load_helper("managed-packages")
+        required.update(helper.evidence_files(state["managed"]))
+        required.update("logs/" + name + ".log" for name in helper.command_names())
     for name, (_, calls) in cases.items():
         required.update("nft-cli/" + name + suffix for suffix in (".stdout", ".stderr"))
         if calls:
@@ -382,6 +386,8 @@ def _verify_apk(folder, commit, run_id, attempt, arch, checkout):
     metadata = json_value(files["apk-metadata.json"], "apk-metadata.json")
     require(metadata == json_value(logs["apk-metadata"], "APK metadata log"), "raw APK metadata differs")
     verify_elf(files, state, metadata, arch)
+    if "managed" in state:
+        load_helper("managed-packages").verify_evidence(files, state, source, commands, logs)
     config = files["sdk.config"].decode().splitlines()
     require(all(config.count(line) == 1 for line in ("# CONFIG_SIGNED_PACKAGES is not set",
             "# CONFIG_AUTOREMOVE is not set", "# CONFIG_CCACHE is not set", "CONFIG_PACKAGE_diversion-dns-c-lite=m"))

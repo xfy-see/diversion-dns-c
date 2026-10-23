@@ -1,0 +1,10 @@
+{
+  "device": "generic",
+  "config": "/etc/diversion-dns/config.conf",
+  "service": "diversion-dns",
+  "dns_host": "127.0.0.1",
+  "dns_port": 15353,
+  "direct_listener": true,
+  "selected": "unmanaged",
+  "expected_config_sha": ""
+}

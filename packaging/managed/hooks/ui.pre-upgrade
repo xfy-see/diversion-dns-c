@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+rm -f /var/run/diversion-dns-ui-package-upgrade
+if /etc/init.d/diversion-dns-ui running; then
+ umask 077
+ mkdir -m 700 /var/run/diversion-dns-ui-package-upgrade.lock
+ trap 'rmdir /var/run/diversion-dns-ui-package-upgrade.lock 2>/dev/null || true' EXIT
+ printf '%s\n' running > /var/run/diversion-dns-ui-package-upgrade
+ /etc/init.d/diversion-dns-ui stop
+fi

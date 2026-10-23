@@ -1,0 +1,4 @@
+#!/usr/bin/lua
+local J=require('luci.jsonc')
+local ok,value=pcall(function()return dofile('/usr/share/diversion-dns-ui/device.lua').main(arg)end)
+print(J.stringify(ok and value or {error=tostring(value):sub(1,400)}));os.exit(ok and 0 or 1)

@@ -1,0 +1,12 @@
+{
+  "device": "131",
+  "config": "/etc/diversion-dns-c-test/config.conf",
+  "service": "diversion-dns",
+  "dns_host": "192.168.100.131",
+  "dns_port": 15453,
+  "direct_listener": true,
+  "table": "ddns_main_742e1e9",
+  "tunnel": null,
+  "selected": "upstream",
+  "expected_config_sha": ""
+}
