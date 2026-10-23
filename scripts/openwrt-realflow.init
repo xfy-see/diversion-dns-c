@@ -1,0 +1,36 @@
+#!/bin/sh /etc/rc.common
+# Install this template inside the private task BASE, with a unique service name.
+# Explicit start only: never enable it at boot or set respawn.
+USE_PROCD=1
+START=99
+STOP=10
+
+start_service() {
+ local base phase seconds mode id
+ base=${initscript%/*}
+ case "$base" in /data/dns-ab24-20261015-*) ;; *) return 2;; esac
+ id=${base#/data/dns-ab24-20261015-}
+ case "$id" in ''|*[!A-Za-z0-9_-]*) return 2;; esac
+ [ "$(cat "$base/OWNERSHIP")" = "$id" ] || return 2
+ phase=$(cat "$base/current-phase");seconds=$(cat "$base/current-duration");mode=$(cat "$base/current-mode")
+ case "$phase" in ''|*[!A-Za-z0-9_-]*) return 2;; esac
+ case "$seconds" in ''|*[!0-9]*|0*) return 2;; esac
+ [ "${#seconds}" -le 6 ] && [ "$seconds" -ge 10 ] && [ "$seconds" -le 86400 ] || return 2
+ case "$mode" in off|tuned) ;; *) return 2;; esac
+ procd_open_instance main
+ procd_set_param command /bin/ash "$base/tools/openwrt-realflow-run.sh" "$base" "$phase" "$seconds" "$mode"
+ procd_set_param nice 10
+ procd_set_param limits core=0 nofile=4096
+ procd_set_param term_timeout 45
+ procd_set_param stdout 0
+ procd_set_param stderr 1
+ procd_close_instance
+ procd_open_instance lease
+ procd_set_param command /bin/ash "$base/tools/openwrt-realflow-lease.sh" "$base" "$phase" "$seconds"
+ procd_set_param nice 10
+ procd_set_param limits core=0 nofile=256
+ procd_set_param term_timeout 45
+ procd_set_param stdout 0
+ procd_set_param stderr 1
+ procd_close_instance
+}
