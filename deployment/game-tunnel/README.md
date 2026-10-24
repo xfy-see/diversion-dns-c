@@ -81,6 +81,9 @@ network response. The UI also supports manual list refresh.
   rollback, external-writer refusal, gate and policy ordering tests.
 - `node packaging/managed/ui/tests/frontend.test.js` covers unavailable controls,
   confirmed vs optimistic state, pending submissions and stale connection state.
-- Kernel set/tuple syntax, exact binary source provenance, real DNS/route behavior,
+- `kernel-smoke.py` installs both complete classifier chains in an owned CI
+  network namespace. Transport tuples precede the dynamic protocol gate: nft
+  otherwise loses transport context and rejects port expressions.
+- Device kernel set/tuple syntax, exact binary source provenance, real DNS/route behavior,
   on/off persistence, automatic recovery and normal traffic must be verified on
   the target separately. Mock tests are not device proof.

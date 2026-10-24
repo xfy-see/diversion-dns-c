@@ -146,6 +146,10 @@ class GameTests(unittest.TestCase):
    section='\n'.join(x for x in changed.splitlines()if ' '+chain+' 'in x)
    self.assertLess(section.index('fib daddr'),section.index('@game_site4'));self.assertLess(section.index('@game_site4'),section.index('@cn4'));self.assertIn('@game_enabled',section)
   with self.assertRaises(ValueError):integrate.policy('unsupported')
+ def test_transport_tuple_precedes_dynamic_protocol_gate(self):
+  text=integrate.policy('add rule inet diversion_dns split ip daddr @cn4 return\nadd rule inet diversion_dns router_output ip daddr @cn4 return\n')
+  for line in text.splitlines():
+   if ' dport 'in line:self.assertLess(line.index(' dport '),line.index('meta l4proto @game_enabled'))
  def test_helper_bootstrap_precedes_policy(self):
   text=integrate.helper('cat "$base/policy.nft" >> "$file"\nnft -f "$file"')
   self.assertLess(text.index('game-tunnel-render'),text.index('cat "$base/policy'))

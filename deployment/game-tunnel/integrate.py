@@ -16,9 +16,9 @@ def policy(text):
         rules=[
             'meta l4proto @game_enabled ip daddr @game_site4 meta mark set 1 ct mark set 1 counter return comment "Game login/community IPv4 tunnel"',
             'meta l4proto @game_enabled ip6 daddr @game_site6 meta mark set 1 ct mark set 1 counter return comment "Game login/community IPv6 tunnel"',
-            'meta l4proto @game_enabled ip daddr . udp dport @game_relay4 meta mark set 1 ct mark set 1 counter return comment "Dota 2 SDR tunnel"',
-            'meta l4proto @game_enabled ip daddr . tcp dport @game_cm4 meta mark set 1 ct mark set 1 counter return comment "Steam CM TCP tunnel"',
-            'meta l4proto @game_enabled ip daddr . udp dport @game_cm4 meta mark set 1 ct mark set 1 counter return comment "Steam CM UDP tunnel"',
+            'ip daddr . udp dport @game_relay4 meta l4proto @game_enabled meta mark set 1 ct mark set 1 counter return comment "Dota 2 SDR tunnel"',
+            'ip daddr . tcp dport @game_cm4 meta l4proto @game_enabled meta mark set 1 ct mark set 1 counter return comment "Steam CM TCP tunnel"',
+            'ip daddr . udp dport @game_cm4 meta l4proto @game_enabled meta mark set 1 ct mark set 1 counter return comment "Steam CM UDP tunnel"',
         ]
         text=text.replace(anchor,''.join(prefix+x+'\n'for x in rules)+anchor)
     return text
