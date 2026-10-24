@@ -188,6 +188,9 @@ class DedicatedTests(unittest.TestCase):
   m=self.setup_module();self.assertTrue(self.h.python(m.status())['ready'])
   for bad in ['ip -4','ip -6','allowed-ips','router_output',' guard','router_guard','latest-handshakes']:
    self.bad=bad;self.assertFalse(self.h.python(m.status())['ready'],bad)
+ def test_missing_identity_cannot_masquerade_as_current_exit(self):
+  h=GameHarness();h.files['/etc/diversion-dns-c/policy.nft']='Dedicated game fail closed'
+  d=h.python(h.module.status());self.assertFalse(d['consistent']);self.assertFalse(d['egress']['ready'])
  def test_invalid_config_refuses_shell_input(self):
   m=self.setup_module();self.h.files['/etc/pnw-control/game-tunnel/egress.json']='{"interface":"wg_game; reboot"}'
   with self.assertRaises(Exception):m.status()

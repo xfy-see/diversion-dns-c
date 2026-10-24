@@ -15,7 +15,12 @@ local function run(c)local f=assert(io.popen('('..c..") 2>&1; printf '\nGAME_RC=
 local function must(c)local s,r=run(c);assert(r==0,'game tunnel operation failed: '..s:sub(1,240));return s end
 local function locked()assert(os.getenv('DIVERSION_CN_DEPLOY_LOCK_HELD')=='1','game tunnel requires deployment lock')end
 local function egress()
- if not read(B..'/egress.json')then return nil end
+ if not read(B..'/egress.json')then
+  if (read('/etc/diversion-dns-c/policy.nft')or ''):find('Dedicated game fail closed',1,true)then
+   return {label='独立 AWS',consistent=false,ready=false,error='独立 AWS 配置缺失；不会使用全局出口代替'}
+  end
+  return nil
+ end
  return assert(dofile('/etc/pnw-control/game-egress.lua').status(),'dedicated egress unavailable')
 end
 local function integer(n,low,high)return type(n)=='number'and n==math.floor(n)and n>=low and n<=high end

@@ -555,6 +555,13 @@ test('game disagreement is visible and a lost connection disables both switches'
  u.advance(16000);await u.poll(1);assert.equal(u.action('game-off').disabled,true);assert.equal(u.action('game-on').disabled,true);
 });
 
+test('dedicated AWS label and handshake failure stay distinct from global exit', async () => {
+ const u=create(fixture({game_tunnel:{available:true,enabled:true,consistent:true,egress:{label:'独立 AWS',ready:false,error:'独立 AWS 暂无近期握手'}}}));
+ assert.match(u.part('gameStatus').textContent,/独立 AWS/);
+ assert.match(u.part('gameNote').textContent,/暂无近期握手/);
+ assert.match(u.part('gameNote').textContent,/下载.*原分流/);
+});
+
 (async () => {
  let failed = 0;
  for (const [name, fn] of tests) {
