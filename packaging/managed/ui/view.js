@@ -4,7 +4,7 @@
 'require poll';
 'require ui';
 
-var PNW_VIEW_VERSION = '2026.10.22.1-query';
+var PNW_VIEW_VERSION = 'game-20261024-2026.10.22.1-query';
 
 return view.extend({
  statsOnly: false,
@@ -61,6 +61,7 @@ return view.extend({
    if (current.running === true) return '后台任务正在执行';
    if (current.running !== false) return '任务状态缺失，暂不可操作';
    var entry = object(object(current.actions)[action]);
+   if (action.indexOf('game-') === 0 && (object(current.game_tunnel).available !== true || entry.allowed !== true)) return entry.reason || '本设备未部署游戏隧道开关';
    if (self.deviceMode && entry.allowed !== true) return entry.reason || '本设备未部署该受管能力';
    if (entry.allowed === false) return entry.reason || '当前状态不允许此操作';
    if (current.pending && action !== 'diagnose' && action !== 'retry-recovery') return '存在待回退事务，请先查看回退结果';
@@ -73,7 +74,10 @@ return view.extend({
    buttons.forEach(function(item) {
     var reason = unavailableReason(item.action);
     item.node.disabled = !!reason; item.node.title = reason || '执行 ' + item.label; item.reason.textContent = reason;
-    if (self.deviceMode) {
+    if (item.action.indexOf('game-') === 0) {
+     var g = object(current.game_tunnel);
+     item.node.parentNode.hidden = g.available !== true || (item.action === 'game-on' && g.enabled === true && g.consistent === true) || (item.action === 'game-off' && g.enabled !== true && g.consistent === true);
+    } else if (self.deviceMode) {
      var enabled = object(object(current.actions)[item.action]).allowed === true;
      var target = enabled ? parts.availableActions : parts.unavailableActions;
      var wrapper = item.node.parentNode;
@@ -93,6 +97,10 @@ return view.extend({
    parts.version.textContent = '页面版本 ' + PNW_VIEW_VERSION + ' · 服务版本 ' + value(current.version);
   }
   function renderOverview() {
+   var game = object(current.game_tunnel);
+   parts.gameCard.hidden = game.available !== true;
+   parts.gameStatus.textContent = !connected ? '游戏隧道状态未知' : !game.consistent ? '配置与运行状态尚未一致，请等待完成或重试恢复' : game.enabled ? '已开启：登录、社区和 Dota 2 走当前隧道' : '已关闭：按原 CN-site / CN-IP 分流';
+   parts.gameNote.textContent = '游戏下载沿用原分流；现有设备豁免保留。切换后请重新连接 Steam / 游戏。' + (game.updated ? ' 游戏地址更新：' + time(game.updated) + '；SDR ' + count(game.relay_count) + '，登录服务器 ' + count(game.cm_count) + '。' : '') + (game.note || '') + (game.refresh_error ? ' 地址更新失败，继续使用最近有效列表：' + game.refresh_error : '');
    var h = object(current.health), last = object(current.last), failures = object(current.endpoint_health).dns_failures, containment = object(current.containment);
    var known = connected ? '' : '上次记录：';
    parts.exit.textContent = known + name(current.selected) + (current.configured_selected && current.configured_selected !== current.selected ? '（配置：' + name(current.configured_selected) + '）' : '');
@@ -373,6 +381,7 @@ return view.extend({
     E('div', { 'class': 'pnw-actions' }, [button('切换 AWS 新加坡', 'switch-aws'), button('切换 nobrand', 'switch-nobrand'), button('切换美国 SS', 'switch-usss'), button('切换美国 VLESS', 'switch-usvless'), button('回滚上次出口', 'rollback')]), part('rollbackTarget', 'p', { 'class': 'pnw-muted' }),
     E('div', { 'class': 'pnw-actions' }, [button('恢复国内联网（应急）', 'rescue'), button('恢复正常分流', 'recover'), button('检测出口可用性', 'check'), button('采集诊断（3 秒）', 'diagnose'), button('重试未完成回退', 'retry-recovery')]),
     E('p', { 'class': 'pnw-muted', 'data-device-hide': '1' }, '国内应急保留 LAN、静态租约和管理入口，停止海外标记流量；AI 服务不会自动改走 WAN。美国出口仅使用 IPv4，境外 IPv6 阻断，国内 IPv6 保留。出口身份以设备本地配置和实际检测为准；两个出口是否独立需由部署配置确认。'), part('last', 'p', { 'class': 'pnw-preserve' })]),
+   E('section', { 'class': 'pnw-card' }, [part('gameCard', 'div'), E('h3', {}, 'Steam / Dota 2 游戏隧道'), part('gameStatus'), part('gameNote', 'p', {'class':'pnw-muted'}), E('div', {'class':'pnw-actions'}, [button('开启游戏隧道', 'game-on'), button('关闭游戏隧道', 'game-off'), button('更新游戏地址', 'game-refresh')])]),
    E('div', { 'class': 'pnw-grid' }, [E('section', { 'class': 'pnw-card' }, metric('最近操作耗时', 'operationTime', 'operationTimeNote')), E('section', { 'class': 'pnw-card' }, metric('最近检测耗时', 'checkTime', 'checkTimeNote'))]),
    E('section', { 'class': 'pnw-card' }, [E('h3', {}, '国内 / 国外 DNS'), E('p', { 'class': 'pnw-muted' }, '当前配置的 DNS 上游与转发链。并发、故障切换和缓存会影响每次请求，以下不代表某次请求实际命中的服务器。'), E('div', { 'class': 'pnw-grid' }, [card('国内 DNS', 'dnsCn'), card('国外 DNS', 'dnsForeign')])]),
    E('section', { 'class': 'pnw-card' }, [E('h3', {}, 'DNS 实际请求指标'), part('telemetryInfo', 'p', { 'class': 'pnw-muted' }), E('div', { 'class': 'pnw-grid' }, [metric('国内缓存命中率', 'cacheCnRate', 'cacheCnNote'), metric('国外缓存命中率', 'cacheForeignRate', 'cacheForeignNote')]), E('div', { 'class': 'pnw-grid' }, [metric('请求成功率', 'successRate', 'successNote'), metric(self.deviceMode ? '近期 DNS 耗时' : '最近 DNS 耗时', 'latency', 'latencyNote')]), E('details', {}, [E('summary', {}, '全部缓存与分组明细'), metric('全部缓存命中率', 'cacheRate', 'cacheNote'), part('groupMetrics')]),
@@ -435,6 +444,7 @@ return view.extend({
    var diagnosticSection = section('pnw-diagnostics', '检测与诊断', [available, health, lookup, take(diagnosticExport), diagnostics]);
    replace(root, [style, title, take(parts.connection), take(refreshButton), E('nav', {'class':'pnw-query','aria-label':'页面分区'}, [E('a', {href:'#pnw-overview'}, '概览'), E('a', {href:'#pnw-dns'}, 'DNS 统计'), E('a', {href:'#pnw-diagnostics'}, '检测与诊断')]), overview, dnsSection, diagnosticSection, take(parts.version)]);
   }
+  parts.gameCard = parts.gameCard.parentNode;
   if (self.deviceMode) {
    function hideDeviceHints(n) { if (n.attrs && n.attrs['data-device-hide']) n.hidden = true; if (n.getAttribute && n.getAttribute('data-device-hide')) n.hidden = true; Array.prototype.forEach.call(n.children || [], hideDeviceHints); }
    hideDeviceHints(root);

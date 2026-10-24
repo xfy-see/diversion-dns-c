@@ -433,7 +433,7 @@ local function health()
  save(R..'/health.json',h);save(R..'/public-exit.json',h.public_exit);telemetry('record_health',h)
  return h.ok and 'DNS and configured HTTPS checks passed' or 'health check completed with failures; see individual checks'
 end
-local allowed={['switch-aws']=true,['switch-nobrand']=true,['switch-usss']=true,['switch-usvless']=true,rollback=true,rescue=true,recover=true,diagnose=true,check=true,['retry-recovery']=true}
+local allowed={['switch-aws']=true,['switch-nobrand']=true,['switch-usss']=true,['switch-usvless']=true,rollback=true,rescue=true,recover=true,diagnose=true,check=true,['retry-recovery']=true,['game-on']=true,['game-off']=true,['game-refresh']=true}
 local function diagnose()
  local metrics=dofile(B..'/metrics.lua');local a=metrics.sample();nixio.nanosleep(3);local b=metrics.sample()
  local report={time=os.time(),boot=trim(read('/proc/sys/kernel/random/boot_id') or ''),load=trim(read('/proc/loadavg') or ''),memory=read('/proc/meminfo'),cpu=read('/proc/stat'),softirqs=read('/proc/softirqs'),conntrack=trim(read('/proc/sys/net/netfilter/nf_conntrack_count') or '')}
@@ -454,6 +454,8 @@ local function status()
  endpoint_health=load(B..'/endpoint-health.json'),health=load(R..'/health.json'),public_exit=load(R..'/public-exit.json'),cpu_monitor=load(R..'/cpu-monitor.json'),diagnostic=load(R..'/diagnostic.json'),
  vless_available=fs.stat('/sys/class/net/pnwuvl0')~=nil,usss_available=fs.stat('/sys/class/net/pnwuss0')~=nil,recovery=load(R..'/reconcile.json'),telemetry=telemetry('status',{selected=ok and current or 'unavailable'})}
  st.services={wireguard={available=fs.stat('/sys/class/net/wg_vpn')~=nil},usss={available=st.usss_available},usvless={available=st.vless_available}}
+ st.game_tunnel=select(1,observation('game-tunnel','status')) or {available=false,reason='本机未部署游戏隧道模块'}
+ st.pending=st.pending or st.game_tunnel.pending==true
  st.actions={}
  st.public_exit.domestic=load(R..'/public-domestic.json')
  for action in pairs(allowed) do
@@ -465,6 +467,13 @@ local function status()
   elseif not containment.known and action~='diagnose' then reason='cannot inspect emergency containment'
   elseif target and (target=='usss' or target=='usvless') and not st.services[target].available then reason='target proxy TUN is not running'
   elseif target and st.emergency and target==current then reason='choose an alternate exit or recover the current exit' end
+  if action:match('^game%-') then
+   if not st.game_tunnel.available then reason='本设备未部署游戏隧道模块'
+   elseif st.game_tunnel.pending then reason='游戏切换未完成，请重试恢复'
+   elseif st.emergency or st.dns_degraded then reason='应急或 DNS 降级期间不可切换游戏策略'
+   elseif action=='game-on' and st.game_tunnel.enabled and st.game_tunnel.consistent then reason='已经开启'
+   elseif action=='game-off' and not st.game_tunnel.enabled and st.game_tunnel.consistent then reason='已经关闭' end
+  end
   st.actions[action]={allowed=reason==nil,reason=reason}
  end
  return st
@@ -484,6 +493,7 @@ local function reconcile_locked(ignore_job)
   os.remove(R..'/job/token');os.remove(R..'/job/pid');fs.rmdir(R..'/job')
  end
  reconcile_containment()
+ if read(B..'/game-tunnel.lua') then dofile(B..'/game-tunnel.lua').reconcile() end
  if read(B..'/pending.json') then restore() end
  return true
 end
@@ -503,6 +513,7 @@ elseif mode=='probe-fetch' then
  error('probe exec failed')
 elseif mode=='start' then
  local action=arg[2];assert(allowed[action],'invalid action')
+ assert(not read(B..'/game-tunnel/pending.json') or action=='diagnose' or action=='retry-recovery','unfinished game transaction')
  assert(not read(B..'/pending.json') or action=='diagnose' or action=='retry-recovery','unfinished transaction; automatic rollback pending')
  assert(fs.mkdir(R..'/job','700'),'another action is running')
  local token=tostring(os.time())..'-'..nixio.getpid();write(R..'/job/token',token)
@@ -518,7 +529,13 @@ elseif mode=='worker' then
  write(R..'/job/pid',tostring(nixio.getpid()))
  local started=milliseconds();local started_at=os.time()
  local ok,result=pcall(function()
-  if action=='switch-aws' then return switch('aws') elseif action=='switch-nobrand' then return switch('nobrand')
+  if action:match('^game%-') then
+   ensure_topology()
+   if runtime_snapshot then assert(runtime_snapshot(selected()).consistent,'runtime exit mismatch') end
+   local game=dofile(B..'/game-tunnel.lua')
+   if action=='game-refresh' then return game.refresh() end
+   return game.set(action=='game-on')
+  elseif action=='switch-aws' then return switch('aws') elseif action=='switch-nobrand' then return switch('nobrand')
   elseif action=='switch-usss' then return switch('usss') elseif action=='switch-usvless' then return switch('usvless')
   elseif action=='rollback' then local old=load(B..'/previous.json').selected;assert(exits[old],'no previous exit');return switch(old)
   elseif action=='retry-recovery' then restore();reconcile_locked(true);return 'unfinished transaction recovery retried; emergency state retained when present'

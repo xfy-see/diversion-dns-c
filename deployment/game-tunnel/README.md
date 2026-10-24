@@ -1,0 +1,86 @@
+# Steam / Dota 2 tunnel exception
+
+This opt-in main-router feature adds a Web UI switch for Steam login/community
+and Dota 2 game relay traffic. Downloads keep the ordinary CN-site/CN-IP policy.
+It does not replace the selected exit, create a new WireGuard peer, or require
+dnsmasq-full. It is disabled until explicitly enabled and unsupported managed
+APK/device profiles do not expose an actionable switch.
+
+## Classification
+
+- `domains.txt` is a deliberately narrow login/community/game-control list.
+  `steamcontent.com`, `steamstatic.com`, `steamusercontent.com`, download hosts,
+  and the blanket `steampowered.com` suffix are not forced.
+- Original DNS QNAME matches use the foreign upstream and populate
+  `game_site4` / `game_site6`, including fresh/stale cache hits and refreshes.
+- [Valve's SDR API](https://api.steampowered.com/ISteamApps/GetSDRConfig/v1/?appid=570)
+  supplies Dota 2 relay IPv4 + UDP port ranges. The
+  [Steam CM API](https://api.steampowered.com/ISteamDirectory/GetCMListForConnect/v1/?cellid=0&cmtype=netfilter)
+  supplies login server IPv4 + TCP/UDP ports. These are not broad port rules.
+- Rules go after existing local/private/LAN, device, transport and DNS exemptions
+  but before CN-IP/CN-site returns. LAN, existing VPN-client scope and router
+  output inherit the existing classifier scope. Existing marked-traffic egress
+  guards and emergency isolation apply; no WAN fallback is introduced.
+- Disabling removes the opt-in DNS block, restarts DNS, empties the enable gate
+  and profile sets, and restores ordinary classification. It does not force WAN:
+  an overseas destination can still use the tunnel under the normal policy.
+
+This is IP-based routing, not process identification. Shared hosting addresses
+can affect other names at the same IP, including a download when it shares a
+learned login address. Client-private DNS, pre-existing client DNS caches,
+third-party game servers and non-SDR direct Dota server endpoints are outside
+exact identification. Reconnect Steam and the game after switching. Established
+NAT/conntrack sessions are not deleted. Actual game login/match quality requires
+a client gameplay check; DNS/nft probes are not a substitute.
+
+## Ownership and installation
+
+The static main-router layout is distinct from the managed generic APK profile.
+`integrate.py` provides fail-on-unknown-input transforms for the existing
+controller, policy, apply helper, query helper and view. It never connects to or
+modifies a router. `packaging/managed/ui/control.lua` remains a source-only fixture;
+its game action wiring is not a generic APK routing migration.
+
+A deployment must first back up the exact live files and active CN-policy
+snapshot, compare pre-change hashes, hold `/var/lock/diversion-dns-deploy.lock`,
+and arm an independent rollback guard. Install `game-tunnel.lua` and
+`game-tunnel-render.lua` in `/etc/pnw-control/`; create root-only
+`/etc/pnw-control/game-tunnel/` containing `domains.txt` and initially
+`state.json` (`{"enabled":false}`). Use the matching verified CI C binary with
+`tunnel_domain_file` support. Keep device-specific files out of the repository.
+
+The policy apply helper must render the profile's sets into its own atomic nft
+transaction before adding classifier references. Apply and explicitly adopt the
+new approved policy with `cn-policy.sh seed --replace`; preserve the old
+snapshot for rollback. Preserve the controller's existing endpoint bindings,
+MAC exemptions and runtime exit validation. Install a content-hashed LuCI view
+and retain the existing authenticated control/status ACL (no new anonymous RPC).
+
+The controller holds the global lock across switching and recovery. The module
+journals exact before/after DNS configuration before mutations, refuses rollback
+if another writer changed it, and leaves failed recovery journals intact.
+Its existing monitor reconciliation restores interrupted toggles. Runtime state
+is shown separately from saved intent; missing or inconsistent state is not
+reported as enabled. File-write and network failures do not silently enable it.
+
+Official lists are fetched before enabling; malformed, empty, private-address,
+implausibly shrunken or backwards-revision updates are rejected. While enabled,
+monitor reconciliation checks for hourly refresh, with at least 30 minutes
+between failed attempts; failures retain last-good lists and are displayed.
+Boot/policy recreation uses locally validated last-good data, never an untrusted
+network response. The UI also supports manual list refresh.
+
+## Tests
+
+- GitHub compiles the C regression tests: tunnel override wins over CN, foreign
+  upstream is selected, A/AAAA cold and cache-hit paths write only the tunnel
+  set, nft failures propagate, ordinary CN/foreign paths and disabled config
+  retain old behavior. Configuration validation covers orphaned/invalid keys.
+- `python3 -m unittest discover -s tests -p test_game_tunnel.py -v` uses prebuilt
+  `lupa` for feed validation, config round trips, state mismatch, interrupted
+  rollback, external-writer refusal, gate and policy ordering tests.
+- `node packaging/managed/ui/tests/frontend.test.js` covers unavailable controls,
+  confirmed vs optimistic state, pending submissions and stale connection state.
+- Kernel set/tuple syntax, exact binary source provenance, real DNS/route behavior,
+  on/off persistence, automatic recovery and normal traffic must be verified on
+  the target separately. Mock tests are not device proof.

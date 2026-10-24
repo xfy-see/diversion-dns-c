@@ -536,6 +536,25 @@ test('device shares identical windows but retains differing timestamps and unava
  assert.match(ui.part('successRate').textContent,/暂无数据/);assert.match(ui.part('successNote').textContent,/expired/);
 });
 
+test('game switch is hidden without capability and never submits unsupported actions', async () => {
+ const u=create(fixture());assert.equal(u.part('gameCard').parentNode.hidden,true);
+ u.action('game-on').click();await flush();assert.equal(u.calls.length,0);
+});
+test('game switch reflects confirmed mode and keeps downloads on normal policy', async () => {
+ const d=fixture({game_tunnel:{available:true,enabled:false,consistent:true,downloads:'normal'},actions:{'game-on':{allowed:true},'game-off':{allowed:false},'game-refresh':{allowed:true}}});
+ const u=create(d,a=>Promise.resolve(a[0]==='start'?{accepted:true}:d));
+ assert.match(u.part('gameStatus').textContent,/已关闭/);assert.match(u.part('gameNote').textContent,/下载.*原分流/);
+ assert.equal(u.action('game-on').parentNode.hidden,false);assert.equal(u.action('game-off').parentNode.hidden,true);
+ u.action('game-on').click();await flush();assert.deepEqual(u.calls[0],['start','game-on']);
+ assert.match(u.part('gameStatus').textContent,/已关闭/); // no optimistic success
+});
+test('game disagreement is visible and a lost connection disables both switches', async () => {
+ const d=fixture({game_tunnel:{available:true,enabled:true,consistent:false},actions:{'game-on':{allowed:true},'game-off':{allowed:true}}});
+ const u=create(d);assert.match(u.part('gameStatus').textContent,/尚未一致/);
+ assert.equal(u.action('game-off').parentNode.hidden,false);assert.equal(u.action('game-on').parentNode.hidden,false);
+ u.advance(16000);await u.poll(1);assert.equal(u.action('game-off').disabled,true);assert.equal(u.action('game-on').disabled,true);
+});
+
 (async () => {
  let failed = 0;
  for (const [name, fn] of tests) {
@@ -545,3 +564,4 @@ test('device shares identical windows but retains differing timestamps and unava
  process.stdout.write(tests.length + ' tests, ' + failed + ' failures\n');
  process.exitCode = failed ? 1 : 0;
 })();
+

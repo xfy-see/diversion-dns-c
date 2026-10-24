@@ -1,0 +1,13 @@
+# Login/community/game control only. Deliberately omit steamcontent.com,
+# steamstatic.com, steamusercontent.com and download hosts/CDN suffixes.
+full:login.steampowered.com
+full:store.steampowered.com
+full:checkout.steampowered.com
+full:help.steampowered.com
+full:api.steampowered.com
+full:api.steamchina.com
+domain:steamcommunity.com
+domain:steam-chat.com
+domain:steamserver.net
+domain:dota2.com
+regexp:^cm[0-9-]*\.steampowered\.com$

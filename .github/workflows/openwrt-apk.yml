@@ -71,6 +71,7 @@ jobs:
       - name: Validate managed UI and service lifecycle
         run: |
           python3 -m pip install --only-binary=:all: lupa==2.8
+          python3 -m unittest discover -s tests -p test_game_tunnel.py -v
           python3 -m unittest discover -s packaging/managed/ui/tests -p 'test_*.py' -v
           node packaging/managed/ui/tests/frontend.test.js
           for f in packaging/managed/*.init packaging/managed/hooks/*; do sh -n "$f"; done
