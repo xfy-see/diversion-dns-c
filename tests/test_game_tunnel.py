@@ -10,7 +10,7 @@ BASE=ROOT/'deployment/game-tunnel'
 spec=importlib.util.spec_from_file_location('game_integrate',BASE/'integrate.py');integrate=importlib.util.module_from_spec(spec);spec.loader.exec_module(integrate)
 class GameHarness:
  def __init__(self):
-  self.lua=LuaRuntime(unpack_returned_tuples=True);self.files={};self.commands=[];self.failure=None
+  self.lua=LuaRuntime(unpack_returned_tuples=True);self.files={};self.commands=[];self.failure=None;self.failure_once=None;self.gate=False
   def parse(s):
    try:return self.table(json.loads(s))
    except Exception:return None
@@ -18,7 +18,14 @@ class GameHarness:
   def command(s):
    self.commands.append(s)
    if self.failure and self.failure in s:return '\nGAME_RC=1\n'
-   if s.startswith('(nft list set'):return 'table inet diversion_dns { set game_enabled { type inet_proto; } }\nGAME_RC=0\n'
+   if self.failure_once and self.failure_once in s:
+    self.failure_once=None;return '\nGAME_RC=1\n'
+   if 'uclient-fetch' in s:
+    a,b=self.feeds()
+    self.files['/etc/pnw-control/game-tunnel/'+('sdr.download'if 'GetSDR' in s else 'cm.download')]=json.dumps(a if 'GetSDR' in s else b)
+   if s.startswith('(nft -f /etc/pnw-control/game-tunnel/runtime.nft'):
+    self.gate='game_enabled { tcp, udp }'in self.files['/etc/pnw-control/game-tunnel/runtime.nft']
+   if s.startswith('(nft list set'):return 'table inet diversion_dns { set game_enabled { type inet_proto; '+('elements = { tcp, udp };'if self.gate else '')+' } }\nGAME_RC=0\n'
    return '\nGAME_RC=0\n'
   g=self.lua.globals();g.pyread=lambda p:self.files.get(p);g.pywrite=lambda p,s:self.files.__setitem__(p,s);g.pyremove=lambda p:self.files.pop(p,None) is not None;g.pyrename=lambda a,b:self.files.__setitem__(b,self.files.pop(a))or True;g.pyparse=parse;g.pyserial=serial;g.pycommand=command
   self.lua.execute('''package.preload['luci.jsonc']=function()return {parse=pyparse,stringify=pyserial}end
@@ -105,6 +112,29 @@ class GameTests(unittest.TestCase):
   self.h.files['/etc/diversion-dns-c/config.conf']='new';self.h.failure='diversion-dns-c restart'
   with self.assertRaises(Exception):self.h.module.recover()
   self.assertIn('/etc/pnw-control/game-tunnel/pending.json',self.h.files)
+ def test_toggle_on_off_roundtrip(self):
+  path='/etc/diversion-dns-c/config.conf';self.h.files[path]='cache_size=64\n'
+  self.h.module.set(True);d=self.h.python(self.h.module.status());self.assertTrue(d['enabled']);self.assertTrue(d['consistent']);self.assertTrue(self.h.gate)
+  self.h.module.set(False);self.assertEqual(self.h.files[path],'cache_size=64\n');self.assertFalse(self.h.gate);self.assertTrue(self.h.python(self.h.module.status())['consistent'])
+ def test_download_failure_does_not_mutate_config(self):
+  path='/etc/diversion-dns-c/config.conf';self.h.files[path]='original';self.h.failure='uclient-fetch'
+  with self.assertRaises(Exception):self.h.module.set(True)
+  self.assertEqual(self.h.files[path],'original');self.assertNotIn('/etc/pnw-control/game-tunnel/pending.json',self.h.files)
+ def test_nft_failure_restores_before_config_and_mode(self):
+  path='/etc/diversion-dns-c/config.conf';self.h.files[path]='original\n';self.h.failure_once='nft -f /etc/pnw-control/game-tunnel/runtime.nft'
+  with self.assertRaises(Exception):self.h.module.set(True)
+  self.assertEqual(self.h.files[path],'original\n');self.assertFalse(self.h.gate);self.assertNotIn('/etc/pnw-control/game-tunnel/pending.json',self.h.files)
+ def test_refresh_failure_retains_previous_list(self):
+  path='/etc/pnw-control/game-tunnel/data.json';self.h.files[path]='last-good';self.h.failure='uclient-fetch'
+  with self.assertRaises(Exception):self.h.module.refresh()
+  self.assertEqual(self.h.files[path],'last-good')
+ def test_invalid_journal_is_not_silently_ignored(self):
+  self.h.files['/etc/pnw-control/game-tunnel/pending.json']='{}'
+  with self.assertRaises(Exception):self.h.module.recover()
+ def test_periodic_failure_is_bounded_and_preserves_enabled(self):
+  self.h.files['/etc/pnw-control/game-tunnel/state.json']='{"enabled":true}'
+  self.h.failure='uclient-fetch';self.h.module.reconcile();before=len(self.h.commands);self.h.module.reconcile()
+  self.assertEqual(len(self.h.commands),before);self.assertEqual(json.loads(self.h.files['/etc/pnw-control/game-tunnel/refresh.json'])['state'],'failed')
  def test_profile_does_not_include_download_domains(self):
   rules=(BASE/'domains.txt').read_text().splitlines();active=[r for r in rules if r and not r.startswith('#')]
   for name in ['steamcontent.com','steamstatic.com','steamusercontent.com','client-download.steampowered.com','steampowered.com']:
