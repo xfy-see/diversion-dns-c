@@ -23,6 +23,39 @@ def policy(text):
         text=text.replace(anchor,''.join(prefix+x+'\n'for x in rules)+anchor)
     return text
 
+def dedicated_policy(text):
+    """Upgrade an already integrated profile. Dedicated mark never becomes global."""
+    lines=text.splitlines(True);count=0
+    for i,line in enumerate(lines):
+        if any(x in line for x in ('@game_site4','@game_site6','@game_relay4','@game_cm4')):
+            if 'meta mark set 1 ct mark set 1' not in line:
+                raise ValueError('unsupported game mark')
+            lines[i]=line.replace('meta mark set 1 ct mark set 1','meta mark set 2 ct mark set 2');count+=1
+    if count!=10:raise ValueError('expected ten existing game rules')
+    text=''.join(lines)
+    anchor='add rule inet diversion_dns router_output ct direction reply return\n'
+    text=once(text,anchor,anchor+
+        'add rule inet diversion_dns router_output udp sport 51824 meta mark set 0 ct mark set 0 return comment "Dedicated game WireGuard transport WAN"\n'+
+        'add rule inet diversion_dns router_output oifname "wg_game" meta mark set 2 ct mark set 2 return comment "Explicit dedicated game interface"\n')
+    text+='add rule inet diversion_dns guard ct direction original meta mark 2 oifname != "wg_game" counter reject comment "Dedicated game fail closed"\n'
+    text+='add rule inet diversion_dns router_guard ct direction original meta mark 2 oifname != "wg_game" counter drop comment "Dedicated game fail closed"\n'
+    return text
+
+def dedicated_emergency(text):
+    if text.count('meta mark 1 counter drop')!=2:raise ValueError('unknown emergency rules')
+    return text.replace('meta mark 1 counter drop','meta mark { 1, 2 } counter drop')
+
+def dedicated_query(text):
+    text=once(text,' local game_known=true;local game_enabled=false',
+        " local game_known=true;local game_enabled=false\n local dedicated=read('/etc/pnw-control/game-tunnel/egress.json')~=nil")
+    text=once(text,"elseif gamehit then a.expected_path='tunnel';a.reason='Steam/游戏登录社区地址例外优先于国内集合；TCP/UDP 新连接'",
+        "elseif gamehit then a.expected_path='tunnel';a.reason=dedicated and 'Steam/游戏例外：独立 AWS 隧道；TCP/UDP 新连接' or 'Steam/游戏登录社区地址例外优先于国内集合；TCP/UDP 新连接'")
+    text=once(text,"a.family==6 and (ctx.selected=='usss' or ctx.selected=='usvless')",
+        "a.family==6 and not (gamehit and dedicated) and (ctx.selected=='usss' or ctx.selected=='usvless')")
+    text=once(text,"local mark=(a.expected_path=='tunnel' or a.expected_path=='blocked') and 1 or 0",
+        "local mark=(a.expected_path=='tunnel' or a.expected_path=='blocked') and ((gamehit and dedicated) and 2 or 1) or 0")
+    return text
+
 def helper(text):
     # The sets must exist before nft sees references from the policy. Generated
     # bootstrap operations and all classifier updates use the same transaction.
@@ -60,8 +93,8 @@ def view(text):
     text=once(text,'  function renderOverview() {','''  function renderOverview() {
    var game = object(current.game_tunnel);
    parts.gameCard.hidden = game.available !== true;
-   parts.gameStatus.textContent = !connected ? '游戏隧道状态未知' : !game.consistent ? '配置与运行状态尚未一致，请等待完成或重试恢复' : game.enabled ? '已开启：登录、社区和 Dota 2 走当前隧道' : '已关闭：按原 CN-site / CN-IP 分流';
-   parts.gameNote.textContent = '游戏下载沿用原分流；现有设备豁免保留。切换后请重新连接 Steam / 游戏。' + (game.updated ? ' 游戏地址更新：' + time(game.updated) + '；SDR ' + count(game.relay_count) + '，登录服务器 ' + count(game.cm_count) + '。' : '') + (game.note || '');''')
+   parts.gameStatus.textContent = !connected ? '游戏隧道状态未知' : !game.consistent ? '配置与运行状态尚未一致，请等待完成或重试恢复' : game.enabled ? '已开启：登录、社区和 Dota 2 走' + (object(game.egress).label || '当前隧道') : '已关闭：按原 CN-site / CN-IP 分流';
+   parts.gameNote.textContent = '游戏下载沿用原分流；现有设备豁免保留。切换后请重新连接 Steam / 游戏。' + (game.updated ? ' 游戏地址更新：' + time(game.updated) + '；SDR ' + count(game.relay_count) + '，登录服务器 ' + count(game.cm_count) + '。' : '') + (object(game.egress).error ? ' ' + object(game.egress).error + '。' : '') + (game.note || '');''')
     anchor="   E('div', { 'class': 'pnw-grid' }, [E('section', { 'class': 'pnw-card' }, metric('最近操作耗时'"
     text=once(text,anchor,"   E('section', { 'class': 'pnw-card' }, [part('gameCard', 'div'), E('h3', {}, 'Steam / Dota 2 游戏隧道'), part('gameStatus'), part('gameNote', 'p', {'class':'pnw-muted'}), E('div', {'class':'pnw-actions'}, [button('开启游戏隧道', 'game-on'), button('关闭游戏隧道', 'game-off'), button('更新游戏地址', 'game-refresh')])]),\n"+anchor)
     # Make the actual section the part rather than hiding an empty marker.

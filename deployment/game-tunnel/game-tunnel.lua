@@ -14,6 +14,10 @@ local function save(p,v)write(p,J.stringify(v))end
 local function run(c)local f=assert(io.popen('('..c..") 2>&1; printf '\nGAME_RC=%s\n' \"$?\""));local s=f:read(1048577) or '';f:close();assert(#s<=1048576,'command output too large');local b,r=s:match('^(.*)\nGAME_RC=(%d+)\n$');return b or '',tonumber(r) or 255 end
 local function must(c)local s,r=run(c);assert(r==0,'game tunnel operation failed: '..s:sub(1,240));return s end
 local function locked()assert(os.getenv('DIVERSION_CN_DEPLOY_LOCK_HELD')=='1','game tunnel requires deployment lock')end
+local function egress()
+ if not read(B..'/egress.json')then return nil end
+ return assert(dofile('/etc/pnw-control/game-egress.lua').status(),'dedicated egress unavailable')
+end
 local function integer(n,low,high)return type(n)=='number'and n==math.floor(n)and n>=low and n<=high end
 local function public4(ip)
  local v,k=Q.validate_input(ip);if k~='ipv4' then return false end
@@ -132,6 +136,7 @@ function M.set(on)
  assert(not read('/etc/pnw-control/emergency')and not read('/etc/diversion-dns-c/degraded'),'game switch unavailable in emergency/degraded mode')
  local old=load(B..'/state.json');local data
  if on then
+  local e=egress();assert(not e or e.ready,e and e.error or 'dedicated egress unavailable')
   -- Downloads happen before any mutation. Failure leaves the current mode.
   data=fetch();save(B..'/data.json',data)
  end
@@ -166,7 +171,7 @@ function M.status()
  local actual=rc==0 and gate:find('tcp',1,true)~=nil and gate:find('udp',1,true)~=nil
  local cfg=read(C)or '';local configured=cfg:find('# BEGIN PNW GAME TUNNEL\n',1,true)~=nil
  local pending=read(B..'/pending.json')~=nil
- local refresh=load(B..'/refresh.json')
- return {available=true,enabled=state.enabled==true,runtime_enabled=actual,consistent=rc==0 and actual==(state.enabled==true)and configured==(state.enabled==true)and not pending,pending=pending,refresh_error=refresh.error,updated=data.updated,relay_count=type(data.relay)=='table'and #data.relay or 0,cm_count=type(data.cm)=='table'and #data.cm or 0,downloads='normal',scope='Steam 登录/社区及 Dota 2 SDR；下载沿用原分流；现有设备豁免保留',note='切换后请重连 Steam/游戏。域名分流基于 IP，共享地址可能连带；不覆盖第三方游戏服务器、客户端私有 DNS 或本地缓存未重新解析的连接。'}
+ local refresh=load(B..'/refresh.json');local e=egress()
+ return {available=true,egress=e,enabled=state.enabled==true,runtime_enabled=actual,consistent=(not e or e.consistent)and rc==0 and actual==(state.enabled==true)and configured==(state.enabled==true)and not pending,pending=pending,refresh_error=refresh.error,updated=data.updated,relay_count=type(data.relay)=='table'and #data.relay or 0,cm_count=type(data.cm)=='table'and #data.cm or 0,downloads='normal',scope='Steam 登录/社区及 Dota 2 SDR；下载沿用原分流；现有设备豁免保留',note='切换后请重连 Steam/游戏。域名分流基于 IP，共享地址可能连带；不覆盖第三方游戏服务器、客户端私有 DNS 或本地缓存未重新解析的连接。'}
 end
 return M

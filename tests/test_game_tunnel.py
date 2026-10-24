@@ -168,3 +168,38 @@ class GameTests(unittest.TestCase):
   text=integrate.helper('cat "$base/policy.nft" >> "$file"\nnft -f "$file"')
   self.assertLess(text.index('game-tunnel-render'),text.index('cat "$base/policy'))
 if __name__=='__main__':unittest.main()
+
+@unittest.skipIf(LuaRuntime is None, 'prebuilt lupa required')
+class DedicatedTests(unittest.TestCase):
+ def setup_module(self):
+  h=GameHarness();self.h=h;self.peer='A'*43+'='
+  h.files['/etc/pnw-control/game-tunnel/egress.json']=json.dumps(dict(interface='wg_game',mark=2,table=20234,peer=self.peer))
+  self.bad=None
+  def command(c):
+   if self.bad and self.bad in c:return ''
+   if c.startswith('ip -'):return '1.1.1.1 dev wg_game table 20234 src 192.0.2.1\n'
+   if 'allowed-ips'in c:return self.peer+'\t0.0.0.0/0 ::/0\n'
+   if 'latest-handshakes'in c:return self.peer+'\t'+str(int(h.lua.eval('os.time()')))+'\n'
+   if 'router_output'in c:return 'meta l4proto @game_enabled ip daddr @game_site4 meta mark set 0x00000002\n'
+   return 'ct direction original meta mark 0x00000002 oifname != "wg_game" drop comment "Dedicated game fail closed"\n'
+  h.lua.globals().pycommand=command
+  return h.lua.execute((BASE/'game-egress.lua').read_text())
+ def test_actual_routes_peer_guard_and_handshake_required(self):
+  m=self.setup_module();self.assertTrue(self.h.python(m.status())['ready'])
+  for bad in ['ip -4','ip -6','allowed-ips','router_output',' guard','router_guard','latest-handshakes']:
+   self.bad=bad;self.assertFalse(self.h.python(m.status())['ready'],bad)
+ def test_invalid_config_refuses_shell_input(self):
+  m=self.setup_module();self.h.files['/etc/pnw-control/game-tunnel/egress.json']='{"interface":"wg_game; reboot"}'
+  with self.assertRaises(Exception):m.status()
+ def test_upgrade_is_precise_and_keeps_global_mark(self):
+  text='add chain inet diversion_dns guard\nadd chain inet diversion_dns router_guard\n'
+  text+='add rule inet diversion_dns router_output ct direction reply return\n'
+  for c in ('split','router_output'):text+='add rule inet diversion_dns '+c+' ip daddr @cn4 return\nadd rule inet diversion_dns '+c+' meta mark set 1 ct mark set 1\n'
+  out=integrate.dedicated_policy(integrate.policy(text))
+  self.assertEqual(out.count('meta mark set 2 ct mark set 2'),11)
+  self.assertEqual(out.count('meta mark set 1 ct mark set 1'),2)
+  self.assertEqual(out.count('Dedicated game fail closed'),2)
+  with self.assertRaises(ValueError):integrate.dedicated_policy(out)
+ def test_emergency_covers_both_marks(self):
+  self.assertEqual(integrate.dedicated_emergency('meta mark 1 counter drop\n'*2).count('meta mark { 1, 2 }'),2)
+  with self.assertRaises(ValueError):integrate.dedicated_emergency('other')

@@ -89,3 +89,40 @@ network response. The UI also supports manual list refresh.
 - Device kernel set/tuple syntax, exact binary source provenance, real DNS/route behavior,
   on/off persistence, automatic recovery and normal traffic must be verified on
   the target separately. Mock tests are not device proof.
+
+## Dedicated AWS exit (optional static-router deployment)
+
+A root-private `game-tunnel/egress.json` activates the dedicated status checks:
+`interface=wg_game`, `mark=2`, `table=20234`, and `peer` containing the independently
+provisioned server public key. No endpoint, client key or real address is shipped
+in source. `game-egress.lua` verifies both route families, single default peer,
+classifier mark, forward/postrouting guards and recent handshake. The Web view
+labels this profile **独立 AWS**; missing routes or stale handshake are visible.
+Enabling requires a ready dedicated tunnel. Disabling remains possible when it fails.
+
+Use `dedicated_policy`, `dedicated_query` and `dedicated_emergency` transformations
+only against the already integrated profile. They keep all ten game rules ahead
+of CN, change only their mark to 2, protect the dedicated transport (UDP source
+51824), and reject mark 2 escaping `wg_game`. The global exit still owns mark 1
+and table 100; switching it does not migrate the dedicated interface. Emergency
+containment blocks both marks. Query inference uses the game's actual mark/table.
+
+Provision a new client key on the router and only its public key on the AWS
+server. Add a peer with unused /32 and /128 addresses to the existing service;
+never copy the active global client's identity or steal its AllowedIPs. Keep keys
+and backup configurations on their devices. Netifd owns the independent interface,
+mark rules and table defaults. Install terminal unreachable defaults via loopback
+so loss of the interface cannot fall through to main. A dedicated firewall zone
+must provide dual-stack source NAT, LAN/VPN forwarding and MTU/MSS handling.
+No default route is added to main. Keep the existing WAN endpoint host route.
+
+Deployment must back up current UCI, policy, UI, emergency rules and CN-policy
+snapshot, arm a timed/boot rollback, validate the tunnel before changing game
+marks, and adopt the new approved policy under the shared lock. Rollback removes
+only the new peer/interface and restores pre-change policy. Verify fresh AWS and
+ordinary global-exit HTTPS identities, game TCP/UDP counters, IPv6, route-loss
+containment, independent down/up recovery and both Web switch states.
+
+DNS for the game names continues using the configured foreign resolver group;
+this feature selects the connection egress, not a separate DNS upstream. Clients
+must reconnect after enabling. Existing conntrack flows are not forcibly deleted.

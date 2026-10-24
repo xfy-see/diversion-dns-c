@@ -145,6 +145,7 @@ function M.lookup(input,ctx)
  local chain=source=='router' and 'router_output' or 'split';local rules,rc=run('nft list chain inet diversion_dns '..chain)
  local policy_known=rc==0 and rules:find('@cn4',1,true) and rules:find('@cnsite4',1,true) and rules:find('@cn6',1,true) and rules:find('@cnsite6',1,true) and rules:find('meta mark set 0x00000001',1,true)
  local game_known=true;local game_enabled=false
+ local dedicated=read('/etc/pnw-control/game-tunnel/egress.json')~=nil
  if rules:find('@game_site4',1,true) then
   local gate,grc=run('nft list set inet diversion_dns game_enabled')
   game_known=grc==0;game_enabled=game_known and gate:find('tcp',1,true)~=nil
@@ -180,11 +181,11 @@ function M.lookup(input,ctx)
   elseif not policy_known or not membership_known or not game_known then a.reason='当前策略或集合无法完整读取'
   elseif localpath then a.expected_path='local';a.reason='本地／保留地址或 LAN 路由'
   elseif downloader then a.expected_path='WAN';a.reason='下载器源 MAC 的 WAN 豁免已匹配'
-  elseif gamehit then a.expected_path='tunnel';a.reason='Steam/游戏登录社区地址例外优先于国内集合；TCP/UDP 新连接'
+  elseif gamehit then a.expected_path='tunnel';a.reason=dedicated and 'Steam/游戏例外：独立 AWS 隧道；TCP/UDP 新连接' or 'Steam/游戏登录社区地址例外优先于国内集合；TCP/UDP 新连接'
   elseif #a.sets>0 then a.expected_path='WAN';a.reason='命中当前国内地址集合 '..table.concat(a.sets,', ')
   else a.expected_path='tunnel';a.reason='未命中国内地址集合，普通流量按 mark=1 推断' end
-  if a.expected_path=='tunnel' and (ctx.emergency or (a.family==6 and (ctx.selected=='usss' or ctx.selected=='usvless'))) then a.expected_path='blocked';a.reason=ctx.emergency and '应急隔离阻断隧道标记流量' or '当前美国出口阻断境外 IPv6' end
-  local mark=(a.expected_path=='tunnel' or a.expected_path=='blocked') and 1 or 0
+  if a.expected_path=='tunnel' and (ctx.emergency or (a.family==6 and not (gamehit and dedicated) and (ctx.selected=='usss' or ctx.selected=='usvless'))) then a.expected_path='blocked';a.reason=ctx.emergency and '应急隔离阻断隧道标记流量' or '当前美国出口阻断境外 IPv6' end
+  local mark=(a.expected_path=='tunnel' or a.expected_path=='blocked') and ((gamehit and dedicated) and 2 or 1) or 0
   local route,route_rc=run('ip -'..a.family..' route get '..q(a.address)..' mark '..mark)
   a.route={mark=mark,device=route:match('%sdev%s+(%S+)'),table=route:match('%stable%s+(%S+)'),available=route_rc==0,inference_only=true}
  end

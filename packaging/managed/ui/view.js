@@ -99,7 +99,7 @@ return view.extend({
   function renderOverview() {
    var game = object(current.game_tunnel);
    parts.gameCard.hidden = game.available !== true;
-   parts.gameStatus.textContent = !connected ? '游戏隧道状态未知' : !game.consistent ? '配置与运行状态尚未一致，请等待完成或重试恢复' : game.enabled ? '已开启：登录、社区和 Dota 2 走当前隧道' : '已关闭：按原 CN-site / CN-IP 分流';
+   parts.gameStatus.textContent = !connected ? '游戏隧道状态未知' : !game.consistent ? '配置与运行状态尚未一致，请等待完成或重试恢复' : game.enabled ? '已开启：登录、社区和 Dota 2 走' + (object(game.egress).label || '当前隧道') : '已关闭：按原 CN-site / CN-IP 分流';
    parts.gameNote.textContent = '游戏下载沿用原分流；现有设备豁免保留。切换后请重新连接 Steam / 游戏。' + (game.updated ? ' 游戏地址更新：' + time(game.updated) + '；SDR ' + count(game.relay_count) + '，登录服务器 ' + count(game.cm_count) + '。' : '') + (game.note || '') + (game.refresh_error ? ' 地址更新失败，继续使用最近有效列表：' + game.refresh_error : '');
    var h = object(current.health), last = object(current.last), failures = object(current.endpoint_health).dns_failures, containment = object(current.containment);
    var known = connected ? '' : '上次记录：';
