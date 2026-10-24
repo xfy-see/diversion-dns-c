@@ -230,13 +230,22 @@ static void cache_policy_contract(void) {
         snprintf(extra, sizeof(extra), "%s\n%s\n", single[i], single[i]); reject(extra);
     }
 }
+static void tunnel_contract(void) {
+    char text[2048];
+    snprintf(text, sizeof(text), "tunnel_domain_file=%s\ntunnel_nftset_ipv4=inet,dns,game4,ipv4_addr,32\nnftset_fast=1\nnftset_hit_window_ms=0\n", rules_path);
+    accept_config(text);
+    snprintf(text, sizeof(text), "tunnel_domain_file=%s\n", rules_path); reject(text);
+    reject("tunnel_nftset_ipv4=inet,dns,game4,ipv4_addr,32\n");
+    snprintf(text, sizeof(text), "tunnel_domain_file=%s\ntunnel_nftset_ipv4=inet,dns,game4,ipv6_addr,128\n", rules_path); reject(text);
+    reject("tunnel_domain_file=/definitely/missing\ntunnel_nftset_ipv4=inet,dns,game4,ipv4_addr,32\n");
+}
 int main(void) {
     strcpy(test_dir, "/tmp/mosdns-fixed-config-XXXXXX"); assert(mkdtemp(test_dir));
     snprintf(config_path, sizeof(config_path), "%s/config.conf", test_dir);
     snprintf(rules_path, sizeof(rules_path), "%s/cn.txt", test_dir);
     const char *rules = "domain:cn\nfull:exact.test\n"; write_bytes(rules_path, rules, strlen(rules));
     snprintf(valid, sizeof(valid), "listen_udp=127.0.0.1:5300\ncn_domain_file=%s\ncn_upstream=127.0.0.1:5301\nforeign_upstream=127.0.0.1:5302\n", rules_path);
-    basic_contract(); malformed_contract(); repeat_limits(); byte_limits(); literal_value_characters(); actual_rules_are_checked(); cache_policy_contract();
+    tunnel_contract(); basic_contract(); malformed_contract(); repeat_limits(); byte_limits(); literal_value_characters(); actual_rules_are_checked(); cache_policy_contract();
     assert(!unlink(config_path)); assert(!unlink(rules_path)); assert(!rmdir(test_dir));
     puts("fixed config: strict keys, bounds, lists, diagnostics and rules preflight passed"); return 0;
 }

@@ -53,7 +53,7 @@ void md_dns_limit_udp(const md_packet *q, md_packet *r);
  * （至多一个无选项、版本 0、extended RCODE 0 的 OPT，且没有其他记录）。
  * 服务端收包时解析一次，之后 engine/cache/forward/limit_udp/error 全部复用。
  * 请求报文在处理期间只读；len 不符或未解析时，*_q 接口退回兼容的自行解析。
- * route 是 engine 的分流备忘（-1 未知，0 境外，1 CN），解析时置 -1。
+ * route 是 engine 的分流备忘（-1 未知，0 境外，1 CN，2 显式隧道域名），解析时置 -1。
  * cache_memo 是 engine 的缓存统计备忘（-1 尚未计数；0 已在 dispatch 计数；
  * 1 已计数且已认领一次 prefetch），保证每个请求只计数一次。解析时置 -1。 */
 typedef struct {
