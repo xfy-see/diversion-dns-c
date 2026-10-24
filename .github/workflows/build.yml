@@ -294,6 +294,7 @@ jobs:
           sudo --preserve-env=GITHUB_SHA,GITHUB_RUN_ID unshare --net sh -c '
             ip link set lo up
             export DIVERSION_OWNED_NETNS=1
+            python3 deployment/game-tunnel/kernel-smoke.py --output .build/kernel-evidence/game-policy.json
             python3 c/tests/nft_kernel_test.py --application .build/gcc-review/mosdns-c --output .build/kernel-evidence/regression
           '
       - name: Default CLI path, worker lanes, small thread stack and TCP limits in an owned namespace
