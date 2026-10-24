@@ -109,7 +109,15 @@ end
 local function dns_restart()
  must('/usr/sbin/diversion-dns-c check -c '..C)
  must('/etc/init.d/diversion-dns-c restart');must('/etc/init.d/diversion-dns-c running')
- must('lua /etc/diversion-dns-c/dns-probe.lua 127.0.0.1 15363 example.com A positive udp')
+ -- procd running means the process exists, not that rule loading/listeners
+ -- are ready. A connected UDP socket can receive ECONNREFUSED immediately.
+ local last
+ for attempt=1,5 do
+  local output,rc=run('lua /etc/diversion-dns-c/dns-probe.lua 127.0.0.1 15363 example.com A positive udp')
+  if rc==0 then return end
+  last=output;if attempt<5 then must('sleep 1')end
+ end
+ error('DNS did not become ready after bounded retries: '..tostring(last):sub(1,240))
 end
 function M.recover()
  locked();if not read(B..'/pending.json')then return false end;local p=load(B..'/pending.json');assert(p.state=='applying','invalid game recovery journal')

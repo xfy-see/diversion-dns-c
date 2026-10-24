@@ -59,7 +59,9 @@ and retain the existing authenticated control/status ACL (no new anonymous RPC).
 The controller holds the global lock across switching and recovery. The module
 journals exact before/after DNS configuration before mutations, refuses rollback
 if another writer changed it, and leaves failed recovery journals intact.
-Its existing monitor reconciliation restores interrupted toggles. Runtime state
+Its existing monitor reconciliation restores interrupted toggles. DNS readiness
+uses up to five real queries with one-second gaps because procd can report a
+running process before its listeners are ready; persistent failure still rolls back. Runtime state
 is shown separately from saved intent; missing or inconsistent state is not
 reported as enabled. File-write and network failures do not silently enable it.
 

@@ -124,6 +124,20 @@ class GameTests(unittest.TestCase):
   path='/etc/diversion-dns-c/config.conf';self.h.files[path]='original\n';self.h.failure_once='nft -f /etc/pnw-control/game-tunnel/runtime.nft'
   with self.assertRaises(Exception):self.h.module.set(True)
   self.assertEqual(self.h.files[path],'original\n');self.assertFalse(self.h.gate);self.assertNotIn('/etc/pnw-control/game-tunnel/pending.json',self.h.files)
+ def test_dns_startup_probe_retries_before_committing(self):
+  self.h.files['/etc/diversion-dns-c/config.conf']='original\n'
+  self.h.failure_once='lua /etc/diversion-dns-c/dns-probe.lua'
+  self.h.module.set(True)
+  probes=[c for c in self.h.commands if 'dns-probe.lua'in c]
+  self.assertEqual(len(probes),2);self.assertTrue(self.h.gate)
+  self.assertNotIn('/etc/pnw-control/game-tunnel/pending.json',self.h.files)
+ def test_persistent_dns_failure_keeps_recovery_journal(self):
+  self.h.files['/etc/diversion-dns-c/config.conf']='original\n'
+  self.h.failure='lua /etc/diversion-dns-c/dns-probe.lua'
+  with self.assertRaises(Exception):self.h.module.set(True)
+  self.assertEqual(len([c for c in self.h.commands if 'dns-probe.lua'in c]),10)
+  self.assertIn('/etc/pnw-control/game-tunnel/pending.json',self.h.files)
+  self.assertEqual(self.h.files['/etc/diversion-dns-c/config.conf'],'original\n')
  def test_refresh_failure_retains_previous_list(self):
   path='/etc/pnw-control/game-tunnel/data.json';self.h.files[path]='last-good';self.h.failure='uclient-fetch'
   with self.assertRaises(Exception):self.h.module.refresh()
