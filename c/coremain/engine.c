@@ -41,7 +41,7 @@ typedef enum {
     CACHE_PREFETCH, CACHE_PREFETCH_MAX, CACHE_MAX_BYTES, CACHE_FOREIGN_RESERVE,
     CACHE_WARM_FILE, CACHE_WARM_MAX, CACHE_WARM_QPS, CACHE_WARM_SAVE,
     CACHE_KEEP_FILE, CACHE_KEEP_QPS, CACHE_KEEP_PERCENT,
-    STATS_FILE, STATS_INTERVAL,
+    STATS_FILE, STATS_INTERVAL, TUNNEL_FILE, TUNNEL_NFT4, TUNNEL_NFT6,
     KEY_COUNT
 } config_key;
 static const char *const key_names[KEY_COUNT] = {
@@ -55,10 +55,10 @@ static const char *const key_names[KEY_COUNT] = {
     "cache_prefetch_percent", "cache_prefetch_max", "cache_max_bytes", "cache_foreign_reserve_percent",
     "cache_warm_file", "cache_warm_max", "cache_warm_qps", "cache_warm_save_interval",
     "cache_keep_file", "cache_keep_qps", "cache_keep_percent",
-    "stats_file", "stats_interval"
+    "stats_file", "stats_interval", "tunnel_domain_file", "tunnel_nftset_ipv4", "tunnel_nftset_ipv6"
 };
 /* 可重复（列表）键；其余键只能出现一次。 */
-static bool list_key(size_t k) { return k <= FOREIGN_UPSTREAM || k == CACHE_STALE_OVERRIDE; }
+static bool list_key(size_t k) { return k <= FOREIGN_UPSTREAM || k == CACHE_STALE_OVERRIDE || k == TUNNEL_FILE; }
 #define STALE_OVERRIDE_MAX 8
 typedef struct { char *text; size_t line; } config_value;
 typedef struct { config_value values[CONFIG_LIST_MAX]; size_t count; } config_values;
@@ -75,9 +75,9 @@ typedef struct {
 } keep_entry;
 struct md_engine {
     md_stats *stats;
-    md_domain *cn;
+    md_domain *cn, *tunnel;
     md_cache *cache;
-    md_nft *nft;
+    md_nft *nft, *tunnel_nft;
     upstream_group upstreams[2]; /* 0 CN, 1 foreign */
     md_listener *listeners; size_t listener_count;
     md_server_limits limits;
@@ -376,18 +376,43 @@ static int build_config(md_engine *e, const config *c, const char *path, char *e
         strcat(nft, value(c, k));
     }
     if (*nft && !(e->nft = md_nft_new(nft, err))) return config_error(err, path, key_line(c, NFT4), err);
+    /* Explicit tunnel domains override CN classification, but use a separate
+     * address set. Both resources are opt-in and immutable until restart. */
+    bool tunnel_domains = c->keys[TUNNEL_FILE].count != 0;
+    bool tunnel_targets = c->keys[TUNNEL_NFT4].count || c->keys[TUNNEL_NFT6].count;
+    if (tunnel_domains != tunnel_targets)
+        return config_error(err, path, c->last_line, "tunnel_domain_file and tunnel_nftset target must be configured together");
+    if (tunnel_domains) {
+        if (!(e->tunnel = md_domain_new())) return fail(err, "out of memory");
+        for (size_t i = 0; i < c->keys[TUNNEL_FILE].count; i++) {
+            const config_value *v = &c->keys[TUNNEL_FILE].values[i];
+            if (md_domain_load(e->tunnel, v->text, err)) return config_error(err, path, v->line, err);
+        }
+        nft[0] = 0;
+        for (config_key k = TUNNEL_NFT4; k <= TUNNEL_NFT6; k++) if (c->keys[k].count) {
+            if (validate_nft(value(c, k), k == TUNNEL_NFT6, err)) return config_error(err, path, key_line(c, k), err);
+            if (*nft) strcat(nft, " ");
+            strcat(nft, value(c, k));
+        }
+        if (!(e->tunnel_nft = md_nft_new(nft, err))) return config_error(err, path, c->last_line, err);
+    }
     uint32_t fast;
     if (config_number(c, NFT_FAST, 0, 0, 1, false, &fast, path, err)) return -1;
-    if (fast && (!e->nft || md_nft_enable_fast(e->nft, err)))
-        return config_error(err, path, key_line(c, NFT_FAST), e->nft ? err : "nftset_fast requires a target");
+    if (fast && !e->nft && !e->tunnel_nft)
+        return config_error(err, path, key_line(c, NFT_FAST), "nftset_fast requires a target");
+    if (fast && e->nft && md_nft_enable_fast(e->nft, err))
+        return config_error(err, path, key_line(c, NFT_FAST), err);
+    if (fast && e->tunnel_nft && md_nft_enable_fast(e->tunnel_nft, err))
+        return config_error(err, path, key_line(c, NFT_FAST), err);
     /* 热命中跳过窗口：默认 1000 ms，0 关闭（每次 CN 命中都核对/写入内核）。 */
     uint32_t hit_window;
     if (config_number(c, NFT_HIT_WINDOW, 1000, 0, 10000, false, &hit_window, path, err)) return -1;
-    if (c->keys[NFT_HIT_WINDOW].count && !e->nft)
+    if (c->keys[NFT_HIT_WINDOW].count && !e->nft && !e->tunnel_nft)
         return config_error(err, path, key_line(c, NFT_HIT_WINDOW), "nftset_hit_window_ms requires a target");
     if (e->nft) md_nft_set_hit_window(e->nft, hit_window);
     /* Read-only GETSET: warn (never fail) about interval targets lacking auto-merge. */
     md_nft_audit(e->nft);
+    if (e->tunnel_nft) { md_nft_set_hit_window(e->tunnel_nft, hit_window); md_nft_audit(e->tunnel_nft); }
     e->cn = md_domain_new();
     if (!e->cn) return config_error(err, path, key_line(c, CN_FILE), "out of memory");
     /* check reads actual rule files and compiles PCRE2, but never opens a
@@ -430,7 +455,8 @@ static int finalize(md_engine *e, bool cn, md_packet *response, md_dns_view *vie
     if (response->len && md_dns_normalize_ttl_view(response, view, err)) { qv->stats_error = MD_SE_RESPONSE; return -1; }
     if (response->len) qv->stats_rcode = md_dns_view_rcode(response, view);
     md_trace_mark(MD_T_NFT0);
-    int rc = cn && e->nft && response->len ? md_nft_apply_view(e->nft, response, view, err) : 0;
+    md_nft *target = qv->route == 2 ? e->tunnel_nft : cn ? e->nft : NULL;
+    int rc = target && response->len ? md_nft_apply_view(target, response, view, err) : 0;
     if (rc) qv->stats_error = MD_SE_NFT;
     md_trace_mark(MD_T_NFT1);
     if (!rc && md_now() >= deadline) { qv->stats_error = MD_SE_DEADLINE; rc = fail(err, "query execution deadline exceeded"); }
@@ -761,7 +787,8 @@ const md_server_limits *md_engine_server_limits(const md_engine *e) { return e ?
  * 一个上游组卡住不会占满另一组或缓存命中的 worker 与排队配额。 */
 /* 分流备忘：同一请求在 dispatch 与 worker 中只做一次域名匹配。 */
 static bool route_cn(md_engine *e, md_dns_query *qv) {
-    if (qv->route < 0) qv->route = md_domain_match(e->cn, qv->q.name) ? 1 : 0;
+    if (qv->route < 0) qv->route = e->tunnel && md_domain_match(e->tunnel, qv->q.name) ? 2 :
+        md_domain_match(e->cn, qv->q.name) ? 1 : 0;
     return qv->route == 1;
 }
 unsigned md_engine_dispatch(md_engine *e, size_t entry, const md_packet *q, md_packet *r) {
@@ -777,8 +804,9 @@ unsigned md_engine_dispatch_q(md_engine *e, size_t entry, const md_packet *q, md
     bool cn = route_cn(e, qv);
     /* 只有国外新鲜命中在此回复：才需要解析（一次，finalize 复用）；
      * CN 命中仅探测状态，由 worker 的 md_engine_query 解析唯一一次。 */
-    md_dns_view *view = cn ? NULL : md_dns_view_scratch();
-    if (!cn && !view) return MD_LANE_CACHED;
+    bool writes_nft = cn || qv->route == 2;
+    md_dns_view *view = writes_nft ? NULL : md_dns_view_scratch();
+    if (!writes_nft && !view) return MD_LANE_CACHED;
     /* 每个请求在此计数一次（命中/未命中原因）并认领 prefetch，结果记入
      * qv->cache_memo，worker 不重复计数。需要 prefetch 的国外新鲜命中转入
      * 缓存 lane，由 worker 启动后台刷新，事件循环不创建线程。 */
@@ -787,7 +815,7 @@ unsigned md_engine_dispatch_q(md_engine *e, size_t entry, const md_packet *q, md
                               MD_CACHE_COUNT | MD_CACHE_CLAIM, &info);
     qv->stats_cache = e->cache ? (hit == 2 ? 3 : hit == 1 ? 2 : 1) : 0;
     if (e->cache) qv->cache_memo = info.prefetch_due ? 1 : 0;
-    if (hit == 1 && !cn && !info.prefetch_due && !finalize(e, false, r, view, qv, md_now() + 5, err)) { md_trace_flag(MD_TF_HIT_FRESH); return MD_LANE_REPLY; }
+    if (hit == 1 && !writes_nft && !info.prefetch_due && !finalize(e, false, r, view, qv, md_now() + 5, err)) { md_trace_flag(MD_TF_HIT_FRESH); return MD_LANE_REPLY; }
     r->len = 0;
     if (hit) return MD_LANE_CACHED;
     return cn ? MD_LANE_CN : MD_LANE_FOREIGN;
@@ -852,7 +880,7 @@ void md_engine_free(md_engine *e) {
     }
     for (size_t i = 0; i < e->override_count; i++) md_domain_free(e->overrides[i].domains);
     free(e->keep); free(e->warm_file); if (e->wake_ok) pthread_cond_destroy(&e->wake);
-    md_domain_free(e->cn); md_cache_free(e->cache); md_nft_free(e->nft);
+    md_domain_free(e->cn); md_domain_free(e->tunnel); md_cache_free(e->cache); md_nft_free(e->nft); md_nft_free(e->tunnel_nft);
     free(e->upstreams[0].items); free(e->upstreams[1].items); free(e->listeners);
     pthread_mutex_destroy(&e->lock); free(e);
 }

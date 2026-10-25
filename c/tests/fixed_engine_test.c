@@ -44,6 +44,7 @@ static unsigned test_forward_advance, test_nft_advance;
 static char test_last_device[2][64];
 static bool test_forward_fails, test_nft_fails, test_refresh_block, test_refresh_entered;
 static md_packet test_last_nft;
+static md_nft *test_last_nft_target;
 
 static uint64_t test_now(void) { return atomic_load(&test_clock); }
 static void test_reset(void) {
@@ -157,7 +158,7 @@ static int test_nft_record(const md_packet *packet, const md_rr *rr, void *unuse
     return 0;
 }
 static int test_nft_apply(md_nft *nft, const md_packet *r, char *err) {
-    assert(nft); md_question parsed; assert(!md_dns_question(r, &parsed, err));
+    assert(nft); test_last_nft_target = nft; md_question parsed; assert(!md_dns_question(r, &parsed, err));
     pthread_mutex_lock(&test_lock); ++test_nft_calls; test_last_nft = *r;
     assert(!md_dns_records(r, test_nft_record, NULL, err)); bool failed = test_nft_fails;
     pthread_mutex_unlock(&test_lock);
@@ -484,12 +485,46 @@ static void test_warm_lifecycle(void) {
     test_read_file(warm, text, sizeof(text)); assert(!strcmp(text, original));
     assert(!unlink(warm));
 }
+static void test_tunnel_override(void) {
+    test_reset(); char rules[600], extra[1800], err[MD_ERROR_SIZE];
+    snprintf(rules, sizeof(rules), "%s/tunnel.txt", test_directory);
+    test_write(rules, "domain:game.cn\n");
+    snprintf(extra, sizeof(extra), "tunnel_domain_file=%s\ntunnel_nftset_ipv4=inet,dns,game4,ipv4_addr,32\ntunnel_nftset_ipv6=inet,dns,game6,ipv6_addr,128\n", rules);
+    md_engine *e = test_engine(extra, true);
+    for (unsigned i = 0; i < 2; i++) {
+        md_packet q = test_question("login.game.cn", i ? 28 : 1, 0x0100), r;
+        md_dns_query qv = {0};
+        assert(md_engine_dispatch_q(e, 0, &q, &qv, &r) == MD_LANE_FOREIGN && qv.route == 2);
+        assert(!md_engine_query_q(e, 0, &q, &qv, &r, err));
+        assert(test_last_nft_target == e->tunnel_nft && test_calls[0] == 0);
+        qv.valid = false;
+        assert(md_engine_dispatch_q(e, 0, &q, &qv, &r) == MD_LANE_CACHED);
+        unsigned before = test_nft_calls;
+        assert(!md_engine_query_q(e, 0, &q, &qv, &r, err));
+        assert(test_nft_calls == before + 1 && test_last_nft_target == e->tunnel_nft);
+        test_nft_fails = true;
+        assert(md_engine_query(e, 0, &q, &r, err) != 0);
+        test_nft_fails = false;
+    }
+    assert(test_calls[1] == 2 && test_calls[0] == 0);
+    md_packet ordinary = test_question("ordinary.foreign.test", 1, 0x0100);
+    unsigned before = test_nft_calls;
+    (void)test_resolve(e, &ordinary); assert(test_nft_calls == before);
+    md_packet cn = test_question("download.cn", 1, 0x0100);
+    (void)test_resolve(e, &cn); assert(test_last_nft_target == e->nft && test_calls[0] == 1);
+    md_engine_free(e);
+    /* Removing the opt-in config restores the CN path without changing data. */
+    test_reset(); e = test_engine("", true);
+    cn = test_question("login.game.cn", 1, 0x0100);
+    (void)test_resolve(e, &cn); assert(test_calls[0] == 1 && test_calls[1] == 0);
+    md_engine_free(e); assert(!unlink(rules));
+}
 int main(void) {
     strcpy(test_directory, "/tmp/mosdns-fixed-engine-XXXXXX"); assert(mkdtemp(test_directory));
     snprintf(test_rules, sizeof(test_rules), "%s/cn.txt", test_directory);
     snprintf(test_config, sizeof(test_config), "%s/config.conf", test_directory);
     test_write(test_rules, "domain:cn\nfull:exact.test\nkeyword:needle\nregexp:^asset-[0-9]+\\.test$\n");
-    test_split_and_cnames(); test_cache_keeps_nft(); test_negative_and_isolation();
+    test_tunnel_override(); test_split_and_cnames(); test_cache_keeps_nft(); test_negative_and_isolation();
     test_disabled_cache_and_group_options(); test_failures_and_entry(); test_deadlines_and_null_errors(); test_lazy_refresh();
     test_stale_refresh_failure(); test_stale_override(); test_prefetch(); test_counters_and_bypass(); test_warm_file(); test_warm_lifecycle();
     assert(!unlink(test_config)); assert(!unlink(test_rules)); assert(!rmdir(test_directory));

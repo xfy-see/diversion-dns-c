@@ -203,3 +203,77 @@ class ControllerTests(unittest.TestCase):
   def fail_probe(command):h.files['/etc/config/firewall']='external edit';return 'candidate failed',1
   h.fail['probe-fetch']=fail_probe;h.worker('switch-usss');s=h.get(R+'/result.json');self.assertEqual(s['rollback']['state'],'failed');self.assertEqual(h.files['/etc/config/firewall'],'external edit');self.assertIn(B+'/pending.json',h.files);self.assertTrue(h.active)
 if __name__=='__main__':unittest.main(verbosity=2)
+
+class GameRecoveryIsolationTests(unittest.TestCase):
+ def test_main_restore_precedes_throwing_optional_game_module(self):
+  h=Harness();h.files[B+'/pending.json']='pending';h.files[B+'/game-tunnel.lua']='installed'
+  h.lua.execute("dofile=function()assert(PY_OPEN('/etc/pnw-control/pending.json')==nil,'main restore must run first');error('game failure')end")
+  code=h.code.replace("if read(B..'/pending.json') then restore() end", "if read(B..'/pending.json') then os.remove(B..'/pending.json') end")
+  cut=code.index("fs.mkdir(R,'700')\nlocal mode=")
+  api=h.lua.execute(code[:cut]+'return {reconcile=reconcile_locked}')
+  self.assertTrue(api.reconcile());self.assertNotIn(B+'/pending.json',h.files)
+
+class GameLaunchTests(unittest.TestCase):
+ def test_prepare_failure_reports_original_error_and_never_starts_worker(self):
+  h=Harness();h.env={};h.dirs.add(R+'/job');h.files[R+'/job/token']='owned'
+  h.lua.execute("dofile=function()return {prepare=function()error('download timed out')end}end")
+  h.run_mode('launch','game-on','owned')
+  result=h.get(R+'/result.json');self.assertEqual(result['state'],'failed');self.assertEqual(result['phase'],'prepare')
+  self.assertIn('download timed out',result['message']);self.assertNotIn(R+'/job/token',h.files)
+  self.assertFalse(any(' worker ' in c for c in h.events))
+ def test_launcher_prepares_before_lock_and_then_invokes_worker(self):
+  h=Harness();h.env={};h.dirs.add(R+'/job');h.files[R+'/job/token']='owned'
+  h.lua.execute("dofile=function()return {prepare=function()assert(os.getenv('DIVERSION_CN_DEPLOY_LOCK_HELD')==nil);print('prepared')end}end")
+  h.run_mode('launch','game-refresh','owned')
+  self.assertIn('prepared',h.outputs);self.assertTrue(any('flock -n 9' in c and ' worker ' in c for c in h.events))
+ def test_recovery_error_is_recorded_without_failing_main_reconcile(self):
+  h=Harness();h.files[B+'/game-tunnel.lua']='present'
+  h.lua.execute("dofile=function()error('broken game journal')end")
+  self.assertEqual(h.run_mode('reconcile'),0)
+  result=h.get(R+'/reconcile.json');self.assertEqual(result['failures'],0)
+  self.assertEqual(result['game_recovery']['state'],'failed');self.assertIn('broken game journal',result['game_recovery']['error'])
+ def test_start_shell_returns_before_slow_background_launch(self):
+  import subprocess,time
+  h=Harness();h.env={};h.run_mode('start','game-on')
+  cmd=next(c for c in h.events if ' launch ' in c)
+  self.assertNotIn('game-prepare',cmd)
+  cmd=cmd.replace('/usr/libexec/pnw-control launch', 'sleep 1; :').replace('>'+R+'/job.log','>/dev/null')
+  started=time.monotonic();subprocess.run(['/bin/sh','-c',cmd],check=True,capture_output=True,timeout=0.5)
+  self.assertLess(time.monotonic()-started,0.5)
+
+class GameOffPreconditionTests(unittest.TestCase):
+ def test_unknown_containment_still_blocks_off(self):
+  h=Harness();h.fail['nft list tables']=('permission denied',1)
+  h.lua.execute("dofile=function()return {status=function()return {available=true,enabled=true,consistent=false}end}end")
+  status=h.to_py(h.api.status());self.assertFalse(status['actions']['game-off']['allowed'])
+  self.assertEqual(status['actions']['game-off']['reason'],'cannot inspect emergency containment')
+
+class BusyCleanupRegressionTests(unittest.TestCase):
+ def test_busy_removes_launcher_pid_and_allows_next_action(self):
+  h=Harness();h.dirs.add(R+'/job')
+  for name,value in [('token','owned'),('pid','123'),('game-data','prepared')]:h.files[R+'/job/'+name]=value
+  h.files[R+'/result.json']=json.dumps({'action':'check','state':'running'})
+  # Model real rmdir: nonempty directories cannot be removed.
+  h.lua.globals().PY_RMDIR=lambda p: None if any(x.startswith(p+'/')for x in h.files)else h.rmdir(p)
+  h.env={};original_run=h.run
+  def locked(command):
+   if 'flock -n 9' in command:
+    self.assertIn(' busy ',command);h.run_mode('busy','owned');return '',1
+   return original_run(command)
+  h.lua.globals().PY_RUN=locked
+  h.run_mode('launch','check','owned')
+  self.assertNotIn(R+'/job',h.dirs)
+  self.assertFalse(any(x.startswith(R+'/job/')for x in h.files))
+  self.assertEqual(h.get(R+'/result.json')['state'],'failed')
+  h.run_mode('start','check');self.assertEqual(h.get(R+'/result.json')['state'],'running')
+ def test_busy_wrong_token_cannot_remove_current_job(self):
+  h=Harness();h.dirs.add(R+'/job');h.files[R+'/job/token']='new';h.files[R+'/job/pid']='123'
+  with self.assertRaises(Exception):h.run_mode('busy','old')
+  self.assertEqual(h.files[R+'/job/token'],'new');self.assertEqual(h.files[R+'/job/pid'],'123')
+ def test_retry_recovery_preserves_game_error(self):
+  h=Harness();h.files[B+'/game-tunnel.lua']='present'
+  h.lua.execute("dofile=function()error('broken game journal')end")
+  h.worker('retry-recovery')
+  self.assertEqual(h.get(R+'/result.json')['state'],'success')
+  state=h.get(R+'/reconcile.json');self.assertEqual(state['failures'],0)
+  self.assertEqual(state['game_recovery']['state'],'failed');self.assertIn('broken game journal',state['game_recovery']['error'])

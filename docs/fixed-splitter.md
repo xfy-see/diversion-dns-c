@@ -337,3 +337,15 @@ udp_sport_reuse_pool=2
 **测试机 A 实测（2026-10-13，mipsel_24kc）：** 主要改善冷 **AAAA**——6 轮全部改善；冷 A 无稳定收益；TCP 受顺序效应影响大，无稳定结论。启用池后 500 QPS 累计 30 分钟：900,000/900,000 成功、零漏发、整体 P99 2.976 ms。协议、nft、队列/TCP 限制、池边界、interval 重叠、链路本地 IPv6 功能测试通过。默认保持 `udp_sport_reuse=0`（每查询新源端口）；启用会削弱源端口唯一性（上游随机 DNS ID 仍保留）。仅当慢速 MIPS 上冷 AAAA 延迟重要时建议启用。
 消融结论：恢复无上限 UDP 池（保留随机 ID）或整段回退 M4 可回到基线冷 P99；回退 N3 不能。
 
+
+### Explicit tunnel-domain exception (opt-in)
+
+`tunnel_domain_file` (repeatable) overrides CN-domain matching for its original
+QNAME. Configure at least one of `tunnel_nftset_ipv4` / `tunnel_nftset_ipv6` with
+the existing nft target format. Answers use the foreign upstream and cache
+policy, and populate only the tunnel targets, including cache hits, refresh and
+warmup. They are counted as foreign traffic. The kernel policy must put those
+targets before CN-IP/CN-site direct rules and after local/transport exemptions.
+Without these options classification and memory allocation remain unchanged.
+Changes require a service restart; stale CN cache entries are not retained.
+This feature does not depend on dnsmasq-full.
