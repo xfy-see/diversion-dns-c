@@ -54,7 +54,14 @@ jobs:
             GOARCH="$arch" go build -trimpath -ldflags='-s -w' -o "dist/$arch/load" benchmarks/suite/load.go
             GOARCH="$arch" go build -trimpath -ldflags='-s -w' -o "dist/$arch/fixture" benchmarks/suite/fixture.go
             GOARCH="$arch" go build -trimpath -ldflags='-s -w' -o "dist/$arch/diagload" benchmarks/suite/diagload.go
+            GOARCH="$arch" go build -trimpath -ldflags='-s -w' -o "dist/$arch/realflow-capture" benchmarks/suite/realflow_capture.go
+            GOARCH="$arch" go build -trimpath -ldflags='-s -w' -o "dist/$arch/realflow-runner" benchmarks/suite/realflow_runner.go
+            GOARCH="$arch" go build -trimpath -ldflags='-s -w' -o "dist/$arch/realflow-bounded" benchmarks/suite/realflow_bounded.go
           done
+          CGO_ENABLED=1 GOARCH=amd64 go test -race benchmarks/suite/realflow_capture.go benchmarks/suite/realflow_capture_test.go
+          CGO_ENABLED=1 GOARCH=amd64 go test -race benchmarks/suite/realflow_runner.go benchmarks/suite/realflow_runner_test.go
+          CGO_ENABLED=1 GOARCH=amd64 go test -race benchmarks/suite/realflow_bounded.go benchmarks/suite/realflow_bounded_test.go
+          dist/amd64/realflow-runner -fixture-smoke
           cp benchmarks/suite/*.go dist/
           go version > dist/toolchain.txt
           python3 - <<'PYTHON'
@@ -86,6 +93,84 @@ jobs:
           s=d['samples']
           assert d['schema']=='diversion-diagload-v1' and len(s)==20,d
           assert all(not x.get('error') and not x.get('unsent') and x['slot_ns']<=x['pickup_ns']<=x['send_ns']<x['recv_ns'] for x in s),s
+          PYTHON
+          python3 -u - <<'PYTHON' &
+          import socketserver,struct
+          def read(c,n):
+              b=b''
+              while len(b)<n:
+                  v=c.recv(n-len(b))
+                  if not v: return None
+                  b+=v
+              return b
+          class Handler(socketserver.BaseRequestHandler):
+              def handle(self):
+                  self.request.settimeout(5)
+                  while True:
+                      h=read(self.request,2)
+                      if h is None: return
+                      q=read(self.request,struct.unpack('!H',h)[0])
+                      if q is None: return
+                      p=12
+                      while q[p]: p+=q[p]+1
+                      end=p+5
+                      typ=struct.unpack('!H',q[p+1:p+3])[0]
+                      ip=b'\xc6\x12\x00\x2a' if typ==1 else b'\xfd\xaa'+bytes(13)+b'\x2a'
+                      r=q[:2]+struct.pack('!HHHHH',0x8180,1,1,0,0)+q[12:end]
+                      r+=b'\xc0\x0c'+struct.pack('!HHIH',typ,1,30,len(ip))+ip
+                      self.request.sendall(struct.pack('!H',len(r))+r)
+          class Server(socketserver.ThreadingTCPServer):
+              daemon_threads=True
+          with Server(('127.0.0.1',15531),Handler) as server: server.serve_forever()
+          PYTHON
+          tcp_fixture_pid=$!
+          trap 'kill "$fixture_pid" "$tcp_fixture_pid" 2>/dev/null || true' EXIT
+          sudo dist/amd64/realflow-capture -iface lo -dst-port 15531 -seconds 4 -stats-seconds 1 > capture-smoke.jsonl 2> capture-smoke.stderr &
+          capture_pid=$!
+          python3 - <<'PYTHON'
+          import json,pathlib,socket,struct,time
+          deadline=time.monotonic()+10
+          while True:
+              try:
+                  with socket.create_connection(('127.0.0.1',15531),timeout=.2): pass
+                  rows=[json.loads(x) for x in pathlib.Path('capture-smoke.jsonl').read_text().splitlines()]
+                  if any(x.get('type')=='capture_start' for x in rows): break
+              except (OSError,ValueError): pass
+              if time.monotonic()>deadline: raise RuntimeError('capture/TCP fixture not ready')
+              time.sleep(.05)
+          def read(c,n):
+              b=b''
+              while len(b)<n:
+                  v=c.recv(n-len(b))
+                  if not v: raise EOFError('TCP fixture closed early')
+                  b+=v
+              return b
+          qname=b'\x07example\x03com\0'
+          for transport in ('udp','tcp'):
+              with socket.socket(socket.AF_INET,socket.SOCK_DGRAM if transport=='udp' else socket.SOCK_STREAM) as c:
+                  c.settimeout(2)
+                  c.connect(('127.0.0.1',15531))
+                  for i in range(5):
+                      q=struct.pack('!HHHHHH',i+1,0x100,1,0,0,0)+qname+struct.pack('!HH',1,1)
+                      if transport=='udp':
+                          c.send(q)
+                          r=c.recv(4096)
+                      else:
+                          c.sendall(struct.pack('!H',len(q))+q)
+                          h=read(c,2)
+                          r=read(c,struct.unpack('!H',h)[0])
+                      assert r[:2]==q[:2] and r[2]&128,r
+          PYTHON
+          wait "$capture_pid"
+          python3 - <<'PYTHON'
+          import json
+          rows=[json.loads(line) for line in open('capture-smoke.jsonl')]
+          queries=[x for x in rows if x.get('type')=='dns_query']
+          final=[x for x in rows if x.get('type')=='capture_stats' and x.get('final')]
+          assert len(queries)==10,queries
+          assert {x['transport'] for x in queries}=={'udp','tcp'},queries
+          assert len(final)==1 and final[0]['kernel_drops']==0,final
+          assert not any(v for k,v in final[0]['counters'].items() if 'queue_full' in k),final
           PYTHON
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
