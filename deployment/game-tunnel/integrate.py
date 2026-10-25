@@ -92,6 +92,8 @@ def review_harden_controller(text):
     text=once(text,"   if action~='game-off' then ensure_topology() end", "   if action=='game-off' then assert(containment_state().known,'cannot inspect emergency containment')else ensure_topology() end")
     text=once(text," if not ok then\n  complete_result({action=action,state='failed',phase='prepare'", " if not ok then\n  save(B..'/game-tunnel/refresh.json',{time=os.time(),state='failed',error=clean_error(err)})\n  complete_result({action=action,state='failed',phase='prepare'")
     text=once(text," complete_result({action=action,state=ok and 'success'", " if not ok and (action=='game-on' or action=='game-refresh') then save(B..'/game-tunnel/refresh.json',{time=os.time(),state='failed',error=clean_error(result)})end\n complete_result({action=action,state=ok and 'success'")
+    text=once(text," os.remove(R..'/job/game-data');os.remove(R..'/job/token');fs.rmdir(R..'/job')"," os.remove(R..'/job/game-data');os.remove(R..'/job/token');os.remove(R..'/job/pid');fs.rmdir(R..'/job')")
+    text=once(text," if ok and action~='diagnose' and action~='check' then save(R..'/reconcile.json',{failures=0,paused=false,last_attempt=os.time()}) end"," if ok and action~='diagnose' and action~='check' then\n  local recovery=load(R..'/reconcile.json');recovery.failures=0;recovery.paused=false;recovery.last_attempt=os.time();recovery.last_error=nil\n  save(R..'/reconcile.json',recovery)\n end")
     return text
 
 def controller(text):

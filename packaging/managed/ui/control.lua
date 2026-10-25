@@ -543,7 +543,7 @@ elseif mode=='start' then
 elseif mode=='busy' then
  local token=arg[2];assert(read(R..'/job/token')==token,'invalid busy worker ownership')
  local r=load(R..'/result.json');r.state='failed';r.message='another policy or DNS transaction holds the lock; retry later';r.time=os.time();r.rollback={attempted=false,state='not_needed'};complete_result(r)
- os.remove(R..'/job/game-data');os.remove(R..'/job/token');fs.rmdir(R..'/job')
+ os.remove(R..'/job/game-data');os.remove(R..'/job/token');os.remove(R..'/job/pid');fs.rmdir(R..'/job')
 elseif mode=='worker' then
  local action,token=arg[2],arg[3];assert(allowed[action] and read(R..'/job/token')==token,'invalid worker ownership')
  write(R..'/job/pid',tostring(nixio.getpid()))
@@ -571,7 +571,10 @@ elseif mode=='worker' then
  end
  if not ok and (action=='game-on' or action=='game-refresh') then save(B..'/game-tunnel/refresh.json',{time=os.time(),state='failed',error=clean_error(result)})end
  complete_result({action=action,state=ok and 'success' or 'failed',message=clean_error(result),rollback=rollback,rollback_ok=rollback.state~='failed',time=os.time(),started_at=started_at,duration_ms=math.max(0,milliseconds()-started)})
- if ok and action~='diagnose' and action~='check' then save(R..'/reconcile.json',{failures=0,paused=false,last_attempt=os.time()}) end
+ if ok and action~='diagnose' and action~='check' then
+  local recovery=load(R..'/reconcile.json');recovery.failures=0;recovery.paused=false;recovery.last_attempt=os.time();recovery.last_error=nil
+  save(R..'/reconcile.json',recovery)
+ end
  os.remove(R..'/job/game-data');os.remove(R..'/job/token');os.remove(R..'/job/pid');fs.rmdir(R..'/job')
 elseif mode=='reconcile' then
  if os.getenv('DIVERSION_CN_DEPLOY_LOCK_HELD')~='1' then

@@ -162,3 +162,9 @@ unfinished transactions and unknown emergency containment remain blockers.
 Optional game recovery errors are retained in reconcile.json.game_recovery
 without failing or pausing main-exit recovery. Dedicated guard inspection now
 requires the first rule in each guard chain to be the dedicated fail-closed rule.
+
+Busy-lock completion removes the launcher's PID as well as the token and
+prepared data before removing the job directory. Recovery-counter resets merge
+into the existing reconciliation document, preserving optional game recovery
+errors. NFT chain inspection accepts up to 256 KiB per output; other command
+outputs retain the smaller bound, and oversized chain output still fails closed.

@@ -2,7 +2,7 @@ local M={}
 local J=require('luci.jsonc')
 local B='/etc/pnw-control/game-tunnel'
 local function read(p)local f=io.open(p);if not f then return nil end;local s=f:read(8193);f:close();assert(#s<=8192,'egress file too large');return s end
-local function run(c)local f=assert(io.popen(c..' 2>/dev/null'));local s=f:read(16385)or '';f:close();assert(#s<=16384,'egress output too large');return s end
+local function run(c,limit)limit=limit or 16384;local f=assert(io.popen(c..' 2>/dev/null'));local s=f:read(limit+1)or '';f:close();assert(#s<=limit,'egress output too large');return s end
 function M.status()
  local raw=read(B..'/egress.json');if not raw then return nil end
  local c=assert(J.parse(raw),'invalid dedicated egress config')
@@ -17,7 +17,7 @@ function M.status()
  for key,ips in peers:gmatch('([^%s]+)%s+([^\n]+)')do n=n+1;if key==c.peer and ips:find('0.0.0.0/0',1,true)and ips:find('::/0',1,true)then matched=true end end
  d.consistent=d.consistent and n==1 and matched
  for _,chain in ipairs({'router_output','split'})do
-  local rules=run('nft list chain inet diversion_dns '..chain)
+  local rules=run('nft list chain inet diversion_dns '..chain,262144)
   for _,set in ipairs({'game_site4','game_site6','game_relay4','game_cm4'})do
    local found=false
    for line in rules:gmatch('[^\n]+')do
@@ -29,8 +29,8 @@ function M.status()
   end
  end
  for _,name in ipairs({'guard','router_guard'})do
-  local rules=run('nft list chain inet diversion_dns '..name)
-  local snapshot=J.parse(run('nft -j list chain inet diversion_dns '..name))
+  local rules=run('nft list chain inet diversion_dns '..name,262144)
+  local snapshot=J.parse(run('nft -j list chain inet diversion_dns '..name,262144))
   local first
   for _,item in ipairs(type(snapshot)=='table'and type(snapshot.nftables)=='table'and snapshot.nftables or {})do if item.rule then first=item.rule;break end end
   d.consistent=d.consistent and first~=nil and first.comment=='Dedicated game fail closed'

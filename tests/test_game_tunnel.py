@@ -266,3 +266,18 @@ class GuardOrderTests(unittest.TestCase):
   m=self.setup_module();prior=self.h.lua.globals().pycommand
   self.h.lua.globals().pycommand=lambda c: json.dumps({'nftables':[{'rule':{'expr':[{'accept':None}]}},{'rule':{'comment':'Dedicated game fail closed'}}]})if 'nft -j list chain'in c else prior(c)
   self.assertFalse(self.h.python(m.status())['consistent'])
+
+@unittest.skipIf(LuaRuntime is None,'prebuilt lupa required')
+class LargeGuardTests(unittest.TestCase):
+ setup_module=DedicatedTests.setup_module
+ def test_guard_larger_than_16k_keeps_first_rule_validation(self):
+  m=self.setup_module();prior=self.h.lua.globals().pycommand
+  def command(c):
+   if 'nft -j list chain'in c:return json.dumps({'nftables':[{'rule':{'comment':'Dedicated game fail closed'}}]+[{'rule':{'comment':'padding'*100}}for _ in range(100)]})
+   return prior(c)
+  self.h.lua.globals().pycommand=command
+  self.assertTrue(self.h.python(m.status())['ready'])
+ def test_guard_over_256k_fails_closed(self):
+  m=self.setup_module();prior=self.h.lua.globals().pycommand
+  self.h.lua.globals().pycommand=lambda c:'x'*262145 if 'nft -j list chain'in c else prior(c)
+  with self.assertRaises(Exception):m.status()
