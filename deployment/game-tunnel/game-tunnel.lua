@@ -80,7 +80,13 @@ function M.prepare(path)
  assert(os.getenv('DIVERSION_CN_DEPLOY_LOCK_HELD')~='1','downloads must run outside deployment lock')
  assert(type(path)=='string'and path:match('^/var/run/pnw%-control/job/game%-data$'),'invalid preparation path')
  save(B..'/refresh.json',{time=os.time(),state='preparing'})
- save(path,fetch())
+ local ok,data=pcall(fetch)
+ if not ok then
+  save(B..'/refresh.json',{time=os.time(),state='failed',error=tostring(data):sub(1,240)})
+  error(data)
+ end
+ save(path,data)
+ save(B..'/refresh.json',{time=os.time(),state='prepared'})
 end
 local function prepared()
  local path=os.getenv('PNW_GAME_PREPARED');assert(path=='/var/run/pnw-control/job/game-data','game data must be prepared outside lock')
@@ -170,7 +176,7 @@ function M.set(on)
   if on then save(B..'/data.json',data)else apply_runtime(false,nil)end
   write(C,after);dns_restart();apply_runtime(on,data)
   if not on then must('nft flush set inet diversion_dns game_site4');must('nft flush set inet diversion_dns game_site6')end
-  save(B..'/state.json',{enabled=on,changed=os.time()});must('sync');assert(os.remove(B..'/pending.json'))
+  save(B..'/state.json',{enabled=on,changed=os.time()});if on then save(B..'/refresh.json',{time=os.time(),state='success'})end;must('sync');assert(os.remove(B..'/pending.json'))
  end)
  if not ok then local restored,reason=pcall(M.recover);error(tostring(err)..(restored and '; previous mode restored' or '; rollback failed: '..tostring(reason)))end
  return on and 'Steam login/community and Dota 2 relay exception enabled; downloads keep normal policy; reconnect game clients' or 'Game exception disabled; normal CN policy restored; reconnect game clients'
@@ -178,7 +184,7 @@ end
 function M.refresh()
  locked();assert(not read(B..'/pending.json'),'unfinished game transaction');local data=prepared();local state=load(B..'/state.json')
  if state.enabled then apply_runtime(true,data)end
- save(B..'/data.json',data);return 'Official game server lists refreshed; current switch preserved'
+ save(B..'/data.json',data);save(B..'/refresh.json',{time=os.time(),state='success'});return 'Official game server lists refreshed; current switch preserved'
 end
 function M.reconcile()
  locked();M.recover()

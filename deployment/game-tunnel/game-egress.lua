@@ -30,6 +30,10 @@ function M.status()
  end
  for _,name in ipairs({'guard','router_guard'})do
   local rules=run('nft list chain inet diversion_dns '..name)
+  local snapshot=J.parse(run('nft -j list chain inet diversion_dns '..name))
+  local first
+  for _,item in ipairs(type(snapshot)=='table'and type(snapshot.nftables)=='table'and snapshot.nftables or {})do if item.rule then first=item.rule;break end end
+  d.consistent=d.consistent and first~=nil and first.comment=='Dedicated game fail closed'
   local line=rules:match('[^\n]*Dedicated game fail closed[^\n]*')or ''
   d.consistent=d.consistent and line:find('oifname != "wg_game"',1,true)~=nil and line:find('meta mark 0x00000002',1,true)~=nil
  end

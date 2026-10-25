@@ -61,6 +61,39 @@ def helper(text):
     # bootstrap operations and all classifier updates use the same transaction.
     return once(text,'cat "$base/policy.nft" >> "$file"','lua /etc/pnw-control/game-tunnel-render.lua >> "$file"\ncat "$base/policy.nft" >> "$file"')
 
+def review_harden_controller(text):
+    text=text.replace("   if action=='game-off' and not pending then reason=nil end\n", "")
+    text=once(text," if read(B..'/game-tunnel.lua') then pcall(function()dofile(B..'/game-tunnel.lua').reconcile()end) end", """ local recovery=load(R..'/reconcile.json')
+ if read(B..'/game-tunnel.lua') then
+  local ok,err=pcall(function()dofile(B..'/game-tunnel.lua').reconcile()end)
+  recovery.game_recovery={time=os.time(),state=ok and 'success' or 'failed',error=not ok and clean_error(err) or nil}
+ else recovery.game_recovery=nil end
+ save(R..'/reconcile.json',recovery)""")
+    text=once(text," local ok,result=pcall(reconcile_locked)\n", " local ok,result=pcall(reconcile_locked)\n state.game_recovery=load(R..'/reconcile.json').game_recovery\n")
+    a=text.index("elseif mode=='game-prepare' then")
+    z=text.index("elseif mode=='start' then",a)
+    text=text[:a]+"""elseif mode=='launch' then
+ local action,token=arg[2],arg[3]
+ assert(allowed[action] and read(R..'/job/token')==token,'invalid launch ownership')
+ assert(os.getenv('DIVERSION_CN_DEPLOY_LOCK_HELD')~='1','launch must run outside deployment lock')
+ write(R..'/job/pid',tostring(nixio.getpid()))
+ local ok,err=pcall(function()
+  if action=='game-on' or action=='game-refresh' then dofile(B..'/game-tunnel.lua').prepare(R..'/job/game-data')end
+ end)
+ if not ok then
+  complete_result({action=action,state='failed',phase='prepare',message=clean_error(err),time=os.time(),rollback={attempted=false,state='not_needed'}})
+  os.remove(R..'/job/game-data');os.remove(R..'/job/token');os.remove(R..'/job/pid');fs.rmdir(R..'/job')
+ else
+  run('(flock -n 9 || { '..SELF..' busy '..q(token)..'; exit 1; }; export DIVERSION_CN_DEPLOY_LOCK_HELD=1 PNW_GAME_PREPARED=/var/run/pnw-control/job/game-data; '..SELF..' worker '..q(action)..' '..q(token)..') 9>/var/lock/diversion-dns-deploy.lock')
+ end
+"""+text[z:]
+    a=text.index(" local _,rc=run('(trap ");z=text.index("\n assert(rc==0,'cannot start worker')",a)
+    text=text[:a]+" local _,rc=run('(trap \"\" HUP; '..SELF..' launch '..q(action)..' '..q(token)..') >'..R..'/job.log 2>&1 </dev/null &')"+text[z:]
+    text=once(text,"   if action~='game-off' then ensure_topology() end", "   if action=='game-off' then assert(containment_state().known,'cannot inspect emergency containment')else ensure_topology() end")
+    text=once(text," if not ok then\n  complete_result({action=action,state='failed',phase='prepare'", " if not ok then\n  save(B..'/game-tunnel/refresh.json',{time=os.time(),state='failed',error=clean_error(err)})\n  complete_result({action=action,state='failed',phase='prepare'")
+    text=once(text," complete_result({action=action,state=ok and 'success'", " if not ok and (action=='game-on' or action=='game-refresh') then save(B..'/game-tunnel/refresh.json',{time=os.time(),state='failed',error=clean_error(result)})end\n complete_result({action=action,state=ok and 'success'")
+    return text
+
 def controller(text):
     text=once(text,"['retry-recovery']=true}","['retry-recovery']=true,['game-on']=true,['game-off']=true,['game-refresh']=true}")
     text=once(text,' st.actions={}',''' st.game_tunnel=select(1,observation('game-tunnel','status')) or {available=false,reason='本机未部署游戏隧道模块'}
@@ -89,7 +122,7 @@ def controller(text):
     text=once(text,"elseif mode=='start' then", "elseif mode=='game-prepare' then\n write(R..'/job/pid',tostring(nixio.getpid()))\n local game=dofile(B..'/game-tunnel.lua');game.prepare(R..'/job/game-data')\nelseif mode=='start' then")
     text=once(text,"  os.exit(rc)", "  if rc==0 and read(B..'/game-tunnel.lua') then pcall(function()if dofile(B..'/game-tunnel.lua').refresh_due() then run(SELF..' start game-refresh')end end)end\n  os.exit(rc)")
     text=text.replace("os.remove(R..'/job/token');", "os.remove(R..'/job/game-data');os.remove(R..'/job/token');")
-    return text
+    return review_harden_controller(text)
 
 def view(text):
     text=once(text,"var PNW_VIEW_VERSION = '","var PNW_VIEW_VERSION = 'game-20261024-")

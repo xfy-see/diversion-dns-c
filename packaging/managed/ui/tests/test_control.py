@@ -212,3 +212,38 @@ class GameRecoveryIsolationTests(unittest.TestCase):
   cut=code.index("fs.mkdir(R,'700')\nlocal mode=")
   api=h.lua.execute(code[:cut]+'return {reconcile=reconcile_locked}')
   self.assertTrue(api.reconcile());self.assertNotIn(B+'/pending.json',h.files)
+
+class GameLaunchTests(unittest.TestCase):
+ def test_prepare_failure_reports_original_error_and_never_starts_worker(self):
+  h=Harness();h.env={};h.dirs.add(R+'/job');h.files[R+'/job/token']='owned'
+  h.lua.execute("dofile=function()return {prepare=function()error('download timed out')end}end")
+  h.run_mode('launch','game-on','owned')
+  result=h.get(R+'/result.json');self.assertEqual(result['state'],'failed');self.assertEqual(result['phase'],'prepare')
+  self.assertIn('download timed out',result['message']);self.assertNotIn(R+'/job/token',h.files)
+  self.assertFalse(any(' worker ' in c for c in h.events))
+ def test_launcher_prepares_before_lock_and_then_invokes_worker(self):
+  h=Harness();h.env={};h.dirs.add(R+'/job');h.files[R+'/job/token']='owned'
+  h.lua.execute("dofile=function()return {prepare=function()assert(os.getenv('DIVERSION_CN_DEPLOY_LOCK_HELD')==nil);print('prepared')end}end")
+  h.run_mode('launch','game-refresh','owned')
+  self.assertIn('prepared',h.outputs);self.assertTrue(any('flock -n 9' in c and ' worker ' in c for c in h.events))
+ def test_recovery_error_is_recorded_without_failing_main_reconcile(self):
+  h=Harness();h.files[B+'/game-tunnel.lua']='present'
+  h.lua.execute("dofile=function()error('broken game journal')end")
+  self.assertEqual(h.run_mode('reconcile'),0)
+  result=h.get(R+'/reconcile.json');self.assertEqual(result['failures'],0)
+  self.assertEqual(result['game_recovery']['state'],'failed');self.assertIn('broken game journal',result['game_recovery']['error'])
+ def test_start_shell_returns_before_slow_background_launch(self):
+  import subprocess,time
+  h=Harness();h.env={};h.run_mode('start','game-on')
+  cmd=next(c for c in h.events if ' launch ' in c)
+  self.assertNotIn('game-prepare',cmd)
+  cmd=cmd.replace('/usr/libexec/pnw-control launch', 'sleep 1; :').replace('>'+R+'/job.log','>/dev/null')
+  started=time.monotonic();subprocess.run(['/bin/sh','-c',cmd],check=True,capture_output=True,timeout=0.5)
+  self.assertLess(time.monotonic()-started,0.5)
+
+class GameOffPreconditionTests(unittest.TestCase):
+ def test_unknown_containment_still_blocks_off(self):
+  h=Harness();h.fail['nft list tables']=('permission denied',1)
+  h.lua.execute("dofile=function()return {status=function()return {available=true,enabled=true,consistent=false}end}end")
+  status=h.to_py(h.api.status());self.assertFalse(status['actions']['game-off']['allowed'])
+  self.assertEqual(status['actions']['game-off']['reason'],'cannot inspect emergency containment')

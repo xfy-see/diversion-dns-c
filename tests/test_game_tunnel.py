@@ -192,6 +192,7 @@ class DedicatedTests(unittest.TestCase):
   self.bad=None
   def command(c):
    if self.bad and self.bad in c:return ''
+   if 'nft -j list chain'in c:return json.dumps({'nftables':[{'rule':{'comment':'Dedicated game fail closed'}}]})
    if c.startswith('ip -'):return '1.1.1.1 dev wg_game table 20234 src 192.0.2.1\n'
    if 'allowed-ips'in c:return self.peer+'\t0.0.0.0/0 ::/0\n'
    if 'latest-handshakes'in c:return self.peer+'\t'+str(int(h.lua.eval('os.time()')))+'\n'
@@ -239,3 +240,29 @@ class ReviewRegressionTests(unittest.TestCase):
   text+=''.join('add rule inet diversion_dns '+c+' ip daddr @cn4 return\n'for c in ('split','router_output'))
   out=integrate.dedicated_policy(integrate.policy(text))
   for c in ('guard','router_guard'):self.assertIn('insert rule inet diversion_dns '+c+' ct direction original meta mark 2',out)
+
+@unittest.skipIf(LuaRuntime is None,'prebuilt lupa required')
+class PreparationTests(unittest.TestCase):
+ def test_download_failure_records_reason_and_does_not_prepare(self):
+  h=GameHarness();h.files.pop('/var/run/pnw-control/job/game-data');h.failure='uclient-fetch'
+  h.lua.execute("os.getenv=function()return nil end")
+  with self.assertRaises(Exception):h.module.prepare('/var/run/pnw-control/job/game-data')
+  status=json.loads(h.files['/etc/pnw-control/game-tunnel/refresh.json'])
+  self.assertEqual(status['state'],'failed');self.assertIn('game tunnel operation failed',status['error'])
+  self.assertNotIn('/var/run/pnw-control/job/game-data',h.files)
+ def test_successful_prepare_and_apply_have_terminal_status(self):
+  h=GameHarness();h.files['/etc/diversion-dns-c/config.conf']='original'
+  h.lua.execute("os.getenv=function()return nil end")
+  h.module.prepare('/var/run/pnw-control/job/game-data')
+  self.assertEqual(json.loads(h.files['/etc/pnw-control/game-tunnel/refresh.json'])['state'],'prepared')
+  h.lua.execute("os.getenv=function(k)if k=='PNW_GAME_PREPARED'then return '/var/run/pnw-control/job/game-data'else return '1'end end")
+  h.module.set(True)
+  self.assertEqual(json.loads(h.files['/etc/pnw-control/game-tunnel/refresh.json'])['state'],'success')
+
+@unittest.skipIf(LuaRuntime is None,'prebuilt lupa required')
+class GuardOrderTests(unittest.TestCase):
+ setup_module=DedicatedTests.setup_module
+ def test_guard_after_accept_is_not_ready(self):
+  m=self.setup_module();prior=self.h.lua.globals().pycommand
+  self.h.lua.globals().pycommand=lambda c: json.dumps({'nftables':[{'rule':{'expr':[{'accept':None}]}},{'rule':{'comment':'Dedicated game fail closed'}}]})if 'nft -j list chain'in c else prior(c)
+  self.assertFalse(self.h.python(m.status())['consistent'])

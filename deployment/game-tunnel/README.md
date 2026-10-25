@@ -149,3 +149,16 @@ The one-hour game address timeout still requires DNS re-resolution; a client
 retaining an address beyond that period may lose domain-based classification.
 Shared CDN addresses can affect unrelated connections to the same IP. These
 limitations are not resolved by the transaction and recovery fixes above.
+
+The background launcher now owns both preparation and locked application. The
+start endpoint only creates the job and spawns the detached launcher; it does
+not wait for downloads. Preparation failure ends the job before any policy
+worker starts and preserves the original error in result.json and refresh.json.
+Preparation and successful application have separate states; application errors
+also replace the preparation status with a failed terminal state.
+
+Disabling bypasses only the exit-health/degraded prerequisites. Busy jobs,
+unfinished transactions and unknown emergency containment remain blockers.
+Optional game recovery errors are retained in reconcile.json.game_recovery
+without failing or pausing main-exit recovery. Dedicated guard inspection now
+requires the first rule in each guard chain to be the dedicated fail-closed rule.
