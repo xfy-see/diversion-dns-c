@@ -126,3 +126,26 @@ containment, independent down/up recovery and both Web switch states.
 DNS for the game names continues using the configured foreign resolver group;
 this feature selects the connection egress, not a separate DNS upstream. Clients
 must reconnect after enabling. Existing conntrack flows are not forcibly deleted.
+
+### Review hardening
+
+Dedicated-egress inspection failures keep the game card visible with an error.
+Disabling remains available during a global exit mismatch or DNS degradation;
+authentication, deployment locking and unfinished-transaction checks still apply.
+The gate is cleared before restarting DNS on disable. Main-exit recovery runs
+before optional game recovery, whose errors cannot abort the main recovery path.
+
+Official-list downloads run in the background job before acquiring the deployment
+lock. Only validated data prepared within 60 seconds can be committed under the
+lock. The unlocked reconcile parent schedules periodic refresh through this same
+job path, with a 30-minute retry backoff. Rollback journals include the exact prior
+list bytes (or absence), alongside DNS configuration and switch state.
+Dedicated guards are inserted at the head of both guard chains. Status checks
+both LAN and router classifiers for all four game address sets.
+
+Remaining acceptance requirements: verify real rule ordering, firewall reload
+persistence, IPv6 client traffic, and DNS-learned-address expiry on the target.
+The one-hour game address timeout still requires DNS re-resolution; a client
+retaining an address beyond that period may lose domain-based classification.
+Shared CDN addresses can affect unrelated connections to the same IP. These
+limitations are not resolved by the transaction and recovery fixes above.

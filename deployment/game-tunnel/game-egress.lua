@@ -16,9 +16,18 @@ function M.status()
  local peers=run('wg show wg_game allowed-ips');local n=0;local matched=false
  for key,ips in peers:gmatch('([^%s]+)%s+([^\n]+)')do n=n+1;if key==c.peer and ips:find('0.0.0.0/0',1,true)and ips:find('::/0',1,true)then matched=true end end
  d.consistent=d.consistent and n==1 and matched
- local chain=run('nft list chain inet diversion_dns router_output')
- local game=chain:match('[^\n]*@game_site4[^\n]*')or ''
- d.consistent=d.consistent and game:find('meta mark set 0x00000002',1,true)~=nil
+ for _,chain in ipairs({'router_output','split'})do
+  local rules=run('nft list chain inet diversion_dns '..chain)
+  for _,set in ipairs({'game_site4','game_site6','game_relay4','game_cm4'})do
+   local found=false
+   for line in rules:gmatch('[^\n]+')do
+    if line:find('@'..set,1,true)then
+     found=true;d.consistent=d.consistent and line:find('meta mark set 0x00000002',1,true)~=nil
+    end
+   end
+   d.consistent=d.consistent and found
+  end
+ end
  for _,name in ipairs({'guard','router_guard'})do
   local rules=run('nft list chain inet diversion_dns '..name)
   local line=rules:match('[^\n]*Dedicated game fail closed[^\n]*')or ''

@@ -21,7 +21,9 @@ local function egress()
   end
   return nil
  end
- return assert(dofile('/etc/pnw-control/game-egress.lua').status(),'dedicated egress unavailable')
+ local ok,value=pcall(function()return assert(dofile('/etc/pnw-control/game-egress.lua').status(),'dedicated egress unavailable')end)
+ if ok then return value end
+ return {label='独立 AWS',consistent=false,ready=false,error='独立出口状态校验失败；请关闭游戏策略或修复配置'}
 end
 local function integer(n,low,high)return type(n)=='number'and n==math.floor(n)and n>=low and n<=high end
 local function public4(ip)
@@ -73,6 +75,16 @@ local function fetch()
  if type(old.cm)=='table'and #old.cm>0 then assert(#value.cm>=#old.cm*0.5,'CM list shrank unexpectedly; last-good retained')end
  if type(old.revision)=='number'then assert(value.revision>=old.revision,'SDR revision went backwards')end
  return value
+end
+function M.prepare(path)
+ assert(os.getenv('DIVERSION_CN_DEPLOY_LOCK_HELD')~='1','downloads must run outside deployment lock')
+ assert(type(path)=='string'and path:match('^/var/run/pnw%-control/job/game%-data$'),'invalid preparation path')
+ save(B..'/refresh.json',{time=os.time(),state='preparing'})
+ save(path,fetch())
+end
+local function prepared()
+ local path=os.getenv('PNW_GAME_PREPARED');assert(path=='/var/run/pnw-control/job/game-data','game data must be prepared outside lock')
+ local data=verified_data(load(path));assert(os.time()-data.updated>=0 and os.time()-data.updated<=60,'prepared data expired');return data
 end
 function M.config(original,on)
  assert(type(original)=='string'and not original:find('\r',1,true),'unsupported DNS configuration')
@@ -132,23 +144,30 @@ function M.recover()
  locked();if not read(B..'/pending.json')then return false end;local p=load(B..'/pending.json');assert(p.state=='applying','invalid game recovery journal')
  assert(type(p.before)=='string'and type(p.after)=='string'and type(p.old)=='table','invalid game recovery journal')
  local now=read(C);assert(now==p.before or now==p.after,'DNS configuration changed externally; game rollback refused')
+ if p.old_data~=nil then
+  assert(type(p.old_data)=='string' or p.old_data==false,'invalid data backup')
+  if p.old_data==false then os.remove(B..'/data.json')else write(B..'/data.json',p.old_data)end
+ end
  write(C,p.before);dns_restart();apply_runtime(p.old.enabled==true,p.old.enabled and load(B..'/data.json')or nil)
  save(B..'/state.json',p.old);must('sync');assert(os.remove(B..'/pending.json'));return true
 end
 function M.set(on)
  locked();assert(type(on)=='boolean','invalid switch value');assert(not read(B..'/pending.json'),'unfinished game transaction')
- must('/etc/diversion-dns-c/cn-policy.sh audit-runtime')
- assert(not read('/etc/pnw-control/emergency')and not read('/etc/diversion-dns-c/degraded'),'game switch unavailable in emergency/degraded mode')
+ if on then
+  must('/etc/diversion-dns-c/cn-policy.sh audit-runtime')
+  assert(not read('/etc/pnw-control/emergency')and not read('/etc/diversion-dns-c/degraded'),'game switch unavailable in emergency/degraded mode')
+ end
  local old=load(B..'/state.json');local data
  if on then
   local e=egress();assert(not e or e.ready,e and e.error or 'dedicated egress unavailable')
   -- Downloads happen before any mutation. Failure leaves the current mode.
-  data=fetch();save(B..'/data.json',data)
+  data=prepared()
  end
  local before=assert(read(C));local after=M.config(before,on)
  write(B..'/check.conf',after);must('/usr/sbin/diversion-dns-c check -c '..B..'/check.conf')
- save(B..'/pending.json',{state='applying',before=before,after=after,old=old});must('sync')
+ save(B..'/pending.json',{state='applying',before=before,after=after,old=old,old_data=read(B..'/data.json')or false});must('sync')
  local ok,err=pcall(function()
+  if on then save(B..'/data.json',data)else apply_runtime(false,nil)end
   write(C,after);dns_restart();apply_runtime(on,data)
   if not on then must('nft flush set inet diversion_dns game_site4');must('nft flush set inet diversion_dns game_site6')end
   save(B..'/state.json',{enabled=on,changed=os.time()});must('sync');assert(os.remove(B..'/pending.json'))
@@ -157,18 +176,18 @@ function M.set(on)
  return on and 'Steam login/community and Dota 2 relay exception enabled; downloads keep normal policy; reconnect game clients' or 'Game exception disabled; normal CN policy restored; reconnect game clients'
 end
 function M.refresh()
- locked();assert(not read(B..'/pending.json'),'unfinished game transaction');local data=fetch();local state=load(B..'/state.json')
+ locked();assert(not read(B..'/pending.json'),'unfinished game transaction');local data=prepared();local state=load(B..'/state.json')
  if state.enabled then apply_runtime(true,data)end
  save(B..'/data.json',data);return 'Official game server lists refreshed; current switch preserved'
 end
 function M.reconcile()
  locked();M.recover()
- local state=load(B..'/state.json');if not state.enabled then return end
- local data=load(B..'/data.json');local attempt=load(B..'/refresh.json')
- if os.time()-(data.updated or 0)<3600 or os.time()-(attempt.time or 0)<1800 then return end
- save(B..'/refresh.json',{time=os.time(),state='running'})
- local ok,err=pcall(M.refresh)
- save(B..'/refresh.json',{time=os.time(),state=ok and 'success' or 'failed',error=not ok and tostring(err):sub(1,240)or nil})
+ -- Network refresh is scheduled by the unlocked controller worker.
+ return M.refresh_due()
+end
+function M.refresh_due()
+ local state=load(B..'/state.json');local data=load(B..'/data.json');local attempt=load(B..'/refresh.json')
+ return state.enabled==true and os.time()-(data.updated or 0)>=3600 and os.time()-(attempt.time or 0)>=1800
 end
 function M.status()
  local state=load(B..'/state.json');local data=load(B..'/data.json')

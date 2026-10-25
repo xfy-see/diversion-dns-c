@@ -203,3 +203,12 @@ class ControllerTests(unittest.TestCase):
   def fail_probe(command):h.files['/etc/config/firewall']='external edit';return 'candidate failed',1
   h.fail['probe-fetch']=fail_probe;h.worker('switch-usss');s=h.get(R+'/result.json');self.assertEqual(s['rollback']['state'],'failed');self.assertEqual(h.files['/etc/config/firewall'],'external edit');self.assertIn(B+'/pending.json',h.files);self.assertTrue(h.active)
 if __name__=='__main__':unittest.main(verbosity=2)
+
+class GameRecoveryIsolationTests(unittest.TestCase):
+ def test_main_restore_precedes_throwing_optional_game_module(self):
+  h=Harness();h.files[B+'/pending.json']='pending';h.files[B+'/game-tunnel.lua']='installed'
+  h.lua.execute("dofile=function()assert(PY_OPEN('/etc/pnw-control/pending.json')==nil,'main restore must run first');error('game failure')end")
+  code=h.code.replace("if read(B..'/pending.json') then restore() end", "if read(B..'/pending.json') then os.remove(B..'/pending.json') end")
+  cut=code.index("fs.mkdir(R,'700')\nlocal mode=")
+  api=h.lua.execute(code[:cut]+'return {reconcile=reconcile_locked}')
+  self.assertTrue(api.reconcile());self.assertNotIn(B+'/pending.json',h.files)

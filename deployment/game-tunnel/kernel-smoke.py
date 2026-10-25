@@ -14,6 +14,7 @@ def main():
  for name,spec in [('cn4','ipv4_addr'),('game_enabled','inet_proto'),('game_site4','ipv4_addr'),('game_site6','ipv6_addr'),('game_relay4','ipv4_addr . inet_service; flags interval; auto-merge'),('game_cm4','ipv4_addr . inet_service')]:
   header+=f'add set inet diversion_dns {name} {{ type {spec}; }}\n'
  policy='add chain inet diversion_dns guard\nadd chain inet diversion_dns router_guard\nadd chain inet diversion_dns split\nadd chain inet diversion_dns router_output\nadd rule inet diversion_dns router_output ct direction reply return\n' + ''.join(f'add rule inet diversion_dns {c} ip daddr @cn4 return\n'for c in ('split','router_output'))
+ policy+='add rule inet diversion_dns guard accept\nadd rule inet diversion_dns router_guard accept\n'
  data=header+integrate.dedicated_policy(integrate.policy(policy));result={'passed':False,'scope':'complete two-chain nft parser and kernel installation; no production routes'}
  try:
   run(['nft','-c','-f','-'],input=data)
@@ -24,7 +25,10 @@ def main():
    run(['nft','-f','-'],input=batch)
   saved=json.loads(run(['nft','-j','list','table','inet','diversion_dns']).stdout)
   rules=[r['rule']for r in saved['nftables']if 'rule'in r]
-  assert len(rules)==17 and sum('comment'in r for r in rules)==14
+  assert len(rules)==19 and sum('comment'in r for r in rules)==14
+  for chain in ('guard','router_guard'):
+   rows=[r for r in rules if r['chain']==chain]
+   assert rows[0].get('comment')=='Dedicated game fail closed'
   result.update(passed=True,rules=len(rules),game_rules=10,dedicated_guards=2)
  finally:
   subprocess.run(['nft','delete','table','inet','diversion_dns'],capture_output=True)

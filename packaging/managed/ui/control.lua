@@ -468,9 +468,10 @@ local function status()
   elseif target and (target=='usss' or target=='usvless') and not st.services[target].available then reason='target proxy TUN is not running'
   elseif target and st.emergency and target==current then reason='choose an alternate exit or recover the current exit' end
   if action:match('^game%-') then
+   if action=='game-off' and not pending then reason=nil end
    if not st.game_tunnel.available then reason='本设备未部署游戏隧道模块'
    elseif st.game_tunnel.pending then reason='游戏切换未完成，请重试恢复'
-   elseif st.emergency or st.dns_degraded then reason='应急或 DNS 降级期间不可切换游戏策略'
+   elseif action~='game-off' and (st.emergency or st.dns_degraded) then reason='应急或 DNS 降级期间不可切换游戏策略'
    elseif action=='game-on' and st.game_tunnel.enabled and st.game_tunnel.consistent then reason='已经开启'
    elseif action=='game-off' and not st.game_tunnel.enabled and st.game_tunnel.consistent then reason='已经关闭' end
   end
@@ -490,11 +491,11 @@ local function reconcile_locked(ignore_job)
   local pid=read(R..'/job/pid')
   if pid and pid:match('^%d+$') and (read('/proc/'..pid..'/cmdline') or ''):find(SELF,1,true) then return false end
   if os.time()-(load(R..'/result.json').time or 0)<10 then return false end
-  os.remove(R..'/job/token');os.remove(R..'/job/pid');fs.rmdir(R..'/job')
+  os.remove(R..'/job/game-data');os.remove(R..'/job/token');os.remove(R..'/job/pid');fs.rmdir(R..'/job')
  end
  reconcile_containment()
- if read(B..'/game-tunnel.lua') then dofile(B..'/game-tunnel.lua').reconcile() end
  if read(B..'/pending.json') then restore() end
+ if read(B..'/game-tunnel.lua') then pcall(function()dofile(B..'/game-tunnel.lua').reconcile()end) end
  return true
 end
 fs.mkdir(R,'700')
@@ -511,6 +512,9 @@ elseif mode=='probe-fetch' then
  -- Use the certificate hostname; this uclient version rejects HTTPS IP literals.
  nixio.exec('/bin/uclient-fetch','-'..af,'--no-proxy','-T','10','-q','-O','-','https://one.one.one.one/cdn-cgi/trace')
  error('probe exec failed')
+elseif mode=='game-prepare' then
+ write(R..'/job/pid',tostring(nixio.getpid()))
+ local game=dofile(B..'/game-tunnel.lua');game.prepare(R..'/job/game-data')
 elseif mode=='start' then
  local action=arg[2];assert(allowed[action],'invalid action')
  assert(not read(B..'/game-tunnel/pending.json') or action=='diagnose' or action=='retry-recovery','unfinished game transaction')
@@ -518,20 +522,20 @@ elseif mode=='start' then
  assert(fs.mkdir(R..'/job','700'),'another action is running')
  local token=tostring(os.time())..'-'..nixio.getpid();write(R..'/job/token',token)
  save(R..'/result.json',{action=action,state='running',time=os.time(),started_at=os.time()})
- local _,rc=run('(trap "" HUP; (flock -n 9 || { '..SELF..' busy '..q(token)..'; exit 1; }; export DIVERSION_CN_DEPLOY_LOCK_HELD=1; '..SELF..' worker '..q(action)..' '..q(token)..') 9>/var/lock/diversion-dns-deploy.lock >'..R..'/job.log 2>&1 </dev/null &)')
+ local _,rc=run('(trap "" HUP; if [ '..q(action)..' = game-on ] || [ '..q(action)..' = game-refresh ]; then '..SELF..' game-prepare; fi; (flock -n 9 || { '..SELF..' busy '..q(token)..'; exit 1; }; export DIVERSION_CN_DEPLOY_LOCK_HELD=1 PNW_GAME_PREPARED=/var/run/pnw-control/job/game-data; '..SELF..' worker '..q(action)..' '..q(token)..') 9>/var/lock/diversion-dns-deploy.lock >'..R..'/job.log 2>&1 </dev/null &)')
  assert(rc==0,'cannot start worker');print(json.stringify({accepted=true}))
 elseif mode=='busy' then
  local token=arg[2];assert(read(R..'/job/token')==token,'invalid busy worker ownership')
  local r=load(R..'/result.json');r.state='failed';r.message='another policy or DNS transaction holds the lock; retry later';r.time=os.time();r.rollback={attempted=false,state='not_needed'};complete_result(r)
- os.remove(R..'/job/token');fs.rmdir(R..'/job')
+ os.remove(R..'/job/game-data');os.remove(R..'/job/token');fs.rmdir(R..'/job')
 elseif mode=='worker' then
  local action,token=arg[2],arg[3];assert(allowed[action] and read(R..'/job/token')==token,'invalid worker ownership')
  write(R..'/job/pid',tostring(nixio.getpid()))
  local started=milliseconds();local started_at=os.time()
  local ok,result=pcall(function()
   if action:match('^game%-') then
-   ensure_topology()
-   if runtime_snapshot then assert(runtime_snapshot(selected()).consistent,'runtime exit mismatch') end
+   if action~='game-off' then ensure_topology() end
+   if action~='game-off' and runtime_snapshot then assert(runtime_snapshot(selected()).consistent,'runtime exit mismatch') end
    local game=dofile(B..'/game-tunnel.lua')
    if action=='game-refresh' then return game.refresh() end
    return game.set(action=='game-on')
@@ -551,11 +555,12 @@ elseif mode=='worker' then
  end
  complete_result({action=action,state=ok and 'success' or 'failed',message=clean_error(result),rollback=rollback,rollback_ok=rollback.state~='failed',time=os.time(),started_at=started_at,duration_ms=math.max(0,milliseconds()-started)})
  if ok and action~='diagnose' and action~='check' then save(R..'/reconcile.json',{failures=0,paused=false,last_attempt=os.time()}) end
- os.remove(R..'/job/token');os.remove(R..'/job/pid');fs.rmdir(R..'/job')
+ os.remove(R..'/job/game-data');os.remove(R..'/job/token');os.remove(R..'/job/pid');fs.rmdir(R..'/job')
 elseif mode=='reconcile' then
  if os.getenv('DIVERSION_CN_DEPLOY_LOCK_HELD')~='1' then
   -- Exit 75 is a busy lock, not a failed recovery attempt.
   local _,rc=run('(flock -n 9 || exit 75; export DIVERSION_CN_DEPLOY_LOCK_HELD=1; '..SELF..' reconcile) 9>/var/lock/diversion-dns-deploy.lock')
+  if rc==0 and read(B..'/game-tunnel.lua') then pcall(function()if dofile(B..'/game-tunnel.lua').refresh_due() then run(SELF..' start game-refresh')end end)end
   os.exit(rc)
  end
  local state=load(R..'/reconcile.json')

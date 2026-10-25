@@ -37,8 +37,8 @@ def dedicated_policy(text):
     text=once(text,anchor,anchor+
         'add rule inet diversion_dns router_output udp sport 51824 meta mark set 0 ct mark set 0 return comment "Dedicated game WireGuard transport WAN"\n'+
         'add rule inet diversion_dns router_output oifname "wg_game" meta mark set 2 ct mark set 2 return comment "Explicit dedicated game interface"\n')
-    text+='add rule inet diversion_dns guard ct direction original meta mark 2 oifname != "wg_game" counter reject comment "Dedicated game fail closed"\n'
-    text+='add rule inet diversion_dns router_guard ct direction original meta mark 2 oifname != "wg_game" counter drop comment "Dedicated game fail closed"\n'
+    text+='insert rule inet diversion_dns guard ct direction original meta mark 2 oifname != "wg_game" counter reject comment "Dedicated game fail closed"\n'
+    text+='insert rule inet diversion_dns router_guard ct direction original meta mark 2 oifname != "wg_game" counter drop comment "Dedicated game fail closed"\n'
     return text
 
 def dedicated_emergency(text):
@@ -67,22 +67,28 @@ def controller(text):
  st.pending=st.pending or st.game_tunnel.pending==true
  st.actions={}''')
     text=once(text,'  st.actions[action]={allowed=reason==nil,reason=reason}', '''  if action:match('^game%-') then
+   if action=='game-off' and not pending then reason=nil end
    if not st.game_tunnel.available then reason='本设备未部署游戏隧道模块'
    elseif st.game_tunnel.pending then reason='游戏切换未完成，请重试恢复'
-   elseif st.emergency or st.dns_degraded then reason='应急或 DNS 降级期间不可切换游戏策略'
+   elseif action~='game-off' and (st.emergency or st.dns_degraded) then reason='应急或 DNS 降级期间不可切换游戏策略'
    elseif action=='game-on' and st.game_tunnel.enabled and st.game_tunnel.consistent then reason='已经开启'
    elseif action=='game-off' and not st.game_tunnel.enabled and st.game_tunnel.consistent then reason='已经关闭' end
   end
   st.actions[action]={allowed=reason==nil,reason=reason}''')
-    text=once(text," reconcile_containment()\n if read(B..'/pending.json') then restore() end", " reconcile_containment()\n if read(B..'/game-tunnel.lua') then dofile(B..'/game-tunnel.lua').reconcile() end\n if read(B..'/pending.json') then restore() end")
+    text=once(text," reconcile_containment()\n if read(B..'/pending.json') then restore() end", " reconcile_containment()\n if read(B..'/pending.json') then restore() end\n if read(B..'/game-tunnel.lua') then pcall(function()dofile(B..'/game-tunnel.lua').reconcile()end) end")
     text=once(text," local action=arg[2];assert(allowed[action],'invalid action')", " local action=arg[2];assert(allowed[action],'invalid action')\n assert(not read(B..'/game-tunnel/pending.json') or action=='diagnose' or action=='retry-recovery','unfinished game transaction')")
     text=once(text,"  if action=='switch-aws' then", """  if action:match('^game%-') then
-   ensure_topology()
-   if runtime_snapshot then assert(runtime_snapshot(selected()).consistent,'runtime exit mismatch') end
+   if action~='game-off' then ensure_topology() end
+   if action~='game-off' and runtime_snapshot then assert(runtime_snapshot(selected()).consistent,'runtime exit mismatch') end
    local game=dofile(B..'/game-tunnel.lua')
    if action=='game-refresh' then return game.refresh() end
    return game.set(action=='game-on')
   elseif action=='switch-aws' then""")
+    text=once(text,"(trap \"\" HUP; (flock -n 9", "(trap \"\" HUP; if [ '..q(action)..' = game-on ] || [ '..q(action)..' = game-refresh ]; then '..SELF..' game-prepare; fi; (flock -n 9")
+    text=once(text,"export DIVERSION_CN_DEPLOY_LOCK_HELD=1; '..SELF..' worker", "export DIVERSION_CN_DEPLOY_LOCK_HELD=1 PNW_GAME_PREPARED=/var/run/pnw-control/job/game-data; '..SELF..' worker")
+    text=once(text,"elseif mode=='start' then", "elseif mode=='game-prepare' then\n write(R..'/job/pid',tostring(nixio.getpid()))\n local game=dofile(B..'/game-tunnel.lua');game.prepare(R..'/job/game-data')\nelseif mode=='start' then")
+    text=once(text,"  os.exit(rc)", "  if rc==0 and read(B..'/game-tunnel.lua') then pcall(function()if dofile(B..'/game-tunnel.lua').refresh_due() then run(SELF..' start game-refresh')end end)end\n  os.exit(rc)")
+    text=text.replace("os.remove(R..'/job/token');", "os.remove(R..'/job/game-data');os.remove(R..'/job/token');")
     return text
 
 def view(text):

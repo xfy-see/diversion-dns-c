@@ -36,10 +36,11 @@ io.open=function(p,mode)
  return {read=function(_,n)return type(n)=='number'and v:sub(1,n)or v end,close=function()return true end}
 end
 io.popen=function(c)local s=pycommand(c);return {read=function()return s end,close=function()return true end}end
-os.remove=pyremove;os.rename=pyrename;os.getenv=function()return '1'end
+os.remove=pyremove;os.rename=pyrename;os.getenv=function(k)if k=='PNW_GAME_PREPARED'then return '/var/run/pnw-control/job/game-data'elseif k=='DIVERSION_CN_DEPLOY_LOCK_HELD'then return '1'end end
 ''')
   q=self.lua.execute((ROOT/'packaging/managed/ui/query.lua').read_text());g.querymodule=q;self.lua.execute('dofile=function()return querymodule end')
   self.module=self.lua.execute((BASE/'game-tunnel.lua').read_text())
+  self.files['/var/run/pnw-control/job/game-data']=json.dumps(self.python(self.module.parse_feeds(*[self.table(x)for x in self.feeds()])))
  def table(self,x):
   if isinstance(x,dict):return self.lua.table_from({k:self.table(v)for k,v in x.items()})
   if isinstance(x,list):return self.lua.table_from([self.table(v)for v in x])
@@ -117,7 +118,7 @@ class GameTests(unittest.TestCase):
   self.h.module.set(True);d=self.h.python(self.h.module.status());self.assertTrue(d['enabled']);self.assertTrue(d['consistent']);self.assertTrue(self.h.gate)
   self.h.module.set(False);self.assertEqual(self.h.files[path],'cache_size=64\n');self.assertFalse(self.h.gate);self.assertTrue(self.h.python(self.h.module.status())['consistent'])
  def test_download_failure_does_not_mutate_config(self):
-  path='/etc/diversion-dns-c/config.conf';self.h.files[path]='original';self.h.failure='uclient-fetch'
+  path='/etc/diversion-dns-c/config.conf';self.h.files[path]='original';self.h.files.pop('/var/run/pnw-control/job/game-data',None)
   with self.assertRaises(Exception):self.h.module.set(True)
   self.assertEqual(self.h.files[path],'original');self.assertNotIn('/etc/pnw-control/game-tunnel/pending.json',self.h.files)
  def test_nft_failure_restores_before_config_and_mode(self):
@@ -139,16 +140,30 @@ class GameTests(unittest.TestCase):
   self.assertIn('/etc/pnw-control/game-tunnel/pending.json',self.h.files)
   self.assertEqual(self.h.files['/etc/diversion-dns-c/config.conf'],'original\n')
  def test_refresh_failure_retains_previous_list(self):
-  path='/etc/pnw-control/game-tunnel/data.json';self.h.files[path]='last-good';self.h.failure='uclient-fetch'
+  path='/etc/pnw-control/game-tunnel/data.json';self.h.files[path]='last-good';self.h.files.pop('/var/run/pnw-control/job/game-data',None)
   with self.assertRaises(Exception):self.h.module.refresh()
   self.assertEqual(self.h.files[path],'last-good')
  def test_invalid_journal_is_not_silently_ignored(self):
   self.h.files['/etc/pnw-control/game-tunnel/pending.json']='{}'
   with self.assertRaises(Exception):self.h.module.recover()
- def test_periodic_failure_is_bounded_and_preserves_enabled(self):
+ def test_reconcile_never_downloads_under_lock(self):
   self.h.files['/etc/pnw-control/game-tunnel/state.json']='{"enabled":true}'
-  self.h.failure='uclient-fetch';self.h.module.reconcile();before=len(self.h.commands);self.h.module.reconcile()
-  self.assertEqual(len(self.h.commands),before);self.assertEqual(json.loads(self.h.files['/etc/pnw-control/game-tunnel/refresh.json'])['state'],'failed')
+  self.assertTrue(self.h.module.reconcile())
+  self.assertFalse(any('uclient-fetch' in c for c in self.h.commands))
+ def test_off_works_during_emergency_and_without_prepared_data(self):
+  self.h.files['/etc/diversion-dns-c/config.conf']='original\n'
+  self.h.module.set(True)
+  self.h.files['/etc/pnw-control/emergency']='1'
+  self.h.files['/etc/diversion-dns-c/degraded']='1'
+  self.h.files.pop('/var/run/pnw-control/job/game-data')
+  self.h.failure='audit-runtime'
+  self.h.module.set(False);self.assertFalse(self.h.gate)
+ def test_failed_enable_restores_exact_old_data(self):
+  self.h.files['/etc/diversion-dns-c/config.conf']='original\n'
+  path='/etc/pnw-control/game-tunnel/data.json';self.h.files[path]='{"old":true}'
+  self.h.failure_once='nft -f /etc/pnw-control/game-tunnel/runtime.nft'
+  with self.assertRaises(Exception):self.h.module.set(True)
+  self.assertEqual(self.h.files[path],'{"old":true}')
  def test_profile_does_not_include_download_domains(self):
   rules=(BASE/'domains.txt').read_text().splitlines();active=[r for r in rules if r and not r.startswith('#')]
   for name in ['steamcontent.com','steamstatic.com','steamusercontent.com','client-download.steampowered.com','steampowered.com']:
@@ -180,13 +195,13 @@ class DedicatedTests(unittest.TestCase):
    if c.startswith('ip -'):return '1.1.1.1 dev wg_game table 20234 src 192.0.2.1\n'
    if 'allowed-ips'in c:return self.peer+'\t0.0.0.0/0 ::/0\n'
    if 'latest-handshakes'in c:return self.peer+'\t'+str(int(h.lua.eval('os.time()')))+'\n'
-   if 'router_output'in c:return 'meta l4proto @game_enabled ip daddr @game_site4 meta mark set 0x00000002\n'
+   if 'router_output'in c or ' split'in c:return ''.join('@'+name+' meta mark set 0x00000002\n'for name in ('game_site4','game_site6','game_relay4','game_cm4'))
    return 'ct direction original meta mark 0x00000002 oifname != "wg_game" drop comment "Dedicated game fail closed"\n'
   h.lua.globals().pycommand=command
   return h.lua.execute((BASE/'game-egress.lua').read_text())
  def test_actual_routes_peer_guard_and_handshake_required(self):
   m=self.setup_module();self.assertTrue(self.h.python(m.status())['ready'])
-  for bad in ['ip -4','ip -6','allowed-ips','router_output',' guard','router_guard','latest-handshakes']:
+  for bad in ['ip -4','ip -6','allowed-ips','router_output',' split',' guard','router_guard','latest-handshakes']:
    self.bad=bad;self.assertFalse(self.h.python(m.status())['ready'],bad)
  def test_missing_identity_cannot_masquerade_as_current_exit(self):
   h=GameHarness();h.files['/etc/diversion-dns-c/policy.nft']='Dedicated game fail closed'
@@ -206,3 +221,21 @@ class DedicatedTests(unittest.TestCase):
  def test_emergency_covers_both_marks(self):
   self.assertEqual(integrate.dedicated_emergency('meta mark 1 counter drop\n'*2).count('meta mark { 1, 2 }'),2)
   with self.assertRaises(ValueError):integrate.dedicated_emergency('other')
+
+@unittest.skipIf(LuaRuntime is None,'prebuilt lupa required')
+class ReviewRegressionTests(unittest.TestCase):
+ def test_broken_egress_keeps_status_available(self):
+  h=GameHarness();h.files['/etc/pnw-control/game-tunnel/egress.json']='broken'
+  h.lua.execute("dofile=function()error('invalid identity')end")
+  status=h.python(h.module.status());self.assertTrue(status['available']);self.assertFalse(status['consistent']);self.assertFalse(status['egress']['ready'])
+ def test_expired_preparation_cannot_enable(self):
+  h=GameHarness();h.files['/etc/diversion-dns-c/config.conf']='original'
+  d=json.loads(h.files['/var/run/pnw-control/job/game-data']);d['updated']=1
+  h.files['/var/run/pnw-control/job/game-data']=json.dumps(d)
+  with self.assertRaises(Exception):h.module.set(True)
+  self.assertEqual(h.files['/etc/diversion-dns-c/config.conf'],'original')
+ def test_guards_insert_before_existing_accept(self):
+  text='add chain inet diversion_dns guard\nadd chain inet diversion_dns router_guard\nadd rule inet diversion_dns guard accept\nadd rule inet diversion_dns router_guard accept\nadd rule inet diversion_dns router_output ct direction reply return\n'
+  text+=''.join('add rule inet diversion_dns '+c+' ip daddr @cn4 return\n'for c in ('split','router_output'))
+  out=integrate.dedicated_policy(integrate.policy(text))
+  for c in ('guard','router_guard'):self.assertIn('insert rule inet diversion_dns '+c+' ct direction original meta mark 2',out)
