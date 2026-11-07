@@ -479,7 +479,7 @@ local function status()
    local id=action:sub(6);local d=st.dota_egress
    if not reason then
     if not d.available or not d.choices then reason='本设备未部署 Dota 独立出口'
-    elseif d.pending or not d.consistent then reason='Dota 状态未完成同步，请稍后重试'
+    elseif d.pending then reason='Dota 存在待恢复事务，请稍后重试'
     elseif st.emergency or st.dns_degraded then reason='应急或降级期间不可切换 Dota'
     elseif not d.choices[id] or not d.choices[id].available then reason='目标接口未就绪'
     elseif d.selected==id then reason='已选择该出口' end

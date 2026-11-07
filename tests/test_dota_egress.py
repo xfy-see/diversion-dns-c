@@ -92,7 +92,7 @@ class DotaTests(unittest.TestCase):
  def test_transform_preserves_existing_game_branches(self):
   p=ROOT/'deployment/dota-egress/integrate.py';sp=importlib.util.spec_from_file_location('dota_transform',p);m=importlib.util.module_from_spec(sp);sp.loader.exec_module(m)
   base="local allowed={['game-refresh']=true}\n st.pending=st.pending or st.game_tunnel.pending==true\n  st.actions[action]={allowed=reason==nil,reason=reason}\n local ok,result=pcall(function()\n  if action:match('^game%-') then\n   return game.set(action=='game-on')\n end)"
-  patched=m.controller(base);self.assertIn("['dota-hk']=true",patched);self.assertIn("return game.set(action=='game-on')",patched)
+  patched=m.controller(base);self.assertIn("['dota-hk']=true",patched);self.assertIn("return game.set(action=='game-on')",patched);self.assertNotIn("d.pending or not d.consistent",patched)
   with self.assertRaises(ValueError):m.controller(patched)
   e=m.emergency('chain a { meta mark { 1, 2, 7 } counter drop }\nchain b { meta mark { 1, 2, 7 } counter drop }');self.assertEqual(e.count('16, 17, 18'),3);self.assertIn('hook forward priority -129',e)
 if __name__=='__main__':unittest.main()
