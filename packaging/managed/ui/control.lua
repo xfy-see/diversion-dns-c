@@ -433,7 +433,7 @@ local function health()
  save(R..'/health.json',h);save(R..'/public-exit.json',h.public_exit);telemetry('record_health',h)
  return h.ok and 'DNS and configured HTTPS checks passed' or 'health check completed with failures; see individual checks'
 end
-local allowed={['switch-aws']=true,['switch-nobrand']=true,['switch-usss']=true,['switch-usvless']=true,rollback=true,rescue=true,recover=true,diagnose=true,check=true,['retry-recovery']=true,['game-on']=true,['game-off']=true,['game-refresh']=true}
+local allowed={['switch-aws']=true,['switch-nobrand']=true,['switch-usss']=true,['switch-usvless']=true,rollback=true,rescue=true,recover=true,diagnose=true,check=true,['retry-recovery']=true,['game-on']=true,['game-off']=true,['game-refresh']=true,['dota-aws']=true,['dota-hk']=true,['dota-game']=true}
 local function diagnose()
  local metrics=dofile(B..'/metrics.lua');local a=metrics.sample();nixio.nanosleep(3);local b=metrics.sample()
  local report={time=os.time(),boot=trim(read('/proc/sys/kernel/random/boot_id') or ''),load=trim(read('/proc/loadavg') or ''),memory=read('/proc/meminfo'),cpu=read('/proc/stat'),softirqs=read('/proc/softirqs'),conntrack=trim(read('/proc/sys/net/netfilter/nf_conntrack_count') or '')}
@@ -455,6 +455,7 @@ local function status()
  vless_available=fs.stat('/sys/class/net/pnwuvl0')~=nil,usss_available=fs.stat('/sys/class/net/pnwuss0')~=nil,recovery=load(R..'/reconcile.json'),telemetry=telemetry('status',{selected=ok and current or 'unavailable'})}
  st.services={wireguard={available=fs.stat('/sys/class/net/wg_vpn')~=nil},usss={available=st.usss_available},usvless={available=st.vless_available}}
  st.game_tunnel=select(1,observation('game-tunnel','status')) or {available=false,reason='本机未部署游戏隧道模块'}
+ st.dota_egress=select(1,observation('dota-egress','status')) or {available=read(B..'/dota-egress/config.json')~=nil,consistent=false,error='Dota 状态读取失败'}
  st.pending=st.pending or st.game_tunnel.pending==true
  st.actions={}
  st.public_exit.domestic=load(R..'/public-domestic.json')
@@ -473,6 +474,16 @@ local function status()
    elseif action~='game-off' and (st.emergency or st.dns_degraded) then reason='应急或 DNS 降级期间不可切换游戏策略'
    elseif action=='game-on' and st.game_tunnel.enabled and st.game_tunnel.consistent then reason='已经开启'
    elseif action=='game-off' and not st.game_tunnel.enabled and st.game_tunnel.consistent then reason='已经关闭' end
+  end
+  if action:match('^dota%-') then
+   local id=action:sub(6);local d=st.dota_egress
+   if not reason then
+    if not d.available or not d.choices then reason='本设备未部署 Dota 独立出口'
+    elseif d.pending then reason='Dota 存在待恢复事务，请稍后重试'
+    elseif st.emergency or st.dns_degraded then reason='应急或降级期间不可切换 Dota'
+    elseif not d.choices[id] or not d.choices[id].available then reason='目标接口未就绪'
+    elseif d.selected==id then reason='已选择该出口' end
+   end
   end
   st.actions[action]={allowed=reason==nil,reason=reason}
  end
@@ -549,7 +560,8 @@ elseif mode=='worker' then
  write(R..'/job/pid',tostring(nixio.getpid()))
  local started=milliseconds();local started_at=os.time()
  local ok,result=pcall(function()
-  if action:match('^game%-') then
+  if action:match('^dota%-') then return dofile(B..'/dota-egress.lua').switch(action:sub(6))
+  elseif action:match('^game%-') then
    if action=='game-off' then assert(containment_state().known,'cannot inspect emergency containment')else ensure_topology() end
    if action~='game-off' and runtime_snapshot then assert(runtime_snapshot(selected()).consistent,'runtime exit mismatch') end
    local game=dofile(B..'/game-tunnel.lua')
