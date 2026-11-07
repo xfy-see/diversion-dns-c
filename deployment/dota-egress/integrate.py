@@ -38,7 +38,7 @@ def emergency(s):
     s=''.join(lines)
     pos=s.rfind('}')
     if pos<0:raise ValueError('emergency table end missing')
-    return s[:pos]+' chain dota_forward { type filter hook forward priority -129; policy accept; meta mark { 16, 17, 18 } counter drop }\n'+s[pos:]
+    return s[:pos]+' chain dota_forward { type filter hook forward priority -129; policy accept; meta mark { 16, 17, 18 } counter drop; }\n'+s[pos:]
 
 def view(s):
     s=once(s,"  function renderOverview() {",'''  function renderDota() {

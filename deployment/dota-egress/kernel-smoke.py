@@ -42,13 +42,24 @@ add element inet pnw_dota_egress enabled { udp }
   counts=snapshot();assert counts[id+'_up']['packets']==3,counts;assert counts[id+'_down']['packets']==3,counts
   assert counts[id+'_up']['bytes']==384 and counts[id+'_down']['bytes']==384,counts
   print('PASS',id,'3 UDP replies; exactly 384 IP bytes each direction')
+ # Verify generated emergency syntax and its post-classification block.
+ import importlib.util
+ spec=importlib.util.spec_from_file_location('dota_integrate',ROOT/'deployment/dota-egress/integrate.py');transform=importlib.util.module_from_spec(spec);spec.loader.exec_module(transform)
+ emergency='table inet pnw_emergency {\nchain ingress { type filter hook prerouting priority -129; policy accept;\nmeta mark { 1, 2 } counter drop\n}\nchain local { type filter hook output priority -129; policy accept;\nmeta mark { 1, 2 } counter drop\n}\n}\n'
+ run('nft','-f','-',input=transform.emergency(emergency))
+ code="import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.settimeout(.5);s.sendto(b'contained',('198.51.100.1',27015));\ntry:\n s.recv(4096);raise AssertionError('emergency escape')\nexcept (socket.timeout,ConnectionRefusedError):pass"
+ run('ip','netns','exec',client,sys.executable,'-c',code)
+ assert snapshot()['game_up']['packets']==3
+ block=json.loads(run('nft','-j','list','chain','inet','pnw_emergency','dota_forward'))
+ assert sum(e.get('counter',{}).get('packets',0)for r in block['nftables']for e in r.get('rule',{}).get('expr',[]))==1
+ run('nft','delete','table','inet','pnw_emergency');print('PASS emergency drops classified Dota before forwarding/accounting')
  # Force an AWS-marked flow down the HK interface; guard must reject it.
  run('nft','-f','-',input='flush chain inet pnw_dota_egress choose\nadd rule inet pnw_dota_egress choose meta mark set 16 ct mark set 16\n')
  run('ip','route','replace','198.51.100.1/32','via','198.18.2.2','dev','pnwhks0','table','24016')
  code="import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.settimeout(.5);s.sendto(b'blocked',('198.51.100.1',27015));\ntry:\n s.recv(4096);raise AssertionError('escape reply')\nexcept (socket.timeout,ConnectionRefusedError):pass"
  run('ip','netns','exec',client,sys.executable,'-c',code);counts=snapshot();assert counts['rejected']['packets']==1,counts
  print('PASS wrong-interface escape rejected before accounting')
- print(json.dumps({'passed':4,'counters':counts},sort_keys=True))
+ print(json.dumps({'passed':5,'counters':counts},sort_keys=True))
 finally:
  if proc:
   proc.terminate()
