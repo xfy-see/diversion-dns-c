@@ -22,7 +22,7 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y nftables iproute2
       - run: |
           mkdir -p dist
-          sudo "$(command -v python3)" deployment/dota-egress/kernel-smoke.py > dist/kernel-evidence.log
+          sudo env PYTHONPATH="$(python3 -m site --user-site)" "$(command -v python3)" deployment/dota-egress/kernel-smoke.py > dist/kernel-evidence.log
       - name: Bind script artifact to exact source and workflow
         run: |
           git archive HEAD | gzip -n > dist/source.tar.gz
