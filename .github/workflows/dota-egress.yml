@@ -1,0 +1,38 @@
+name: Dota egress scripts
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  scripts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - run: python3 scripts/privacy_scan.py --ref HEAD
+      - run: python3 -m pip install --only-binary=:all: lupa==2.8
+      - run: |
+          python3 -m unittest discover -s tests -p test_dota_egress.py -v
+          python3 -m unittest discover -s packaging/managed/ui/tests -p 'test_*.py' -v
+          node packaging/managed/ui/tests/frontend.test.js
+          sh -n deployment/dota-egress/daemon.sh
+          sh -n deployment/dota-egress/service.init
+      - run: sudo apt-get update && sudo apt-get install -y nftables iproute2
+      - run: |
+          mkdir -p dist
+          sudo "$(command -v python3)" deployment/dota-egress/kernel-smoke.py > dist/kernel-evidence.log
+      - name: Bind script artifact to exact source and workflow
+        run: |
+          git archive HEAD | gzip -n > dist/source.tar.gz
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,subprocess
+          d=pathlib.Path('dist')
+          m={'commit':os.environ['GITHUB_SHA'],'run_id':os.environ['GITHUB_RUN_ID'],'attempt':os.environ['GITHUB_RUN_ATTEMPT'],'tree':subprocess.check_output(['git','rev-parse','HEAD^{tree}'],text=True).strip(),'files':{p.name:hashlib.sha256(p.read_bytes()).hexdigest()for p in d.iterdir()if p.is_file()}}
+          (d/'manifest.json').write_text(json.dumps(m,indent=2)+'\n')
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: dota-egress-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          path: dist/
+          retention-days: 90

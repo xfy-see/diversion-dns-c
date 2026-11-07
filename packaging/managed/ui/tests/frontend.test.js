@@ -562,6 +562,17 @@ test('dedicated AWS label and handshake failure stay distinct from global exit',
  assert.match(u.part('gameNote').textContent,/下载.*原分流/);
 });
 
+test('Dota has independent controls, per-exit upload and download, and no optimistic selection', async () => {
+ const d=fixture({dota_egress:{available:true,consistent:true,enabled:true,selected:'hk',label:'香港 SS',choices:{aws:{label:'AWS'},hk:{label:'香港 SS'},game:{label:'游戏 SS'}},traffic:{started:1700000000,updated:1700000010,totals:{hk:{up:2048,down:4096}},rates:{hk:{up:256,down:512}}}},actions:{'dota-aws':{allowed:true},'dota-hk':{allowed:false,reason:'已选择该出口'}}});
+ const u=create(d,a=>Promise.resolve(a[0]==='start'?{accepted:true}:d));
+ assert.equal(u.part('dotaCard').parentNode.hidden,false);assert.match(u.part('dotaStatus').textContent,/香港 SS/);assert.match(u.part('dotaTraffic').textContent,/2.0 KiB/);assert.match(u.part('dotaTraffic').textContent,/4.0 KiB/);assert.match(u.part('dotaNote').textContent,/代理封装/);
+ u.action('dota-aws').click();await flush();assert.deepEqual(u.calls[0],['start','dota-aws']);assert.match(u.part('dotaStatus').textContent,/香港 SS/);
+});
+test('Dota missing capability and stale network never permit switching', async () => {
+ const u=create(fixture());u.action('dota-hk').click();await flush();assert.equal(u.calls.length,0);assert.equal(u.part('dotaCard').parentNode.hidden,true);
+ const d=fixture({dota_egress:{available:true,consistent:false,error:'Dota 同步失败',stats_stale:true,traffic:{rates:{hk:{up:999}}}},actions:{'dota-hk':{allowed:false,reason:'未就绪'}}});const v=create(d);assert.match(v.part('dotaStatus').textContent,/同步失败/);assert.match(v.part('dotaTraffic').textContent,/未知/);assert.equal(v.action('dota-hk').disabled,true);
+});
+
 (async () => {
  let failed = 0;
  for (const [name, fn] of tests) {
