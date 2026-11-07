@@ -63,6 +63,30 @@ class DotaTests(unittest.TestCase):
   for ip in ['127.0.0.1','10.0.0.1','224.1.1.1','1.1.1.1;bad']:
    good['relay'][0]['ip']=ip
    with self.assertRaises(Exception):h.api.relays(h.t(good))
+ def ready(self,h):
+  h.files['/etc/pnw-control/dota-egress/config.json']=json.dumps({'version':1,'selected':'game'})
+  h.files['/etc/pnw-control/game-tunnel/state.json']='{"enabled":true}'
+  h.files['/etc/pnw-control/game-tunnel/data.json']=json.dumps({'relay':[{'ip':'198.51.100.1','first':27015,'last':27020}for _ in range(10)]})
+ def test_all_exits_switch_and_checkpoint_under_lock(self):
+  for id in ('aws','hk','game'):
+   h=Harness();self.ready(h);h.api.switch(id);self.assertEqual(json.loads(h.files['/etc/pnw-control/dota-egress/config.json'])['selected'],id);self.assertNotIn('/etc/pnw-control/dota-egress/pending.json',h.files);self.assertIn('/etc/pnw-control/dota-egress/traffic.json',h.files)
+ def test_switch_apply_failure_restores_old_exit(self):
+  h=Harness();self.ready(h);original=h.run;failed=[False]
+  def run(c):
+   if c=='nft -f /var/run/pnw-dota-egress/apply.nft' and not failed[0]:failed[0]=True;return '',1
+   return original(c)
+  h.lua.globals().PY_RUN=run
+  with self.assertRaises(Exception):h.api.switch('aws')
+  self.assertEqual(json.loads(h.files['/etc/pnw-control/dota-egress/config.json'])['selected'],'game');self.assertNotIn('/etc/pnw-control/dota-egress/pending.json',h.files)
+ def test_pending_emergency_and_degraded_refuse_switch(self):
+  for path in ('/etc/pnw-control/dota-egress/pending.json','/etc/pnw-control/pending.json','/etc/pnw-control/game-tunnel/pending.json','/etc/pnw-control/emergency','/etc/diversion-dns-c/degraded'):
+   h=Harness();self.ready(h);h.files[path]='{}'
+   with self.assertRaises(Exception):h.api.switch('aws')
+   self.assertEqual(h.commands,[])
+ def test_interrupted_switch_recovers_old_exit(self):
+  h=Harness();self.ready(h);h.files['/etc/pnw-control/dota-egress/config.json']='{"version":1,"selected":"aws"}'
+  h.files['/etc/pnw-control/dota-egress/pending.json']='{"old":{"version":1,"selected":"game"},"new":{"version":1,"selected":"aws"}}'
+  h.api.tick(False);self.assertEqual(json.loads(h.files['/etc/pnw-control/dota-egress/config.json'])['selected'],'game');self.assertNotIn('/etc/pnw-control/dota-egress/pending.json',h.files)
  def test_fixed_schema_and_guards(self):
   s=Harness().api.schema();self.assertIn('priority -124',s);self.assertIn('priority -23',s);self.assertIn('priority 10',s);self.assertEqual(s.count('counter name rejected reject'),3);self.assertEqual(s.count('counter name aws_up'),1);self.assertNotIn('output priority',s);self.assertIn('iifname "br-lan"',s)
  def test_transform_preserves_existing_game_branches(self):

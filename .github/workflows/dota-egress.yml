@@ -11,7 +11,8 @@ jobs:
         with:
           persist-credentials: false
       - run: python3 scripts/privacy_scan.py --ref HEAD
-      - run: python3 -m pip install --only-binary=:all: lupa==2.8
+      - run: |
+          python3 -m pip install --only-binary=:all: lupa==2.8
       - run: |
           python3 -m unittest discover -s tests -p test_dota_egress.py -v
           python3 -m unittest discover -s packaging/managed/ui/tests -p 'test_*.py' -v
