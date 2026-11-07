@@ -49,6 +49,8 @@ local function routes()
   local expected='from all fwmark 0x'..string.format('%x',c.mark)..' lookup '..c.table
   local found;for line in rules:gmatch('[^\n]+')do if line:match('^'..pref..':')then assert(not found and line:match('^%d+:%s*(.*)$')==expected,'Dota rule ownership conflict');found=true end end
   local r=run('ip -N -4 route show table '..c.table)
+  -- ip -N prints RTN_UNREACHABLE as numeric type 7 on OpenWrt.
+  r=r:gsub('^7 default','unreachable default'):gsub('\n7 default','\nunreachable default')
   for line in r:gmatch('[^\n]+')do assert(line:match('proto 187')and(line:match('^unreachable default')or line:match('^default dev '..c.dev..' ')),'Dota route ownership conflict')end
   if not r:find('unreachable default',1,true)then must('ip -4 route add unreachable default proto 187 metric 32767 table '..c.table)end
   if not found then must('ip -4 rule add pref '..pref..' fwmark '..c.mark..' lookup '..c.table)end

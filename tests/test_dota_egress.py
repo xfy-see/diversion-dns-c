@@ -70,6 +70,17 @@ class DotaTests(unittest.TestCase):
  def test_all_exits_switch_and_checkpoint_under_lock(self):
   for id in ('aws','hk','game'):
    h=Harness();self.ready(h);h.api.switch(id);self.assertEqual(json.loads(h.files['/etc/pnw-control/dota-egress/config.json'])['selected'],id);self.assertNotIn('/etc/pnw-control/dota-egress/pending.json',h.files);self.assertIn('/etc/pnw-control/dota-egress/traffic.json',h.files)
+ def test_openwrt_numeric_unreachable_routes_are_idempotent(self):
+  h=Harness();self.ready(h);original=h.run
+  def run(c):
+   if c=='ip -4 rule show':return '\n'.join(f'{12000+i}:\tfrom all fwmark 0x{i:x} lookup {24000+i}'for i in (16,17,18)),0
+   if c.startswith('ip -N -4 route show table '):
+    dev={24016:'wg_game',24017:'pnwhks0',24018:'pnwgfec0'}[int(c.split()[-1])]
+    return f'default dev {dev} proto 187 scope 253 metric 10 \n7 default proto 187 metric 32767 \n',0
+   return original(c)
+  h.lua.globals().PY_RUN=run
+  h.api.tick(False);h.api.tick(False);h.api.switch('game')
+  self.assertFalse(any(c.startswith('ip -4 route add')or c.startswith('ip -4 rule add')for c in h.commands))
  def test_switch_apply_failure_restores_old_exit(self):
   h=Harness();self.ready(h);original=h.run;failed=[False]
   def run(c):
